@@ -14,6 +14,8 @@ use types::{
     TransactionResponse, TransactionSource, VaultAddressesResponse,
 };
 
+use crate::signature_util::EXPECTED_SIGNATURE_LENGTH;
+
 /// Fireblocks-based signer using Fireblocks' API
 #[derive(Clone)]
 pub struct FireblocksSigner {
@@ -366,9 +368,13 @@ impl FireblocksSigner {
                 SignerError::SerializationError("Failed to decode base58 tx_hash".to_string())
             })?;
 
-            let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-                SignerError::SigningFailed("Invalid tx_hash length (expected 64 bytes)".to_string())
-            })?;
+            let sig_array: [u8; EXPECTED_SIGNATURE_LENGTH] =
+                sig_bytes.try_into().map_err(|_| {
+                    SignerError::SigningFailed(format!(
+                        "Invalid tx_hash length (expected {} bytes)",
+                        EXPECTED_SIGNATURE_LENGTH
+                    ))
+                })?;
 
             return Ok(Signature::from(sig_array));
         }

@@ -22,6 +22,7 @@
 
 pub mod error;
 mod sdk_adapter;
+pub mod signature_util;
 #[cfg(test)]
 pub mod test_util;
 #[cfg(feature = "integration-tests")]

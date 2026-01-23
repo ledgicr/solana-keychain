@@ -11,6 +11,11 @@ use aws_sdk_kms::{
 };
 use std::str::FromStr;
 
+use crate::signature_util::EXPECTED_SIGNATURE_LENGTH;
+
+const AWS_KMS_SIGNING_ALGORITHM: &str = "ED25519_SHA_512";
+const AWS_KMS_KEY_SPEC: &str = "ECC_NIST_EDWARDS25519";
+
 /// AWS KMS-based signer using EdDSA (Ed25519) signing
 ///
 /// # Example
@@ -117,7 +122,7 @@ impl AwsKmsSigner {
         // Note: The SDK may not have a typed enum variant yet since Ed25519 support
         // was added in November 2025. Using from() creates an "Unknown" variant
         // that still works with the API.
-        let signing_algorithm = SigningAlgorithmSpec::from("ED25519_SHA_512");
+        let signing_algorithm = SigningAlgorithmSpec::from(AWS_KMS_SIGNING_ALGORITHM);
 
         let response = self
             .client
@@ -132,7 +137,7 @@ impl AwsKmsSigner {
                 #[cfg(feature = "unsafe-debug")]
                 log::error!("AWS KMS Sign operation failed: {e:?}");
 
-                SignerError::RemoteApiError(format!("AWS KMS Sign operation failed: {e}"))
+                SignerError::RemoteApiError("AWS KMS Sign operation failed".to_string())
             })?;
 
         // Extract signature from response
@@ -143,17 +148,19 @@ impl AwsKmsSigner {
         let signature_bytes = signature_blob.as_ref();
 
         // Ed25519 signatures are 64 bytes
-        if signature_bytes.len() != 64 {
+        if signature_bytes.len() != EXPECTED_SIGNATURE_LENGTH {
             return Err(SignerError::SigningFailed(format!(
-                "Invalid signature length: expected 64 bytes, got {}",
+                "Invalid signature length: expected {} bytes, got {}",
+                EXPECTED_SIGNATURE_LENGTH,
                 signature_bytes.len()
             )));
         }
 
         // Convert to Signature type
-        let sig_bytes: [u8; 64] = signature_bytes.try_into().map_err(|_| {
-            SignerError::SigningFailed("Failed to convert signature bytes".to_string())
-        })?;
+        let sig_bytes: [u8; EXPECTED_SIGNATURE_LENGTH] =
+            signature_bytes.try_into().map_err(|_| {
+                SignerError::SigningFailed("Failed to convert signature bytes".to_string())
+            })?;
 
         Ok(Signature::from(sig_bytes))
     }
@@ -185,7 +192,7 @@ impl AwsKmsSigner {
                         // Check if key spec matches ECC_NIST_EDWARDS25519
                         // The SDK may represent this as a typed enum or as Unknown("ECC_NIST_EDWARDS25519")
                         let key_spec_str = key_spec.as_str();
-                        return key_spec_str == "ECC_NIST_EDWARDS25519";
+                        return key_spec_str == AWS_KMS_KEY_SPEC;
                     }
                 }
                 false
