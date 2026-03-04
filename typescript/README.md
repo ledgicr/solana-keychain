@@ -45,6 +45,7 @@ const signedTx = await signTransactionMessageWithSigners(transaction);
 | [@solana/keychain-aws-kms](./packages/aws-kms) | AWS KMS signer implementation |
 | [@solana/keychain-fireblocks](./packages/fireblocks) | Fireblocks signer implementation |
 | [@solana/keychain-gcp-kms](./packages/gcp-kms) | Google Cloud KMS signer implementation |
+| [@solana/keychain-cdp](./packages/cdp) | Coinbase Developer Platform (CDP) signer implementation |
 | [@solana/keychain-para](./packages/para) | Para MPC signer implementation |
 
 ## Installation
@@ -56,6 +57,7 @@ pnpm add @solana/keychain
 # Or install individual packages as needed
 pnpm add @solana/keychain-core        # Core interfaces (required for custom signers)
 pnpm add @solana/keychain-aws-kms     # AWS KMS signer
+pnpm add @solana/keychain-cdp         # Coinbase Developer Platform (CDP) signer
 pnpm add @solana/keychain-fireblocks  # Fireblocks signer
 pnpm add @solana/keychain-gcp-kms    # Google Cloud KMS signer
 pnpm add @solana/keychain-para        # Para MPC signer

@@ -64,6 +64,7 @@ impl From<serde_json::Error> for SignerError {
     feature = "privy",
     feature = "turnkey",
     feature = "fireblocks",
+    feature = "cdp",
     feature = "para"
 ))]
 impl From<reqwest::Error> for SignerError {

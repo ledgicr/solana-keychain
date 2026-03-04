@@ -26,6 +26,14 @@ fireblocks = [
 ]
 para = ["dep:reqwest", "dep:hex"]
 gcp_kms = ["dep:google-cloud-kms-v1", "dep:google-cloud-auth", "dep:reqwest"]
+cdp = [
+    "dep:reqwest",
+    "dep:jsonwebtoken",
+    "dep:uuid",
+    "dep:chrono",
+    "dep:sha2",
+    "dep:hex",
+]
 all = [
     "memory",
     "vault",
@@ -34,6 +42,7 @@ all = [
     "aws_kms",
     "fireblocks",
     "gcp_kms",
+    "cdp",
     "para",
 ]
 
