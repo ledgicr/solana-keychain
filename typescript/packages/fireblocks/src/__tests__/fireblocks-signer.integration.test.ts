@@ -1,3 +1,15 @@
+/**
+ * Fireblocks PROGRAM_CALL integration tests (devnet, not LiteSVM)
+ *
+ * Unlike other signers, Fireblocks PROGRAM_CALL mode signs AND broadcasts
+ * the transaction to Solana through Fireblocks' infrastructure. The signed
+ * transaction never returns to the caller — only a txHash comes back after
+ * polling. This means LiteSVM (used by runSignerIntegrationTest) can never
+ * observe the transaction, so we test against devnet directly.
+ *
+ * RAW mode returns a raw signature but is not available on the Fireblocks
+ * sandbox/testnet environment used in CI.
+ */
 import {
     appendTransactionMessageInstructions,
     createSolanaRpc,
@@ -11,7 +23,7 @@ import { getAddMemoInstruction } from '@solana-program/memo';
 import { config } from 'dotenv';
 import { describe, expect, it } from 'vitest';
 
-import { FireblocksSigner } from '../fireblocks-signer.js';
+import { createFireblocksSigner } from '../fireblocks-signer.js';
 
 config();
 
@@ -21,32 +33,24 @@ function hasRequiredEnvVars(): boolean {
     return REQUIRED_ENV_VARS.every(v => process.env[v]);
 }
 
-async function createFireblocksSigner(): Promise<FireblocksSigner> {
-    const signer = new FireblocksSigner({
-        apiKey: process.env.FIREBLOCKS_API_KEY!,
-        assetId: process.env.FIREBLOCKS_ASSET_ID ?? 'SOL_TEST',
-        privateKeyPem: process.env.FIREBLOCKS_PRIVATE_KEY_PEM!,
-        useProgramCall: true,
-        vaultAccountId: process.env.FIREBLOCKS_VAULT_ACCOUNT_ID!,
-    });
-    await signer.init();
-    return signer;
-}
-
 describe('FireblocksSigner Integration', () => {
     it.skipIf(!hasRequiredEnvVars())(
         'signs transactions with PROGRAM_CALL',
         async () => {
-            const signer = await createFireblocksSigner();
+            const signer = await createFireblocksSigner({
+                apiKey: process.env.FIREBLOCKS_API_KEY!,
+                assetId: process.env.FIREBLOCKS_ASSET_ID ?? 'SOL_TEST',
+                privateKeyPem: process.env.FIREBLOCKS_PRIVATE_KEY_PEM!,
+                useProgramCall: true,
+                vaultAccountId: process.env.FIREBLOCKS_VAULT_ACCOUNT_ID!,
+            });
             const rpcUrl = process.env.SOLANA_RPC_URL ?? 'https://api.devnet.solana.com';
 
-            // Get real blockhash from devnet
             const rpc = createSolanaRpc(rpcUrl);
             const {
                 value: { blockhash, lastValidBlockHeight },
             } = await rpc.getLatestBlockhash().send();
 
-            // Create memo transaction (doesn't need funds)
             const transaction = pipe(
                 createTransactionMessage({ version: 0 }),
                 tx => setTransactionMessageFeePayerSigner(signer, tx),
@@ -54,21 +58,24 @@ describe('FireblocksSigner Integration', () => {
                 tx => setTransactionMessageLifetimeUsingBlockhash({ blockhash, lastValidBlockHeight }, tx),
             );
 
-            // Sign via Fireblocks (PROGRAM_CALL broadcasts to Solana)
             const signed = await signTransactionMessageWithSigners(transaction);
 
-            // Verify signature returned
             expect(signed.signatures[signer.address]).toBeDefined();
             expect(signed.signatures[signer.address]?.length).toBe(64);
         },
         120_000,
-    ); // 2 minute timeout for PROGRAM_CALL
+    );
 
     // RAW signing not available on Fireblocks testnet/sandbox
     it.skip('signs messages with real API', () => {});
 
     it.skipIf(!hasRequiredEnvVars())('checks availability', async () => {
-        const signer = await createFireblocksSigner();
+        const signer = await createFireblocksSigner({
+            apiKey: process.env.FIREBLOCKS_API_KEY!,
+            assetId: process.env.FIREBLOCKS_ASSET_ID ?? 'SOL_TEST',
+            privateKeyPem: process.env.FIREBLOCKS_PRIVATE_KEY_PEM!,
+            vaultAccountId: process.env.FIREBLOCKS_VAULT_ACCOUNT_ID!,
+        });
         const available = await signer.isAvailable();
         expect(available).toBe(true);
     });

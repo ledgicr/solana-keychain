@@ -10,6 +10,9 @@ import type { Transaction, TransactionWithinSizeLimit, TransactionWithLifetime }
 /**
  * Unified signer interface that extends both transaction and message signers.
  * Provides both high-level (simple) and low-level (@solana/kit compatible) APIs.
+ *
+ * Each signer package exports a `createXSigner(config)` factory function as
+ * the preferred way to construct instances.
  */
 export interface SolanaSigner<TAddress extends string = string>
     extends TransactionPartialSigner<TAddress>, MessagePartialSigner<TAddress> {

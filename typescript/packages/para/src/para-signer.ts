@@ -7,6 +7,12 @@ import { Transaction, TransactionWithinSizeLimit, TransactionWithLifetime } from
 
 import type { ParaErrorResponse, ParaSignRawRequest, ParaSignRawResponse, ParaWalletResponse } from './types.js';
 
+export async function createParaSigner<TAddress extends string = string>(
+    config: ParaSignerConfig,
+): Promise<SolanaSigner<TAddress>> {
+    return await ParaSigner.create(config);
+}
+
 const DEFAULT_BASE_URL = 'https://api.getpara.com';
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -29,6 +35,8 @@ export interface ParaSignerConfig {
  *
  * Uses the /v1/wallets/:walletId/sign-raw endpoint for Ed25519 signing.
  * Raw bytes are signed directly with no hashing or transformation.
+ *
+ * @deprecated Prefer `createParaSigner()`. Class export will be removed in a future version.
  */
 export class ParaSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
     readonly address: Address<TAddress>;
@@ -48,6 +56,7 @@ export class ParaSigner<TAddress extends string = string> implements SolanaSigne
 
     /**
      * Create a ParaSigner by fetching the wallet's public key from Para's API
+     * @deprecated Use `createParaSigner()` instead.
      */
     static async create<TAddress extends string = string>(config: ParaSignerConfig): Promise<ParaSigner<TAddress>> {
         if (!config.apiKey || !config.walletId) {

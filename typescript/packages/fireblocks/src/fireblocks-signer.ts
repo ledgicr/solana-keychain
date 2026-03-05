@@ -20,6 +20,12 @@ import type {
 } from './types.js';
 import { FireblocksTransactionStatus, TERMINAL_STATUSES } from './types.js';
 
+export async function createFireblocksSigner<TAddress extends string = string>(
+    config: FireblocksSignerConfig,
+): Promise<SolanaSigner<TAddress>> {
+    return await FireblocksSigner.create(config);
+}
+
 const DEFAULT_API_BASE_URL = 'https://api.fireblocks.io';
 const DEFAULT_ASSET_ID = 'SOL';
 const DEFAULT_POLL_INTERVAL_MS = 1000;
@@ -33,13 +39,14 @@ const DEFAULT_MAX_POLL_ATTEMPTS = 60;
  *
  * @example
  * ```typescript
- * const signer = new FireblocksSigner({
+ * const signer = await FireblocksSigner.create({
  *     apiKey: 'your-api-key',
  *     privateKeyPem: '-----BEGIN PRIVATE KEY-----\n...',
  *     vaultAccountId: '0',
  * });
- * await signer.init();
  * ```
+ *
+ * @deprecated Prefer `createFireblocksSigner()`. Class export will be removed in a future version.
  */
 export class FireblocksSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
     private _address: Address<TAddress> | null = null;
@@ -54,6 +61,21 @@ export class FireblocksSigner<TAddress extends string = string> implements Solan
     private readonly useProgramCall: boolean;
     private initialized = false;
 
+    /**
+     * Fetches the public key from Fireblocks API during initialization.
+     * @deprecated Use `createFireblocksSigner()` instead.
+     */
+    static async create<TAddress extends string = string>(
+        config: FireblocksSignerConfig,
+    ): Promise<FireblocksSigner<TAddress>> {
+        const signer = new FireblocksSigner<TAddress>(config);
+        await signer.init();
+        return signer;
+    }
+
+    /**
+     * @deprecated Use `createFireblocksSigner()` instead. Direct construction will be removed in a future version.
+     */
     constructor(config: FireblocksSignerConfig) {
         if (!config.apiKey) {
             throwSignerError(SignerErrorCode.CONFIG_ERROR, {
@@ -101,6 +123,7 @@ export class FireblocksSigner<TAddress extends string = string> implements Solan
 
     /**
      * Initialize the signer by fetching the public key from Fireblocks
+     * @deprecated Use `createFireblocksSigner()` instead, which handles initialization automatically.
      */
     async init(): Promise<void> {
         if (this.initialized) {
@@ -145,13 +168,22 @@ export class FireblocksSigner<TAddress extends string = string> implements Solan
         const token = await createJwt(this.apiKey, this.privateKeyPem, uri, '');
 
         const url = `${this.apiBaseUrl}${uri}`;
-        const response = await fetch(url, {
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'X-API-Key': this.apiKey,
-            },
-            method: 'GET',
-        });
+        let response: Response;
+        try {
+            response = await fetch(url, {
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'X-API-Key': this.apiKey,
+                },
+                method: 'GET',
+            });
+        } catch (error) {
+            throwSignerError(SignerErrorCode.HTTP_ERROR, {
+                cause: error,
+                message: 'Fireblocks network request failed',
+                url,
+            });
+        }
 
         if (!response.ok) {
             const errorText = await response.text().catch(() => 'Failed to read error response');
@@ -165,8 +197,9 @@ export class FireblocksSigner<TAddress extends string = string> implements Solan
         let addressesResponse: VaultAddressesResponse;
         try {
             addressesResponse = (await response.json()) as VaultAddressesResponse;
-        } catch {
+        } catch (error) {
             throwSignerError(SignerErrorCode.PARSING_ERROR, {
+                cause: error,
                 message: 'Failed to parse Fireblocks response',
             });
         }
@@ -181,8 +214,9 @@ export class FireblocksSigner<TAddress extends string = string> implements Solan
         try {
             assertIsAddress(firstAddress);
             return firstAddress as Address;
-        } catch {
+        } catch (error) {
             throwSignerError(SignerErrorCode.INVALID_PUBLIC_KEY, {
+                cause: error,
                 message: 'Invalid address from Fireblocks',
             });
         }
@@ -196,15 +230,24 @@ export class FireblocksSigner<TAddress extends string = string> implements Solan
         const token = await createJwt(this.apiKey, this.privateKeyPem, uri, bodyStr);
 
         const url = `${this.apiBaseUrl}${uri}`;
-        const response = await fetch(url, {
-            body: body ? bodyStr : undefined,
-            headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'X-API-Key': this.apiKey,
-            },
-            method,
-        });
+        let response: Response;
+        try {
+            response = await fetch(url, {
+                body: body ? bodyStr : undefined,
+                headers: {
+                    Authorization: `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                    'X-API-Key': this.apiKey,
+                },
+                method,
+            });
+        } catch (error) {
+            throwSignerError(SignerErrorCode.HTTP_ERROR, {
+                cause: error,
+                message: 'Fireblocks network request failed',
+                url,
+            });
+        }
 
         if (!response.ok) {
             const errorText = await response.text().catch(() => 'Failed to read error response');
@@ -217,8 +260,9 @@ export class FireblocksSigner<TAddress extends string = string> implements Solan
 
         try {
             return (await response.json()) as T;
-        } catch {
+        } catch (error) {
             throwSignerError(SignerErrorCode.PARSING_ERROR, {
+                cause: error,
                 message: 'Failed to parse Fireblocks response',
             });
         }

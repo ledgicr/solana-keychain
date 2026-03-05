@@ -83,9 +83,9 @@ Or use the AWS Console:
 ### Basic Example
 
 ```typescript
-import { AwsKmsSigner } from '@solana/keychain-aws-kms';
+import { createAwsKmsSigner } from '@solana/keychain-aws-kms';
 
-const signer = new AwsKmsSigner({
+const signer = createAwsKmsSigner({
     keyId: 'arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012',
     publicKey: 'YourSolanaPublicKeyBase58',
     region: 'us-east-1', // Optional, defaults to AWS config default
@@ -102,7 +102,7 @@ const signatures = await signer.signTransactions([transaction]);
 ### With Custom Credentials
 
 ```typescript
-const signer = new AwsKmsSigner({
+const signer = createAwsKmsSigner({
     keyId: 'arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012',
     publicKey: 'YourSolanaPublicKeyBase58',
     region: 'us-east-1',
@@ -117,7 +117,7 @@ const signer = new AwsKmsSigner({
 ### With Request Delay (Rate Limiting)
 
 ```typescript
-const signer = new AwsKmsSigner({
+const signer = createAwsKmsSigner({
     keyId: 'arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012',
     publicKey: 'YourSolanaPublicKeyBase58',
     requestDelayMs: 100, // 100ms delay between concurrent requests
@@ -131,7 +131,7 @@ const signer = new AwsKmsSigner({
 #### Constructor
 
 ```typescript
-new AwsKmsSigner(config: AwsKmsSignerConfig)
+createAwsKmsSigner(config: AwsKmsSignerConfig)
 ```
 
 **Config Options:**

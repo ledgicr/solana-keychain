@@ -7,6 +7,12 @@ import { Transaction, TransactionWithinSizeLimit, TransactionWithLifetime } from
 
 import type { GcpKmsSignerConfig } from './types.js';
 
+export function createGcpKmsSigner<TAddress extends string = string>(
+    config: GcpKmsSignerConfig,
+): SolanaSigner<TAddress> {
+    return GcpKmsSigner.create(config);
+}
+
 /**
  * Google Cloud KMS-based signer using EdDSA (Ed25519) signing
  *
@@ -22,6 +28,8 @@ import type { GcpKmsSignerConfig } from './types.js';
  *   --purpose=asymmetric-signing \
  *   --default-algorithm=ec-sign-ed25519
  * ```
+ *
+ * @deprecated Prefer `createGcpKmsSigner()`. Class export will be removed in a future version.
  */
 export class GcpKmsSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
     readonly address: Address<TAddress>;
@@ -29,6 +37,12 @@ export class GcpKmsSigner<TAddress extends string = string> implements SolanaSig
     private readonly client: v1.KeyManagementServiceClient;
     private readonly requestDelayMs: number;
 
+    /** @deprecated Use `createGcpKmsSigner()` instead. */
+    static create<TAddress extends string = string>(config: GcpKmsSignerConfig): GcpKmsSigner<TAddress> {
+        return new GcpKmsSigner<TAddress>(config);
+    }
+
+    /** @deprecated Use `createGcpKmsSigner()` instead. Direct construction will be removed in a future version. */
     constructor(config: GcpKmsSignerConfig) {
         if (!config.keyName) {
             throwSignerError(SignerErrorCode.CONFIG_ERROR, {

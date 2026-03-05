@@ -7,6 +7,12 @@ import { Transaction, TransactionWithinSizeLimit, TransactionWithLifetime } from
 
 import type { AwsCredentials, AwsKmsSignerConfig } from './types.js';
 
+export function createAwsKmsSigner<TAddress extends string = string>(
+    config: AwsKmsSignerConfig,
+): SolanaSigner<TAddress> {
+    return AwsKmsSigner.create(config);
+}
+
 /**
  * AWS KMS-based signer using EdDSA (Ed25519) signing
  *
@@ -21,6 +27,8 @@ import type { AwsCredentials, AwsKmsSignerConfig } from './types.js';
  *   --key-usage SIGN_VERIFY \
  *   --description "Solana signing key"
  * ```
+ *
+ * @deprecated Prefer `createAwsKmsSigner()`. Class export will be removed in a future version.
  */
 export class AwsKmsSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
     readonly address: Address<TAddress>;
@@ -28,6 +36,12 @@ export class AwsKmsSigner<TAddress extends string = string> implements SolanaSig
     private readonly client: KMSClient;
     private readonly requestDelayMs: number;
 
+    /** @deprecated Use `createAwsKmsSigner()` instead. */
+    static create<TAddress extends string = string>(config: AwsKmsSignerConfig): AwsKmsSigner<TAddress> {
+        return new AwsKmsSigner<TAddress>(config);
+    }
+
+    /** @deprecated Use `createAwsKmsSigner()` instead. Direct construction will be removed in a future version. */
     constructor(config: AwsKmsSignerConfig) {
         if (!config.keyId) {
             throwSignerError(SignerErrorCode.CONFIG_ERROR, {
