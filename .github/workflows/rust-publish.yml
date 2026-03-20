@@ -22,9 +22,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  guard-main:
+    name: Guard main branch for release publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if workflow_dispatch is not on main
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Publish Rust Crate must be run from main. Current ref: ${{ github.ref }}"
+            exit 1
+          fi
+
   publish:
     name: Publish solana-keychain crate
     runs-on: ubuntu-latest
+    needs: guard-main
     defaults:
       run:
         working-directory: rust
