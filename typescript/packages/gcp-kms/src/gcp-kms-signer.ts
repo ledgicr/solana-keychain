@@ -1,8 +1,8 @@
-import { v1 } from '@google-cloud/kms';
 import { Address, assertIsAddress } from '@solana/addresses';
 import {
     assertSignatureValid,
     createSignatureDictionary,
+    sanitizeRemoteErrorResponse,
     SignerErrorCode,
     SolanaSigner,
     throwSignerError,
@@ -10,6 +10,7 @@ import {
 import { SignatureBytes } from '@solana/keys';
 import { SignableMessage, SignatureDictionary } from '@solana/signers';
 import { Transaction, TransactionWithinSizeLimit, TransactionWithLifetime } from '@solana/transactions';
+import { GoogleAuth } from 'google-auth-library';
 
 import type { GcpKmsSignerConfig } from './types.js';
 
@@ -18,6 +19,17 @@ import type { GcpKmsSignerConfig } from './types.js';
  *
  * @throws {SignerError} `SIGNER_CONFIG_ERROR` when required config is missing or invalid.
  */
+const CLOUD_KMS_BASE_URL = 'https://cloudkms.googleapis.com/v1';
+const CLOUD_KMS_SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
+const ED25519_SIGNATURE_LENGTH = 64;
+
+type AsymmetricSignResponse = {
+    signature?: string;
+};
+
+type PublicKeyResponse = {
+    algorithm?: string;
+};
 export function createGcpKmsSigner<TAddress extends string = string>(
     config: GcpKmsSignerConfig,
 ): SolanaSigner<TAddress> {
@@ -45,7 +57,7 @@ export function createGcpKmsSigner<TAddress extends string = string>(
 export class GcpKmsSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
     readonly address: Address<TAddress>;
     private readonly keyName: string;
-    private readonly client: v1.KeyManagementServiceClient;
+    private readonly auth: GoogleAuth;
     private readonly requestDelayMs: number;
 
     /** @deprecated Use `createGcpKmsSigner()` instead. */
@@ -80,7 +92,60 @@ export class GcpKmsSigner<TAddress extends string = string> implements SolanaSig
         this.keyName = config.keyName;
         this.requestDelayMs = config.requestDelayMs || 0;
         this.validateRequestDelayMs(this.requestDelayMs);
-        this.client = new v1.KeyManagementServiceClient();
+        this.auth = new GoogleAuth({ scopes: [CLOUD_KMS_SCOPE] });
+    }
+
+    private buildResourceUrl(suffix: string): string {
+        return `${CLOUD_KMS_BASE_URL}/${this.keyName.replace(/^\/+/, '')}${suffix}`;
+    }
+
+    private async authorizedFetch(url: string, init: RequestInit): Promise<Response> {
+        const authHeaders = await this.auth.getRequestHeaders(url);
+        const headers = new Headers(init.headers);
+
+        authHeaders.forEach((value, key) => {
+            headers.set(key, value);
+        });
+
+        if (init.body && !headers.has('content-type')) {
+            headers.set('content-type', 'application/json');
+        }
+
+        return await fetch(url, { ...init, headers });
+    }
+
+    private async request<TResponse>(url: string, init: RequestInit): Promise<TResponse> {
+        let response: Response;
+        try {
+            response = await this.authorizedFetch(url, init);
+        } catch (error) {
+            throwSignerError(SignerErrorCode.HTTP_ERROR, {
+                cause: error,
+                message: 'GCP KMS network request failed',
+                url,
+            });
+        }
+
+        if (!response.ok) {
+            const errorText = await response.text().catch(() => 'Failed to read error response');
+            throwSignerError(SignerErrorCode.REMOTE_API_ERROR, {
+                message: `GCP KMS API error: ${response.status}`,
+                response: sanitizeRemoteErrorResponse(errorText),
+                status: response.status,
+            });
+        }
+
+        let payload: TResponse;
+        try {
+            payload = (await response.json()) as TResponse;
+        } catch (error) {
+            throwSignerError(SignerErrorCode.PARSING_ERROR, {
+                cause: error,
+                message: 'Failed to parse GCP KMS response',
+            });
+        }
+
+        return payload;
     }
 
     /**
@@ -113,10 +178,11 @@ export class GcpKmsSigner<TAddress extends string = string> implements SolanaSig
      */
     private async signBytes(messageBytes: Uint8Array): Promise<SignatureBytes> {
         try {
-            // GCP KMS AsymmetricSign expects the raw message for Ed25519 (PureEdDSA)
-            const [response] = await this.client.asymmetricSign({
-                data: messageBytes,
-                name: this.keyName,
+            const response = await this.request<AsymmetricSignResponse>(this.buildResourceUrl(':asymmetricSign'), {
+                body: JSON.stringify({
+                    data: Buffer.from(messageBytes).toString('base64'),
+                }),
+                method: 'POST',
             });
 
             if (!response.signature) {
@@ -126,29 +192,20 @@ export class GcpKmsSigner<TAddress extends string = string> implements SolanaSig
             }
 
             // Ed25519 signatures are 64 bytes
-            const signature = response.signature as Uint8Array;
-            if (signature.length !== 64) {
+            const signature = new Uint8Array(Buffer.from(response.signature, 'base64'));
+            if (signature.length !== ED25519_SIGNATURE_LENGTH) {
                 throwSignerError(SignerErrorCode.SIGNING_FAILED, {
-                    message: `Invalid signature length: expected 64 bytes, got ${signature.length}`,
+                    message: `Invalid signature length: expected ${ED25519_SIGNATURE_LENGTH} bytes, got ${signature.length}`,
                 });
             }
 
             return signature as SignatureBytes;
         } catch (error: unknown) {
-            // Re-throw SignerError as-is
+            // Re-throw SignerError as-is (from request())
             if (error instanceof Error && error.name === 'SignerError') {
                 throw error;
             }
-            if (error instanceof Error) {
-                // GCP SDK errors
-                const gcpError = error as { code?: number; message?: string };
-                throwSignerError(SignerErrorCode.REMOTE_API_ERROR, {
-                    cause: error,
-                    message: `GCP KMS Sign operation failed: ${gcpError.message || error.message}`,
-                    status: gcpError.code,
-                });
-            }
-            throwSignerError(SignerErrorCode.REMOTE_API_ERROR, {
+            throwSignerError(SignerErrorCode.SIGNING_FAILED, {
                 cause: error,
                 message: 'GCP KMS Sign operation failed',
             });
@@ -210,8 +267,8 @@ export class GcpKmsSigner<TAddress extends string = string> implements SolanaSig
      */
     async isAvailable(): Promise<boolean> {
         try {
-            const [publicKey] = await this.client.getPublicKey({
-                name: this.keyName,
+            const publicKey = await this.request<PublicKeyResponse>(this.buildResourceUrl('/publicKey'), {
+                method: 'GET',
             });
 
             if (!publicKey) {
