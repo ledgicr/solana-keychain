@@ -3,7 +3,7 @@
 mod types;
 
 use crate::sdk_adapter::{Pubkey, Signature, Transaction};
-use crate::traits::SignedTransaction;
+use crate::traits::{SignTransactionResult, SignedTransaction};
 use crate::transaction_util::TransactionUtil;
 use crate::{error::SignerError, traits::SolanaSigner};
 use std::str::FromStr;
@@ -587,21 +587,18 @@ impl SolanaSigner for CrossmintSigner {
     async fn sign_transaction(
         &self,
         tx: &mut Transaction,
-    ) -> Result<SignedTransaction, SignerError> {
-        self.sign_and_serialize(tx).await
+    ) -> Result<SignTransactionResult, SignerError> {
+        let signed_transaction = self.sign_and_serialize(tx).await?;
+        Ok(TransactionUtil::classify_signed_transaction(
+            tx,
+            signed_transaction,
+        ))
     }
 
     async fn sign_message(&self, _message: &[u8]) -> Result<Signature, SignerError> {
         Err(SignerError::SigningFailed(
             "Crossmint sign_message is not supported for Solana wallets in this signer".to_string(),
         ))
-    }
-
-    async fn sign_partial_transaction(
-        &self,
-        tx: &mut Transaction,
-    ) -> Result<SignedTransaction, SignerError> {
-        self.sign_and_serialize(tx).await
     }
 
     async fn is_available(&self) -> bool {
@@ -663,11 +660,8 @@ mod tests {
         });
 
         assert!(result.is_err());
-        let err_text = format!("{}", result.unwrap_err());
-        assert!(
-            err_text.contains("must use HTTPS"),
-            "Expected HTTPS validation error, got: {err_text}"
-        );
+        let err = result.unwrap_err();
+        assert!(matches!(err, SignerError::ConfigError(_)));
     }
 
     #[tokio::test]
@@ -735,10 +729,15 @@ mod tests {
 
         let result = signer.sign_message(b"hello").await;
         assert!(result.is_err());
-        assert!(
-            format!("{}", result.unwrap_err()).contains("not supported"),
-            "Expected not supported error"
-        );
+        match result.unwrap_err() {
+            SignerError::SigningFailed(msg) => {
+                assert!(
+                    msg.contains("not supported"),
+                    "Unexpected error message: {msg}"
+                );
+            }
+            other => panic!("Expected SigningFailed error, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -786,7 +785,11 @@ mod tests {
             .await;
 
         let mut local_tx = create_test_transaction(&signer_pubkey);
-        let (serialized, signature) = signer.sign_transaction(&mut local_tx).await.unwrap();
+        let (serialized, signature) = signer
+            .sign_transaction(&mut local_tx)
+            .await
+            .unwrap()
+            .into_signed_transaction();
 
         assert_eq!(signature, expected_signature);
         assert!(!serialized.is_empty());
@@ -824,10 +827,15 @@ mod tests {
         let result = signer.sign_transaction(&mut tx).await;
 
         assert!(result.is_err());
-        assert!(
-            format!("{}", result.unwrap_err()).contains("awaiting approval"),
-            "Expected awaiting approval error"
-        );
+        match result.unwrap_err() {
+            SignerError::SigningFailed(msg) => {
+                assert!(
+                    msg.contains("awaiting approval"),
+                    "Unexpected error message: {msg}"
+                );
+            }
+            other => panic!("Expected SigningFailed error, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -878,7 +886,11 @@ mod tests {
         let mut signer = create_test_signer(&server.uri(), 1, 1);
         signer.init().await.unwrap();
 
-        let (_serialized, signature) = signer.sign_transaction(&mut tx).await.unwrap();
+        let (_serialized, signature) = signer
+            .sign_transaction(&mut tx)
+            .await
+            .unwrap()
+            .into_signed_transaction();
         assert_eq!(signature, expected_signature);
     }
 }

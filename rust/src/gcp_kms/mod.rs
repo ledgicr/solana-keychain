@@ -2,7 +2,7 @@
 
 use crate::error::SignerError;
 use crate::sdk_adapter::{Pubkey, Signature, Transaction};
-use crate::traits::{SignedTransaction, SolanaSigner};
+use crate::traits::{SignTransactionResult, SignedTransaction, SolanaSigner};
 use crate::transaction_util::TransactionUtil;
 use google_cloud_kms_v1::client::KeyManagementService;
 use google_cloud_kms_v1::model::crypto_key_version::CryptoKeyVersionAlgorithm;
@@ -27,6 +27,13 @@ pub struct GcpKmsSigner {
     public_key: Pubkey,
 }
 
+/// Configuration for creating a GcpKmsSigner.
+#[derive(Clone)]
+pub struct GcpKmsSignerConfig {
+    pub key_name: String,
+    pub public_key: String,
+}
+
 impl std::fmt::Debug for GcpKmsSigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GcpKmsSigner")
@@ -44,11 +51,20 @@ impl GcpKmsSigner {
     /// * `key_name` - Full resource name of the crypto key version
     /// * `public_key` - Solana public key (base58-encoded)
     pub async fn new(key_name: String, public_key: String) -> Result<Self, SignerError> {
+        Self::from_config(GcpKmsSignerConfig {
+            key_name,
+            public_key,
+        })
+        .await
+    }
+
+    /// Create a new GcpKmsSigner from a configuration object.
+    pub async fn from_config(config: GcpKmsSignerConfig) -> Result<Self, SignerError> {
         let client = KeyManagementService::builder().build().await.map_err(|e| {
             SignerError::RemoteApiError(format!("Failed to create KMS client: {e}"))
         })?;
 
-        Self::with_client(client, key_name, public_key)
+        Self::with_client(client, config.key_name, config.public_key)
     }
 
     /// Create a new GcpKmsSigner with a pre-configured client
@@ -170,19 +186,16 @@ impl SolanaSigner for GcpKmsSigner {
     async fn sign_transaction(
         &self,
         tx: &mut Transaction,
-    ) -> Result<SignedTransaction, SignerError> {
-        self.sign_and_serialize(tx).await
+    ) -> Result<SignTransactionResult, SignerError> {
+        let signed_transaction = self.sign_and_serialize(tx).await?;
+        Ok(TransactionUtil::classify_signed_transaction(
+            tx,
+            signed_transaction,
+        ))
     }
 
     async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
         self.sign_bytes(message).await
-    }
-
-    async fn sign_partial_transaction(
-        &self,
-        tx: &mut Transaction,
-    ) -> Result<SignedTransaction, SignerError> {
-        self.sign_and_serialize(tx).await
     }
 
     async fn is_available(&self) -> bool {
@@ -400,6 +413,58 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_gcp_kms_sign_message_signature_verification_failure() {
+        let mock_server = MockServer::start().await;
+        let signing_keypair = create_test_keypair();
+        let different_keypair = create_test_keypair();
+
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {
+                    "access_token": "mock-token",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
+                }
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let metadata_host = mock_server.address().to_string();
+        let _env = ScopedEnv::set("GCE_METADATA_HOST", &metadata_host);
+
+        let client = create_test_client(&mock_server.uri()).await;
+        let signer = GcpKmsSigner::with_client(
+            client,
+            TEST_KEY_NAME.to_string(),
+            different_keypair.pubkey().to_string(),
+        );
+        assert!(signer.is_ok());
+        let signer = signer.unwrap();
+
+        let message = b"test message";
+        let signature = signing_keypair.sign_message(message);
+
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {
+                    "signature": STANDARD.encode(signature.as_ref()),
+                    "verified_data_crc32c": true
+                }
+            )))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let result = signer.sign_message(message).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), SignerError::SigningFailed(_)));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_gcp_kms_sign_transaction_success() {
         let mock_server = MockServer::start().await;
         let keypair = create_test_keypair();
@@ -453,7 +518,7 @@ mod tests {
             result.err()
         );
 
-        let (base64_tx, sig) = result.unwrap();
+        let (base64_tx, sig) = result.unwrap().into_signed_transaction();
         assert!(!base64_tx.is_empty());
         assert_eq!(sig.as_ref().len(), 64);
         assert_eq!(sig, signature);

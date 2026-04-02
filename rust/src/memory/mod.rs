@@ -5,7 +5,7 @@ mod keypair_util;
 use crate::{
     error::SignerError,
     sdk_adapter::keypair_from_bytes,
-    traits::{SignedTransaction, SolanaSigner},
+    traits::{SignTransactionResult, SolanaSigner},
     transaction_util::TransactionUtil,
 };
 
@@ -19,6 +19,11 @@ pub struct MemorySigner {
     keypair: Keypair,
 }
 
+/// Configuration for creating a MemorySigner.
+pub struct MemorySignerConfig {
+    pub keypair: Keypair,
+}
+
 impl std::fmt::Debug for MemorySigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemorySigner")
@@ -30,13 +35,22 @@ impl std::fmt::Debug for MemorySigner {
 impl MemorySigner {
     /// Creates a new signer from a Solana keypair
     pub fn new(keypair: Keypair) -> Self {
-        Self { keypair }
+        Self::from_config(MemorySignerConfig { keypair })
+    }
+
+    /// Creates a new signer from a configuration object.
+    pub fn from_config(config: MemorySignerConfig) -> Self {
+        Self {
+            keypair: config.keypair,
+        }
     }
 
     /// Creates a new signer from a private key byte array
     pub fn from_bytes(private_key: &[u8]) -> Result<Self, SignerError> {
-        let keypair = keypair_from_bytes(private_key).map_err(|e| {
-            SignerError::InvalidPrivateKey(format!("Invalid private key bytes: {e}"))
+        let keypair = keypair_from_bytes(private_key).map_err(|_e| {
+            #[cfg(feature = "unsafe-debug")]
+            log::error!("Failed to build keypair from private key bytes: {_e}");
+            SignerError::InvalidPrivateKey("Invalid private key bytes".to_string())
         })?;
         Ok(Self { keypair })
     }
@@ -44,9 +58,14 @@ impl MemorySigner {
     /// Creates a new signer from a private key string that can be in multiple formats:
     /// - Base58 encoded string
     /// - U8Array format: "[0, 1, 2, ...]"
-    /// - File path to a JSON keypair file
     pub fn from_private_key_string(private_key: &str) -> Result<Self, SignerError> {
         let keypair = KeypairUtil::from_private_key_string(private_key)?;
+        Ok(Self::new(keypair))
+    }
+
+    /// Creates a new signer from a JSON keypair file path.
+    pub fn from_private_key_file(path: &str) -> Result<Self, SignerError> {
+        let keypair = KeypairUtil::from_private_key_file(path)?;
         Ok(Self::new(keypair))
     }
 
@@ -64,27 +83,19 @@ impl SolanaSigner for MemorySigner {
     async fn sign_transaction(
         &self,
         tx: &mut Transaction,
-    ) -> Result<SignedTransaction, SignerError> {
+    ) -> Result<SignTransactionResult, SignerError> {
         let signature = self.sign_bytes(&tx.message_data()).await?;
-
         TransactionUtil::add_signature_to_transaction(tx, &self.pubkey(), signature)?;
 
-        Ok((TransactionUtil::serialize_transaction(tx)?, signature))
+        let signed_transaction = (TransactionUtil::serialize_transaction(tx)?, signature);
+        Ok(TransactionUtil::classify_signed_transaction(
+            tx,
+            signed_transaction,
+        ))
     }
 
     async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
         self.sign_bytes(message).await
-    }
-
-    async fn sign_partial_transaction(
-        &self,
-        tx: &mut Transaction,
-    ) -> Result<SignedTransaction, SignerError> {
-        let signature = self.sign_bytes(&tx.message_data()).await?;
-
-        TransactionUtil::add_signature_to_transaction(tx, &self.pubkey(), signature)?;
-
-        Ok((TransactionUtil::serialize_transaction(tx)?, signature))
     }
 
     async fn is_available(&self) -> bool {
@@ -111,6 +122,23 @@ mod tests {
     fn test_create_from_u8_array() {
         let signer = MemorySigner::from_private_key_string(TEST_KEYPAIR_BYTES);
         assert!(signer.is_ok());
+    }
+
+    #[test]
+    fn test_create_from_file() {
+        let tmp_dir = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let file_path = tmp_dir.join(format!("solana-keychain-memory-signer-{unique}.json"));
+
+        std::fs::write(&file_path, TEST_KEYPAIR_BYTES).expect("failed to write temp keypair file");
+        let result = MemorySigner::from_private_key_file(&file_path.to_string_lossy());
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().pubkey().to_string(), TEST_PUBKEY);
+
+        let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]
@@ -147,29 +175,7 @@ mod tests {
         let result = signer.sign_transaction(&mut tx).await;
         assert!(result.is_ok());
 
-        let (serialized_tx, signature) = result.unwrap();
-
-        // Verify the signature is valid
-        assert_eq!(signature.as_ref().len(), 64);
-
-        // Verify the transaction is properly serialized
-        assert!(!serialized_tx.is_empty());
-
-        // Verify the transaction has the signature
-        assert_eq!(tx.signatures.len(), 1);
-        assert_eq!(tx.signatures[0], signature);
-    }
-
-    #[tokio::test]
-    async fn test_sign_partial_transaction() {
-        let signer = create_test_signer();
-
-        let mut tx = create_test_transaction(&keypair_pubkey(&signer.keypair));
-
-        let result = signer.sign_partial_transaction(&mut tx).await;
-        assert!(result.is_ok());
-
-        let (serialized_tx, signature) = result.unwrap();
+        let (serialized_tx, signature) = result.unwrap().into_signed_transaction();
 
         // Verify the signature is valid
         assert_eq!(signature.as_ref().len(), 64);

@@ -13,7 +13,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@solana/keychain-core', async importOriginal => {
     const mod = await importOriginal<typeof import('@solana/keychain-core')>();
-    return { ...mod, assertSignatureValid: vi.fn() };
+    return {
+        ...mod,
+        assertSignatureValid: vi.fn(),
+        sanitizeRemoteErrorResponse:
+            mod.sanitizeRemoteErrorResponse ??
+            ((text: string) =>
+                `${text
+                    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .slice(0, 256)} [truncated]`),
+    };
 });
 
 import { CdpSigner } from '../cdp-signer.js';
@@ -153,6 +164,22 @@ describe('CdpSigner', () => {
         it('accepts custom baseUrl', async () => {
             const signer = await CdpSigner.create(makeConfig({ baseUrl: 'https://custom.example.com' }));
             expect(signer).toBeDefined();
+        });
+
+        it('throws CONFIG_ERROR when baseUrl is not a valid URL', async () => {
+            await expect(CdpSigner.create(makeConfig({ baseUrl: 'not-a-url' }))).rejects.toMatchObject({
+                code: 'SIGNER_CONFIG_ERROR',
+                message: expect.stringContaining('baseUrl is not a valid URL'),
+            });
+        });
+
+        it('throws CONFIG_ERROR when baseUrl does not use HTTPS', async () => {
+            await expect(
+                CdpSigner.create(makeConfig({ baseUrl: 'http://api.cdp.coinbase.com' })),
+            ).rejects.toMatchObject({
+                code: 'SIGNER_CONFIG_ERROR',
+                message: expect.stringContaining('baseUrl must use HTTPS'),
+            });
         });
 
         it('accepts requestDelayMs of 0', async () => {
@@ -332,6 +359,19 @@ describe('CdpSigner', () => {
             const available = await signer.isAvailable();
 
             expect(available).toBe(false);
+        });
+
+        it('returns false when auth header generation fails', async () => {
+            const signer = await CdpSigner.create(makeConfig());
+            const subtleSignSpy = vi
+                .spyOn(globalThis.crypto.subtle, 'sign')
+                .mockRejectedValueOnce(new Error('sign failed'));
+
+            const available = await signer.isAvailable();
+
+            expect(available).toBe(false);
+            expect(mockFetch).not.toHaveBeenCalled();
+            subtleSignSpy.mockRestore();
         });
     });
 });

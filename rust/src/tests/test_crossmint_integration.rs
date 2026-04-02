@@ -54,11 +54,15 @@ mod tests {
         let result = signer.sign_message(b"crossmint-test").await;
         assert!(result.is_err(), "sign_message should be unsupported");
 
-        let err_text = format!("{}", result.unwrap_err());
-        assert!(
-            err_text.contains("not supported"),
-            "Expected not supported error, got: {err_text}"
-        );
+        match result.unwrap_err() {
+            crate::SignerError::SigningFailed(msg) => {
+                assert!(
+                    msg.contains("not supported"),
+                    "Expected not supported error, got: {msg}"
+                );
+            }
+            other => panic!("Expected SigningFailed error, got: {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -78,7 +82,8 @@ mod tests {
         let (base64_txn, signature) = signer
             .sign_transaction(&mut transaction)
             .await
-            .expect("Failed to sign transaction with Crossmint");
+            .expect("Failed to sign transaction with Crossmint")
+            .into_signed_transaction();
 
         assert_eq!(signature.as_ref().len(), 64, "Signature should be 64 bytes");
 

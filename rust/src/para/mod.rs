@@ -3,7 +3,7 @@
 mod types;
 
 use crate::sdk_adapter::{Pubkey, Signature, Transaction};
-use crate::traits::SignedTransaction;
+use crate::traits::{SignTransactionResult, SignedTransaction};
 use crate::transaction_util::TransactionUtil;
 use crate::{error::SignerError, traits::SolanaSigner};
 use std::str::FromStr;
@@ -21,6 +21,14 @@ pub struct ParaSigner {
     api_base_url: String,
     client: reqwest::Client,
     public_key: Pubkey,
+}
+
+/// Configuration for creating a ParaSigner.
+#[derive(Clone)]
+pub struct ParaSignerConfig {
+    pub api_key: String,
+    pub wallet_id: String,
+    pub api_base_url: Option<String>,
 }
 
 impl std::fmt::Debug for ParaSigner {
@@ -47,25 +55,34 @@ impl ParaSigner {
         wallet_id: String,
         api_base_url: Option<String>,
     ) -> Result<Self, SignerError> {
-        if api_key.is_empty() || wallet_id.is_empty() {
+        Self::from_config(ParaSignerConfig {
+            api_key,
+            wallet_id,
+            api_base_url,
+        })
+    }
+
+    /// Create a new ParaSigner from a configuration object.
+    pub fn from_config(config: ParaSignerConfig) -> Result<Self, SignerError> {
+        if config.api_key.is_empty() || config.wallet_id.is_empty() {
             return Err(SignerError::ConfigError(
                 "apiKey and walletId must not be empty".to_string(),
             ));
         }
 
-        if !api_key.starts_with("sk_") {
+        if !config.api_key.starts_with("sk_") {
             return Err(SignerError::ConfigError(
                 "apiKey must be a Para secret key (starts with sk_)".to_string(),
             ));
         }
 
-        if !Self::is_valid_uuid(&wallet_id) {
+        if !Self::is_valid_uuid(&config.wallet_id) {
             return Err(SignerError::ConfigError(
                 "walletId must be a valid UUID".to_string(),
             ));
         }
 
-        if let Some(ref url) = api_base_url {
+        if let Some(ref url) = config.api_base_url {
             if !url.starts_with("https://") {
                 return Err(SignerError::ConfigError(
                     "apiBaseUrl must use HTTPS".to_string(),
@@ -73,15 +90,18 @@ impl ParaSigner {
             }
         }
 
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(CLIENT_TIMEOUT)
+            .https_only(true);
+        let client = builder
             .build()
             .map_err(|e| SignerError::ConfigError(format!("Failed to build HTTP client: {e}")))?;
 
         Ok(Self {
-            api_key,
-            wallet_id,
-            api_base_url: api_base_url
+            api_key: config.api_key,
+            wallet_id: config.wallet_id,
+            api_base_url: config
+                .api_base_url
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
                 .trim_end_matches('/')
                 .to_string(),
@@ -282,19 +302,16 @@ impl SolanaSigner for ParaSigner {
     async fn sign_transaction(
         &self,
         tx: &mut Transaction,
-    ) -> Result<SignedTransaction, SignerError> {
-        self.sign_and_serialize(tx).await
+    ) -> Result<SignTransactionResult, SignerError> {
+        let signed_transaction = self.sign_and_serialize(tx).await?;
+        Ok(TransactionUtil::classify_signed_transaction(
+            tx,
+            signed_transaction,
+        ))
     }
 
     async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
         self.sign_bytes(message).await
-    }
-
-    async fn sign_partial_transaction(
-        &self,
-        tx: &mut Transaction,
-    ) -> Result<SignedTransaction, SignerError> {
-        self.sign_and_serialize(tx).await
     }
 
     /// Check if the signer is available. Makes a network call to the Para API
@@ -344,7 +361,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, SignerError::ConfigError(_)));
-        assert!(err.to_string().contains("sk_"));
+        assert_eq!(err.to_string(), "Configuration error");
     }
 
     #[test]
@@ -353,7 +370,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, SignerError::ConfigError(_)));
-        assert!(err.to_string().contains("UUID"));
+        assert_eq!(err.to_string(), "Configuration error");
     }
 
     #[test]
@@ -567,7 +584,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, SignerError::RemoteApiError(_)));
-        assert!(err.to_string().contains("401"));
+        assert_eq!(err.to_string(), "Remote API error");
     }
 
     // --- Sign tests ---
@@ -651,7 +668,7 @@ mod tests {
 
         let result = signer.sign_transaction(&mut tx).await;
         assert!(result.is_ok());
-        let (serialized_tx, returned_sig) = result.unwrap();
+        let (serialized_tx, returned_sig) = result.unwrap().into_signed_transaction();
         assert_eq!(returned_sig, signature);
         assert!(!serialized_tx.is_empty());
     }
@@ -991,7 +1008,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_para_error_status_code_only() {
-        // Error messages should contain only status code, not API body (matches other signers)
+        // Display output should stay generic and never include API response text.
         let mock_server = MockServer::start().await;
         let keypair = create_test_keypair();
 
@@ -1011,7 +1028,7 @@ mod tests {
         let result = signer.sign_message(b"test").await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("403"));
+        assert_eq!(err.to_string(), "Remote API error");
         assert!(!err.to_string().contains("Wallet is locked"));
     }
 
