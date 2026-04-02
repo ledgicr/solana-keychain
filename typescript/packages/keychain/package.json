@@ -3,7 +3,7 @@
     "author": "Solana Foundation",
     "license": "MIT",
     "repository": "https://github.com/solana-foundation/solana-keychain",
-    "version": "0.6.0",
+    "version": "0.6.1",
     "description": "Unified Solana transaction signing across multiple backends",
     "keywords": [
         "solana",
@@ -55,6 +55,14 @@
         "@solana/keychain-privy": "workspace:*",
         "@solana/keychain-turnkey": "workspace:*",
         "@solana/keychain-vault": "workspace:*"
+    },
+    "peerDependencies": {
+        "@solana/addresses": ">=6.0.1",
+        "@solana/codecs-core": ">=6.0.1",
+        "@solana/codecs-strings": ">=6.0.1",
+        "@solana/keys": ">=6.0.1",
+        "@solana/signers": ">=6.0.1",
+        "@solana/transactions": ">=6.0.1"
     },
     "publishConfig": {
         "access": "public"
