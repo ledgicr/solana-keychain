@@ -1,7 +1,7 @@
 {
     "name": "@solana/keychain-aws-kms",
     "author": "Solana Foundation",
-    "version": "0.6.0",
+    "version": "0.6.1",
     "description": "AWS KMS-based signer for Solana transactions using EdDSA (Ed25519)",
     "license": "MIT",
     "repository": "https://github.com/solana-foundation/solana-keychain",
@@ -42,16 +42,21 @@
         "test:treeshakability": "agadoo dist/index.js"
     },
     "dependencies": {
-        "@aws-sdk/client-kms": "^3.1009.0",
-        "@solana/keychain-core": "workspace:*",
-        "@solana/addresses": "^6.0.1",
-        "@solana/codecs-strings": "^6.0.1",
-        "@solana/keys": "^6.0.1",
-        "@solana/signers": "^6.0.1",
-        "@solana/transactions": "^6.0.1"
+        "@aws-sdk/client-kms": "^3.991.0",
+        "@solana/keychain-core": "workspace:*"
+    },
+    "peerDependencies": {
+        "@solana/addresses": ">=6.0.1",
+        "@solana/keys": ">=6.0.1",
+        "@solana/signers": ">=6.0.1",
+        "@solana/transactions": ">=6.0.1"
     },
     "devDependencies": {
+        "@solana/addresses": "^6.0.1",
         "@solana/keychain-test-utils": "workspace:*",
+        "@solana/keys": "^6.0.1",
+        "@solana/signers": "^6.0.1",
+        "@solana/transactions": "^6.0.1",
         "@solana-program/memo": "^0.11.0",
         "@solana/kit": "^6.0.1",
         "dotenv": "^17.2.3"
