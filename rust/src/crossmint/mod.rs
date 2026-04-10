@@ -2,7 +2,7 @@
 
 mod types;
 
-use crate::sdk_adapter::{Pubkey, Signature, Transaction};
+use crate::sdk_adapter::{Pubkey, Signature, Transaction, VersionedTransaction};
 use crate::traits::{SignTransactionResult, SignedTransaction};
 use crate::transaction_util::TransactionUtil;
 use crate::{error::SignerError, traits::SolanaSigner};
@@ -40,6 +40,9 @@ pub struct CrossmintSigner {
     signer: Option<String>,
     api_base_url: String,
     client: reqwest::Client,
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) public_key: Pubkey,
+    #[cfg(not(any(test, feature = "integration-tests")))]
     public_key: Pubkey,
     poll_interval_ms: u64,
     max_poll_attempts: u32,
@@ -213,7 +216,6 @@ impl CrossmintSigner {
     }
 
     fn build_wallets_api_url(&self, segments: &[&str]) -> Result<String, SignerError> {
-        // Validate base URL and get its string form (without trailing slash)
         let base = reqwest::Url::parse(&self.api_base_url)
             .map_err(|e| SignerError::ConfigError(format!("Invalid api_base_url: {e}")))?;
         if base.cannot_be_a_base() {
@@ -221,17 +223,42 @@ impl CrossmintSigner {
                 "api_base_url cannot be used as a base URL".to_string(),
             ));
         }
-        let base_str = base.as_str().trim_end_matches('/');
 
-        // Encode colons in wallet_locator to match encodeURIComponent behavior
-        let encoded_locator = self.wallet_locator.replace(':', "%3A");
-        let mut url = format!("{}/2025-06-09/wallets/{}", base_str, encoded_locator);
+        let mut url = base.as_str().trim_end_matches('/').to_string();
+        url.push_str("/2025-06-09/wallets/");
+        url.push_str(&Self::encode_uri_component(&self.wallet_locator));
         for segment in segments {
             url.push('/');
-            url.push_str(segment);
+            url.push_str(&Self::encode_uri_component(segment));
         }
 
         Ok(url)
+    }
+
+    fn encode_uri_component(input: &str) -> String {
+        let mut encoded = String::with_capacity(input.len());
+        for byte in input.bytes() {
+            if matches!(
+                byte,
+                b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'0'..=b'9'
+                    | b'-'
+                    | b'_'
+                    | b'.'
+                    | b'!'
+                    | b'~'
+                    | b'*'
+                    | b'\''
+                    | b'('
+                    | b')'
+            ) {
+                encoded.push(byte as char);
+            } else {
+                encoded.push_str(&format!("%{:02X}", byte));
+            }
+        }
+        encoded
     }
 
     async fn parse_response_with_required_field<T>(
@@ -471,6 +498,20 @@ impl CrossmintSigner {
         Some(Signature::from(sig_bytes))
     }
 
+    fn verify_signature_matches_message(
+        &self,
+        signature: &Signature,
+        message: &[u8],
+    ) -> Result<(), SignerError> {
+        if signature.verify(&self.public_key.to_bytes(), message) {
+            Ok(())
+        } else {
+            Err(SignerError::SigningFailed(
+                "Crossmint returned a signature for different bytes".to_string(),
+            ))
+        }
+    }
+
     fn extract_signature_from_serialized_transaction(
         &self,
         serialized_transaction: &str,
@@ -483,22 +524,31 @@ impl CrossmintSigner {
                 ))
             })?;
 
-        let transaction: Transaction = bincode::deserialize(&bytes).map_err(|e| {
+        let transaction: VersionedTransaction = bincode::deserialize(&bytes).map_err(|e| {
             SignerError::SerializationError(format!(
                 "Failed to deserialize Crossmint onChain.transaction: {e}"
             ))
         })?;
 
-        let position =
-            TransactionUtil::get_signing_keypair_position(&transaction, &self.public_key).map_err(
-                |e| {
-                    SignerError::SigningFailed(format!(
-                        "Failed to locate signer pubkey in Crossmint transaction: {e}"
-                    ))
-                },
-            )?;
+        let required_signers = usize::from(transaction.message.header().num_required_signatures);
+        let signer_keys = transaction.message.static_account_keys();
+        if signer_keys.len() < required_signers {
+            return Err(SignerError::SigningFailed(
+                "Invalid account index: not enough account keys".to_string(),
+            ));
+        }
 
-        transaction
+        let position = signer_keys
+            .iter()
+            .take(required_signers)
+            .position(|key| key == &self.public_key)
+            .ok_or_else(|| {
+                SignerError::SigningFailed(
+                    "Failed to locate signer pubkey in Crossmint transaction".to_string(),
+                )
+            })?;
+
+        let signature = transaction
             .signatures
             .get(position)
             .copied()
@@ -507,15 +557,23 @@ impl CrossmintSigner {
                 SignerError::SigningFailed(
                     "Crossmint onChain.transaction did not contain a signer signature".to_string(),
                 )
-            })
+            })?;
+
+        let remote_message = transaction.message.serialize();
+        self.verify_signature_matches_message(&signature, &remote_message)?;
+        Ok(signature)
     }
 
     fn extract_signature_from_response(
         &self,
         response: &TransactionResponse,
+        expected_message: &[u8],
     ) -> Result<Signature, SignerError> {
         if let Some(on_chain) = &response.on_chain {
             if let Some(serialized_transaction) = &on_chain.transaction {
+                // Try to extract from the serialized transaction first. If that
+                // fails, only accept txId if it verifies against the original
+                // requested message bytes.
                 if let Ok(signature) =
                     self.extract_signature_from_serialized_transaction(serialized_transaction)
                 {
@@ -524,19 +582,13 @@ impl CrossmintSigner {
             }
 
             if let Some(tx_id) = &on_chain.tx_id {
-                if let Some(signature) = Self::decode_base58_signature(tx_id) {
-                    return Ok(signature);
-                }
-            }
-        }
-
-        if let Some(approvals) = &response.approvals {
-            for submitted in &approvals.submitted {
-                if let Some(signature_str) = &submitted.signature {
-                    if let Some(signature) = Self::decode_base58_signature(signature_str) {
-                        return Ok(signature);
-                    }
-                }
+                let signature = Self::decode_base58_signature(tx_id).ok_or_else(|| {
+                    SignerError::SigningFailed(
+                        "Crossmint onChain.txId was not a valid Solana signature".to_string(),
+                    )
+                })?;
+                self.verify_signature_matches_message(&signature, expected_message)?;
+                return Ok(signature);
             }
         }
 
@@ -555,6 +607,7 @@ impl CrossmintSigner {
             ));
         }
 
+        let expected_message = transaction.message_data();
         let serialized = bincode::serialize(transaction).map_err(|e| {
             SignerError::SerializationError(format!("Failed to serialize transaction: {e}"))
         })?;
@@ -562,7 +615,7 @@ impl CrossmintSigner {
 
         let create_response = self.create_transaction(transaction_b58).await?;
         let final_response = self.poll_transaction(create_response).await?;
-        let signature = self.extract_signature_from_response(&final_response)?;
+        let signature = self.extract_signature_from_response(&final_response, &expected_message)?;
 
         TransactionUtil::add_signature_to_transaction(transaction, &self.public_key, signature)?;
 
@@ -610,7 +663,7 @@ impl SolanaSigner for CrossmintSigner {
 mod tests {
     use super::*;
     use crate::sdk_adapter::{keypair_pubkey, keypair_sign_message, Keypair};
-    use crate::test_util::create_test_transaction;
+    use crate::test_util::{create_test_transaction, create_test_transaction_with_recipient};
     use wiremock::{
         matchers::{header, method, path},
         Mock, MockServer, ResponseTemplate,
@@ -645,6 +698,116 @@ mod tests {
             max_poll_attempts,
             signing_key: None,
         }
+    }
+
+    fn create_url_builder_test_signer(wallet_locator: &str) -> CrossmintSigner {
+        let mut signer = create_test_signer(
+            "https://example.com/api",
+            DEFAULT_POLL_INTERVAL_MS,
+            DEFAULT_MAX_POLL_ATTEMPTS,
+        );
+        signer.wallet_locator = wallet_locator.to_string();
+        signer
+    }
+
+    fn build_url_and_path(wallet_locator: &str, segments: &[&str]) -> (String, String) {
+        let signer = create_url_builder_test_signer(wallet_locator);
+        let built_url = signer.build_wallets_api_url(segments).unwrap();
+        let path = reqwest::Url::parse(&built_url).unwrap().path().to_string();
+        (built_url, path)
+    }
+
+    #[test]
+    fn test_build_wallets_api_url_encodes_raw_slashes_in_wallet_locator() {
+        let (built_url, path) = build_url_and_path("userId:test-user/child:solana:smart", &[]);
+
+        assert_eq!(
+            built_url,
+            "https://example.com/api/2025-06-09/wallets/userId%3Atest-user%2Fchild%3Asolana%3Asmart"
+        );
+        assert_eq!(
+            path,
+            "/api/2025-06-09/wallets/userId%3Atest-user%2Fchild%3Asolana%3Asmart"
+        );
+        assert!(
+            !path.contains("/child"),
+            "wallet locator slash must stay inside a single encoded path segment: {path}"
+        );
+    }
+
+    #[test]
+    fn test_build_wallets_api_url_prevents_dot_segment_retargeting() {
+        let (built_url, path) =
+            build_url_and_path("userId:attacker/../victim:solana:smart", &["transactions"]);
+
+        assert_eq!(
+            built_url,
+            "https://example.com/api/2025-06-09/wallets/userId%3Aattacker%2F..%2Fvictim%3Asolana%3Asmart/transactions"
+        );
+        assert_eq!(
+            path,
+            "/api/2025-06-09/wallets/userId%3Aattacker%2F..%2Fvictim%3Asolana%3Asmart/transactions"
+        );
+        assert_ne!(
+            path, "/api/2025-06-09/wallets/victim%3Asolana%3Asmart/transactions",
+            "wallet locator must not normalize into a different wallet path"
+        );
+    }
+
+    #[test]
+    fn test_build_wallets_api_url_double_encodes_encoded_traversal_sequences() {
+        for (wallet_locator, expected_fragment) in [
+            (
+                "userId:attacker%2Fvictim:solana:smart",
+                "userId%3Aattacker%252Fvictim%3Asolana%3Asmart",
+            ),
+            (
+                "userId:attacker%2e%2e%2Fvictim:solana:smart",
+                "userId%3Aattacker%252e%252e%252Fvictim%3Asolana%3Asmart",
+            ),
+        ] {
+            let (built_url, path) = build_url_and_path(wallet_locator, &[]);
+
+            assert!(
+                built_url.contains(expected_fragment),
+                "expected encoded traversal fragment {expected_fragment} in URL {built_url}"
+            );
+            assert!(
+                path.contains(expected_fragment),
+                "expected encoded traversal fragment {expected_fragment} in path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_wallets_api_url_encodes_query_and_fragment_metacharacters() {
+        let (built_url, path) = build_url_and_path("userId:test?wallet#fragment:solana:smart", &[]);
+
+        assert_eq!(
+            built_url,
+            "https://example.com/api/2025-06-09/wallets/userId%3Atest%3Fwallet%23fragment%3Asolana%3Asmart"
+        );
+        assert_eq!(
+            path,
+            "/api/2025-06-09/wallets/userId%3Atest%3Fwallet%23fragment%3Asolana%3Asmart"
+        );
+    }
+
+    #[test]
+    fn test_build_wallets_api_url_matches_typescript_encodeuricomponent_behavior() {
+        let (built_url, path) = build_url_and_path(
+            "userId:alice/../wallet?draft#frag:solana:smart",
+            &["transactions", "tx-123", "approvals"],
+        );
+
+        assert_eq!(
+            built_url,
+            "https://example.com/api/2025-06-09/wallets/userId%3Aalice%2F..%2Fwallet%3Fdraft%23frag%3Asolana%3Asmart/transactions/tx-123/approvals"
+        );
+        assert_eq!(
+            path,
+            "/api/2025-06-09/wallets/userId%3Aalice%2F..%2Fwallet%3Fdraft%23frag%3Asolana%3Asmart/transactions/tx-123/approvals"
+        );
     }
 
     #[test]
@@ -757,7 +920,8 @@ mod tests {
         let mut signer = create_test_signer(&server.uri(), 1, 2);
         signer.init().await.unwrap();
 
-        let mut signed_remote_tx = create_test_transaction(&signer_pubkey);
+        let mut local_tx = create_test_transaction(&signer_pubkey);
+        let mut signed_remote_tx = local_tx.clone();
         let expected_signature = keypair_sign_message(&keypair, &signed_remote_tx.message_data());
         TransactionUtil::add_signature_to_transaction(
             &mut signed_remote_tx,
@@ -784,15 +948,168 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut local_tx = create_test_transaction(&signer_pubkey);
-        let (serialized, signature) = signer
+        let (_serialized, signature) = signer
             .sign_transaction(&mut local_tx)
             .await
             .unwrap()
             .into_signed_transaction();
 
         assert_eq!(signature, expected_signature);
-        assert!(!serialized.is_empty());
+        assert!(!_serialized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sign_transaction_rejects_approval_signatures_for_local_transaction_bytes() {
+        let server = MockServer::start().await;
+        let wallet_keypair = Keypair::new();
+        let signer_address = keypair_pubkey(&wallet_keypair).to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/2025-06-09/wallets/test-wallet"))
+            .and(header("x-api-key", "test-api-key"))
+            .respond_with(wallet_response(&signer_address))
+            .mount(&server)
+            .await;
+
+        let approval_signer = Keypair::new();
+        let approval_signature =
+            keypair_sign_message(&approval_signer, b"crossmint-approval-payload");
+        let approval_signature_b58 = bs58::encode(approval_signature.as_ref()).into_string();
+
+        Mock::given(method("POST"))
+            .and(path("/2025-06-09/wallets/test-wallet/transactions"))
+            .and(header("x-api-key", "test-api-key"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "tx-approval",
+                "status": "success",
+                "approvals": {
+                    "submitted": [
+                        { "signature": approval_signature_b58 }
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut signer = create_test_signer(&server.uri(), 1, 1);
+        signer.init().await.unwrap();
+
+        let mut tx = create_test_transaction(&signer.pubkey());
+        let result = signer.sign_transaction(&mut tx).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SignerError::SigningFailed(msg) => {
+                assert!(
+                    msg.contains("Unable to extract signature"),
+                    "Unexpected error message: {msg}"
+                );
+            }
+            other => panic!("Expected SigningFailed error, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sign_transaction_accepts_signature_from_on_chain_transaction_bytes() {
+        let server = MockServer::start().await;
+        let wallet_keypair = Keypair::new();
+        let signer_pubkey = keypair_pubkey(&wallet_keypair);
+        let signer_address = signer_pubkey.to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/2025-06-09/wallets/test-wallet"))
+            .and(header("x-api-key", "test-api-key"))
+            .respond_with(wallet_response(&signer_address))
+            .mount(&server)
+            .await;
+
+        let recipient = Pubkey::new_unique();
+        let mut remote_tx = create_test_transaction_with_recipient(&signer_pubkey, &recipient);
+        let remote_signature = keypair_sign_message(&wallet_keypair, &remote_tx.message_data());
+        TransactionUtil::add_signature_to_transaction(
+            &mut remote_tx,
+            &signer_pubkey,
+            remote_signature,
+        )
+        .unwrap();
+        let remote_on_chain_transaction =
+            bs58::encode(bincode::serialize(&remote_tx).unwrap()).into_string();
+
+        Mock::given(method("POST"))
+            .and(path("/2025-06-09/wallets/test-wallet/transactions"))
+            .and(header("x-api-key", "test-api-key"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "tx-mismatch",
+                "status": "success",
+                "onChain": {
+                    "transaction": remote_on_chain_transaction
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut signer = create_test_signer(&server.uri(), 1, 1);
+        signer.init().await.unwrap();
+
+        let mut local_tx = create_test_transaction(&signer_pubkey);
+        let (_serialized, signature) = signer
+            .sign_transaction(&mut local_tx)
+            .await
+            .unwrap()
+            .into_signed_transaction();
+        assert_eq!(signature, remote_signature);
+    }
+
+    #[tokio::test]
+    async fn test_sign_transaction_prefers_on_chain_transaction_signature_over_txid_fallback() {
+        let server = MockServer::start().await;
+        let keypair = Keypair::new();
+        let signer_pubkey = keypair_pubkey(&keypair);
+        let signer_address = signer_pubkey.to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/2025-06-09/wallets/test-wallet"))
+            .and(header("x-api-key", "test-api-key"))
+            .respond_with(wallet_response(&signer_address))
+            .mount(&server)
+            .await;
+
+        // onChain.transaction with different message bytes (different recipient)
+        let recipient = Pubkey::new_unique();
+        let mut remote_tx = create_test_transaction_with_recipient(&signer_pubkey, &recipient);
+        let remote_sig = keypair_sign_message(&keypair, &remote_tx.message_data());
+        TransactionUtil::add_signature_to_transaction(&mut remote_tx, &signer_pubkey, remote_sig)
+            .unwrap();
+        let remote_on_chain_transaction =
+            bs58::encode(bincode::serialize(&remote_tx).unwrap()).into_string();
+
+        // onChain.txId is only valid for the remote transaction bytes, not the local ones.
+        let tx_id = bs58::encode(remote_sig.as_ref()).into_string();
+
+        Mock::given(method("POST"))
+            .and(path("/2025-06-09/wallets/test-wallet/transactions"))
+            .and(header("x-api-key", "test-api-key"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "tx-fallthrough",
+                "status": "success",
+                "onChain": {
+                    "transaction": remote_on_chain_transaction,
+                    "txId": tx_id
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut signer = create_test_signer(&server.uri(), 1, 1);
+        signer.init().await.unwrap();
+
+        let mut local_tx = create_test_transaction(&signer_pubkey);
+        let (_serialized, signature) = signer
+            .sign_transaction(&mut local_tx)
+            .await
+            .unwrap()
+            .into_signed_transaction();
+        assert_eq!(signature, remote_sig);
     }
 
     #[tokio::test]
