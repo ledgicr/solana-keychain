@@ -1,0 +1,33 @@
+# `@solana/keychain-openfort`
+
+[Openfort backend wallet](https://www.openfort.io/docs/products/server) signer for Solana transactions.
+
+Calls Openfort's `POST /v2/accounts/backend/{accountId}/sign` endpoint with the
+project secret key plus an `x-wallet-auth` ES256 JWT signed by the wallet
+secret. The Solana address is fetched automatically from
+`GET /v2/accounts/{accountId}` during signer initialization.
+
+## Configuration
+
+Three required inputs:
+
+| Field             | Source                                     |
+| ----------------- | ------------------------------------------ |
+| `secretKey`       | Openfort project secret (`sk_test_*` / `sk_live_*`) |
+| `accountId`       | Backend wallet account ID (`acc_<uuid>`)   |
+| `walletSecret`    | ECDSA P-256 PKCS#8 private key from the Openfort dashboard (base64 DER or PEM) |
+
+## Usage
+
+```ts
+import { createOpenfortSigner } from '@solana/keychain-openfort';
+import { signTransactionMessageWithSigners } from '@solana/transactions';
+
+const signer = await createOpenfortSigner({
+    accountId: process.env.OPENFORT_ACCOUNT_ID!,
+    secretKey: process.env.OPENFORT_SECRET_KEY!,
+    walletSecret: process.env.OPENFORT_WALLET_SECRET!,
+});
+
+const signed = await signTransactionMessageWithSigners(transactionMessage, [signer]);
+```
