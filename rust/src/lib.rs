@@ -86,7 +86,7 @@ pub use memory::{MemorySigner, MemorySignerConfig};
 pub use vault::{VaultSigner, VaultSignerConfig};
 
 #[cfg(feature = "privy")]
-pub use privy::{PrivySigner, PrivySignerConfig};
+pub use privy::{PrivyAuthorizationRequestExpiry, PrivySigner, PrivySignerConfig};
 
 #[cfg(feature = "turnkey")]
 pub use turnkey::{TurnkeySigner, TurnkeySignerConfig};
@@ -221,6 +221,8 @@ impl Signer {
             wallet_id,
             api_base_url: None,
             http_client_config,
+            authorization_context: None,
+            authorization_request_expiry: PrivyAuthorizationRequestExpiry::Default,
         });
         signer.init().await?;
         Ok(Self::Privy(signer))

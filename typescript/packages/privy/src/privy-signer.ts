@@ -20,6 +20,8 @@ import {
     TransactionWithLifetime,
 } from '@solana/transactions';
 
+import type { PrivyAuthorizationConfig } from './authorization.js';
+import { getDefaultPrivyAuthorizationRequestExpiryMs, preparePrivyAuthorizationHeaders } from './authorization.js';
 import {
     SignatureBytesBase64,
     SignMessageRequest,
@@ -56,11 +58,30 @@ export interface PrivySignerConfig {
     appId: string;
     /** Privy application secret */
     appSecret: string;
+    /**
+     * Optional Privy wallet authorization context.
+     *
+     * Mirrors the lightweight parts of Privy's SDK AuthorizationContext:
+     * authorization_private_keys, signatures, and sign_fns. JWT exchange is intentionally
+     * left to caller-provided sign_fns so this package can stay REST-only and lightweight.
+     */
+    authorizationContext?: PrivyAuthorizationConfig;
+    /**
+     * Request-expiry window in milliseconds for authorization signatures.
+     * Defaults to 15 minutes when authorizationContext is configured. Set to null to omit it.
+     */
+    authorizationRequestExpiryMs?: number | null;
     /** Optional delay in ms between concurrent signing requests to avoid rate limits (default: 0) */
     requestDelayMs?: number;
     /** Privy wallet ID */
     walletId: string;
 }
+
+type ResolvedPrivySignerConfig = PrivySignerConfig & {
+    apiBaseUrl: string;
+    authorizationRequestExpiryMs: number | null;
+    requestDelayMs: number;
+};
 
 /**
  * Privy-based signer using Privy's wallet API
@@ -75,16 +96,19 @@ export class PrivySigner<TAddress extends string = string> implements SolanaSign
     private readonly appSecret: string;
     private readonly walletId: string;
     private readonly apiBaseUrl: string;
+    private readonly authorizationContext: PrivyAuthorizationConfig | undefined;
+    private readonly authorizationRequestExpiryMs: number | null;
     private readonly requestDelayMs: number;
 
-    private constructor(config: PrivySignerConfig, address: Address<TAddress>) {
+    private constructor(config: ResolvedPrivySignerConfig, address: Address<TAddress>) {
         this.address = address;
         this.appId = config.appId;
         this.appSecret = config.appSecret;
         this.walletId = config.walletId;
-        this.apiBaseUrl = config.apiBaseUrl || DEFAULT_API_BASE_URL;
-        this.requestDelayMs = config.requestDelayMs ?? 0;
-        this.validateRequestDelayMs(this.requestDelayMs);
+        this.apiBaseUrl = config.apiBaseUrl;
+        this.authorizationContext = config.authorizationContext;
+        this.authorizationRequestExpiryMs = config.authorizationRequestExpiryMs;
+        this.requestDelayMs = config.requestDelayMs;
     }
 
     /**
@@ -100,6 +124,13 @@ export class PrivySigner<TAddress extends string = string> implements SolanaSign
         }
         const apiBaseUrl = config.apiBaseUrl || DEFAULT_API_BASE_URL;
         validateHttpsApiBaseUrl(apiBaseUrl);
+        const requestDelayMs = config.requestDelayMs ?? 0;
+        const authorizationRequestExpiryMs =
+            config.authorizationRequestExpiryMs === undefined
+                ? getDefaultPrivyAuthorizationRequestExpiryMs()
+                : config.authorizationRequestExpiryMs;
+        validateRequestDelayMs(requestDelayMs);
+        validateAuthorizationRequestExpiryMs(authorizationRequestExpiryMs);
 
         const address = await fetchPublicKey<TAddress>({
             ...config,
@@ -110,22 +141,11 @@ export class PrivySigner<TAddress extends string = string> implements SolanaSign
             {
                 ...config,
                 apiBaseUrl,
+                authorizationRequestExpiryMs,
+                requestDelayMs,
             },
             address,
         );
-    }
-
-    private validateRequestDelayMs(requestDelayMs: number): void {
-        if (requestDelayMs < 0) {
-            throwSignerError(SignerErrorCode.CONFIG_ERROR, {
-                message: 'requestDelayMs must not be negative',
-            });
-        }
-        if (requestDelayMs > 3000) {
-            console.warn(
-                'requestDelayMs is greater than 3000ms, this may result in blockhash expiration errors for signing messages/transactions',
-            );
-        }
     }
 
     private async delay(index: number): Promise<void> {
@@ -156,12 +176,21 @@ export class PrivySigner<TAddress extends string = string> implements SolanaSign
         const url = `${this.apiBaseUrl}/wallets/${this.walletId}/rpc`;
 
         const request: SignTransactionRequest = {
+            chain_type: 'solana',
             method: 'signTransaction',
             params: {
                 encoding: 'base64',
                 transaction: base64WireTransaction,
             },
         };
+        const authorizationHeaders = await preparePrivyAuthorizationHeaders({
+            appId: this.appId,
+            authorizationContext: this.authorizationContext,
+            body: request,
+            method: 'POST',
+            requestExpiryMs: this.authorizationRequestExpiryMs,
+            url,
+        });
 
         let response: Response;
         try {
@@ -171,6 +200,7 @@ export class PrivySigner<TAddress extends string = string> implements SolanaSign
                     Authorization: getAuthHeader(this.appId, this.appSecret),
                     'Content-Type': 'application/json',
                     'privy-app-id': this.appId,
+                    ...authorizationHeaders,
                 },
                 method: 'POST',
             });
@@ -219,12 +249,21 @@ export class PrivySigner<TAddress extends string = string> implements SolanaSign
         const url = `${this.apiBaseUrl}/wallets/${this.walletId}/rpc`;
 
         const request: SignMessageRequest = {
+            chain_type: 'solana',
             method: 'signMessage',
             params: {
                 encoding: 'base64',
                 message: base64EncodedMessage,
             },
         };
+        const authorizationHeaders = await preparePrivyAuthorizationHeaders({
+            appId: this.appId,
+            authorizationContext: this.authorizationContext,
+            body: request,
+            method: 'POST',
+            requestExpiryMs: this.authorizationRequestExpiryMs,
+            url,
+        });
 
         let response: Response;
         try {
@@ -234,6 +273,7 @@ export class PrivySigner<TAddress extends string = string> implements SolanaSign
                     Authorization: getAuthHeader(this.appId, this.appSecret),
                     'Content-Type': 'application/json',
                     'privy-app-id': this.appId,
+                    ...authorizationHeaders,
                 },
                 method: 'POST',
             });
@@ -372,6 +412,27 @@ function validateHttpsApiBaseUrl(apiBaseUrl: string): void {
     if (parsedUrl.protocol !== 'https:') {
         throwSignerError(SignerErrorCode.CONFIG_ERROR, {
             message: 'apiBaseUrl must use HTTPS',
+        });
+    }
+}
+
+function validateRequestDelayMs(requestDelayMs: number): void {
+    if (requestDelayMs < 0) {
+        throwSignerError(SignerErrorCode.CONFIG_ERROR, {
+            message: 'requestDelayMs must not be negative',
+        });
+    }
+    if (requestDelayMs > 3000) {
+        console.warn(
+            'requestDelayMs is greater than 3000ms, this may result in blockhash expiration errors for signing messages/transactions',
+        );
+    }
+}
+
+function validateAuthorizationRequestExpiryMs(authorizationRequestExpiryMs: number | null): void {
+    if (authorizationRequestExpiryMs !== null && authorizationRequestExpiryMs < 0) {
+        throwSignerError(SignerErrorCode.CONFIG_ERROR, {
+            message: 'authorizationRequestExpiryMs must not be negative',
         });
     }
 }
