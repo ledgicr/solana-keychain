@@ -46,6 +46,11 @@ let base58Decoder: ReturnType<typeof getBase58Decoder> | undefined;
 let base58Encoder: ReturnType<typeof getBase58Encoder> | undefined;
 let base64Encoder: ReturnType<typeof getBase64Encoder> | undefined;
 
+/**
+ * Crossmint is a broadcast-managed signer: it rewrites the transaction (gas
+ * sponsorship, priority fee, its own blockhash) and broadcasts server-side, so
+ * returned signatures cover Crossmint's bytes, not the caller's `messageBytes`.
+ */
 class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
     readonly address: Address<TAddress>;
     private readonly apiKey: string;
@@ -193,18 +198,22 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
     async signTransactions(
         transactions: readonly (Transaction & TransactionWithinSizeLimit & TransactionWithLifetime)[],
     ): Promise<readonly SignatureDictionary[]> {
-        return await Promise.all(
-            transactions.map(async (transaction, index) => {
-                if (this.requestDelayMs > 0 && index > 0) {
-                    await new Promise(resolve => setTimeout(resolve, index * this.requestDelayMs));
-                }
-                const signature = await this.signTransactionManaged(transaction);
-                return createSignatureDictionary({
-                    signature,
-                    signerAddress: this.address,
-                });
-            }),
-        );
+        // Sign sequentially, not via Promise.all: each transaction has
+        // irreversible server-side effects (createTransaction, and auto-approval
+        // when signerSecret is set). Concurrent submission means a failure in one
+        // transaction would abandon siblings that Crossmint has already created
+        // and may execute, leading to duplicate spends on retry. Sequential
+        // execution stops on the first error before any further transaction is
+        // created.
+        const results: SignatureDictionary[] = [];
+        for (const [index, transaction] of transactions.entries()) {
+            if (this.requestDelayMs > 0 && index > 0) {
+                await new Promise(resolve => setTimeout(resolve, this.requestDelayMs));
+            }
+            const signature = await this.signTransactionManaged(transaction);
+            results.push(createSignatureDictionary({ signature, signerAddress: this.address }));
+        }
+        return results;
     }
 
     async isAvailable(): Promise<boolean> {
@@ -220,10 +229,21 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
         transaction: Transaction & TransactionWithinSizeLimit & TransactionWithLifetime,
     ): Promise<SignatureBytes> {
         let response = await this.createTransaction(transaction);
+        let approvalSubmitted = false;
 
         for (let attempt = 0; attempt < this.maxPollAttempts; attempt++) {
-            if (response.status === 'awaiting-approval' && this.signerSeed && this.signer) {
+            if (
+                response.status === 'awaiting-approval' &&
+                this.signerSeed &&
+                this.signer &&
+                !approvalSubmitted &&
+                this.findPendingApprovalForSigner(response) !== undefined
+            ) {
                 response = await this.submitApproval(response);
+                approvalSubmitted = true;
+                // Re-evaluate the new status immediately; the approvalSubmitted
+                // guard prevents this branch from re-running, so we cannot
+                // busy-loop re-signing/re-submitting the same approval.
                 continue;
             }
             const terminalSignature = await this.resolveTerminalStatus(response, transaction);
@@ -267,8 +287,31 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
         }
     }
 
+    /**
+     * Finds the pending approval entry that belongs to this signer's locator.
+     * On a multi-approver wallet, `pending` may contain challenges for other
+     * approvers; signing the wrong one with our key and submitting it under our
+     * locator yields a vendor 4xx. Returns `undefined` when there is nothing for
+     * us to approve.
+     */
+    private findPendingApprovalForSigner(
+        response: CrossmintTransactionResponse,
+    ): { message?: string; signer?: { locator?: string } } | undefined {
+        // The response-side signer is a nested object; match on its `locator`
+        // string (the same value we submit as `signer` when approving).
+        return response.approvals?.pending?.find(entry => entry.signer?.locator === this.signer);
+    }
+
     private async submitApproval(response: CrossmintTransactionResponse): Promise<CrossmintTransactionResponse> {
-        const message = response.approvals?.pending?.[0]?.message;
+        const pending = this.findPendingApprovalForSigner(response);
+        // Nothing pending for us: do not sign another approver's challenge.
+        // Return the response unchanged so the caller falls through to
+        // resolveTerminalStatus (which surfaces the awaiting-approval error).
+        if (!pending) {
+            return response;
+        }
+
+        const message = pending.message;
         if (!message) {
             throwSignerError(SignerErrorCode.SIGNING_FAILED, {
                 message: 'Crossmint transaction awaiting approval but no pending message found',
@@ -402,9 +445,9 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
             });
         }
 
-        // Verify against the message bytes that Crossmint actually signed.
-        // Crossmint may refresh the blockhash before signing, so these may
-        // differ from the original transaction.messageBytes.
+        // Verify against the bytes Crossmint actually signed, not the caller's
+        // messageBytes: Crossmint rewrites the tx (blockhash/fees) before signing,
+        // so a strict check against caller bytes would reject legitimately landed txs.
         await assertSignatureValid({
             data: decodedTransaction.messageBytes,
             signature,
