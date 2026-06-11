@@ -38,6 +38,7 @@ export async function createCdpSigner<TAddress extends string = string>(
 
 const CDP_DEFAULT_BASE_URL = 'https://api.cdp.coinbase.com';
 const CDP_BASE_PATH = '/platform/v2/solana/accounts';
+const JWT_TTL_SECS = 120;
 
 let base16Decoder: ReturnType<typeof getBase16Decoder> | undefined;
 let base58Encoder: ReturnType<typeof getBase58Encoder> | undefined;
@@ -103,7 +104,7 @@ async function createAuthJwt(
         typ: 'JWT',
     };
     const payload = {
-        exp: now + 120,
+        exp: now + JWT_TTL_SECS,
         iat: now,
         iss: 'cdp',
         nbf: now,
@@ -122,7 +123,7 @@ async function createWalletJwt(
 ): Promise<string> {
     const now = Math.floor(Date.now() / 1000);
     const payload: Record<string, unknown> = {
-        exp: now + 120,
+        exp: now + JWT_TTL_SECS,
         iat: now,
         jti: globalThis.crypto.randomUUID(),
         nbf: now,
@@ -389,6 +390,12 @@ export class CdpSigner<TAddress extends string = string> implements SolanaSigner
             });
         }
 
+        if (!data.signature) {
+            throwSignerError(SignerErrorCode.REMOTE_API_ERROR, {
+                message: 'Missing signature in CDP signMessage response',
+            });
+        }
+
         // CDP returns a base58-encoded Ed25519 signature
         base58Encoder ||= getBase58Encoder();
         const signatureBytes = base58Encoder.encode(data.signature) as SignatureBytes;
@@ -449,6 +456,12 @@ export class CdpSigner<TAddress extends string = string> implements SolanaSigner
             });
         }
 
+        if (!data.signedTransaction) {
+            throwSignerError(SignerErrorCode.REMOTE_API_ERROR, {
+                message: 'Missing signedTransaction in CDP signTransaction response',
+            });
+        }
+
         return data.signedTransaction as Base64EncodedWireTransaction;
     }
 
@@ -491,16 +504,9 @@ export class CdpSigner<TAddress extends string = string> implements SolanaSigner
                     base64WireTransaction: signedWireTx,
                     signerAddress: this.address,
                 });
-                const signatureBytes = Object.values(sigDict)[0];
-                if (!signatureBytes) {
-                    throwSignerError(SignerErrorCode.SIGNING_FAILED, {
-                        address: this.address,
-                        message: 'No signature bytes found in extracted signature dictionary',
-                    });
-                }
                 await assertSignatureValid({
                     data: transaction.messageBytes,
-                    signature: signatureBytes,
+                    signature: sigDict[this.address],
                     signerAddress: this.address,
                 });
                 return sigDict;
