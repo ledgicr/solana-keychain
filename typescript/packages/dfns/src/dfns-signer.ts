@@ -284,6 +284,9 @@ export class DfnsSigner<TAddress extends string = string> implements SolanaSigne
      * Send a signature request to the Dfns Keys API
      */
     private async sendSignatureRequest(request: GenerateSignatureRequest): Promise<SignatureBytes> {
+        // keyId is server-issued (from the wallet response) and this path is signed into the
+        // Dfns user-action challenge, which must match the routed request path verbatim — so it
+        // is interpolated raw rather than percent-encoded.
         const httpPath = `/keys/${this.keyId}/signatures`;
         const requestBody = JSON.stringify(request);
 
@@ -308,6 +311,7 @@ export class DfnsSigner<TAddress extends string = string> implements SolanaSigne
                     'x-dfns-useraction': userAction,
                 },
                 method: 'POST',
+                redirect: 'error',
             });
         } catch (error) {
             throwSignerError(SignerErrorCode.HTTP_ERROR, {
@@ -364,7 +368,7 @@ export class DfnsSigner<TAddress extends string = string> implements SolanaSigne
  * Fetch wallet details from Dfns
  */
 async function fetchWallet(apiBaseUrl: string, authToken: string, walletId: string): Promise<GetWalletResponse> {
-    const url = `${apiBaseUrl}/wallets/${walletId}`;
+    const url = `${apiBaseUrl}/wallets/${encodeURIComponent(walletId)}`;
     let response: Response;
     try {
         response = await fetch(url, {
@@ -372,6 +376,7 @@ async function fetchWallet(apiBaseUrl: string, authToken: string, walletId: stri
                 Authorization: `Bearer ${authToken}`,
             },
             method: 'GET',
+            redirect: 'error',
         });
     } catch (error) {
         throwSignerError(SignerErrorCode.HTTP_ERROR, {
