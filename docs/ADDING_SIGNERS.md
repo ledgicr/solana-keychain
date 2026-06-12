@@ -554,7 +554,7 @@ CI is a two-phase process. Coordinate with maintainers to prepare `main` before 
 - [ ] Sanitize remote API error text with `sanitizeRemoteErrorResponse()`
 - [ ] Unit tests with vitest + mocks
 - [ ] Integration tests using `runSignerIntegrationTest` + `setup.ts`
-- [ ] Update umbrella package `typescript/packages/keychain/` (see [Umbrella Package](#umbrella-package) — 6 files)
+- [ ] Update umbrella package `typescript/packages/keychain/` (see [Umbrella Package](#umbrella-package) — 7 files)
 - [ ] README with `createXSigner()` as primary usage
 - [ ] `.env.example` with required env vars
 - [ ] CI updates (`typescript-ci.yml`, `typescript-publish.yml`)
@@ -673,40 +673,30 @@ export class YourSigner<TAddress extends string = string> implements SolanaSigne
 
 **Key rules:**
 
-- **HTTPS enforcement**: If your signer accepts an `apiBaseUrl` config field, validate the URL scheme in `create()`:
+- **HTTPS enforcement**: If your signer accepts an `apiBaseUrl` config field, validate it in `create()` with `assertHttpsUrl()` from `@solana/keychain-core`:
   ```typescript
-  const parsedUrl = new URL(config.apiBaseUrl);
-  if (parsedUrl.protocol !== 'https:') {
-      throwSignerError(SignerErrorCode.CONFIG_ERROR, {
-          message: 'apiBaseUrl must use HTTPS',
-      });
-  }
-  ```
-- **Error sanitization**: Never include raw remote API response text in errors. Use `sanitizeRemoteErrorResponse()` from `@solana/keychain-core`:
-  ```typescript
-  import { sanitizeRemoteErrorResponse } from '@solana/keychain-core';
+  import { assertHttpsUrl } from '@solana/keychain-core';
 
-  const errorText = await response.text();
-  throwSignerError(SignerErrorCode.REMOTE_API_ERROR, {
-      message: `YourService API error: ${sanitizeRemoteErrorResponse(errorText)}`,
-  });
+  assertHttpsUrl(apiBaseUrl, 'apiBaseUrl'); // returns the parsed URL if you need host/origin
   ```
-- **Safe JSON parsing**: Access parsed JSON properties inside the try/catch or use optional chaining (`?.`) to guard against malformed responses that would throw raw `TypeError`:
+- **Remote API calls**: use `fetchSignerJson()` from `@solana/keychain-core` instead of calling `fetch()` directly. It owns the whole error pipeline — network failure → `HTTP_ERROR`, non-2xx → `REMOTE_API_ERROR` with the response body sanitized via `sanitizeRemoteErrorResponse()`, bad JSON → `PARSING_ERROR` — plus redirect rejection and a default 60s timeout:
   ```typescript
-  let data: YourApiResponse;
-  try {
-      data = (await response.json()) as YourApiResponse;
-  } catch (error) {
-      throwSignerError(SignerErrorCode.PARSING_ERROR, { cause: error, ... });
-  }
+  import { fetchSignerJson } from '@solana/keychain-core';
+
+  const data = await fetchSignerJson<YourApiResponse>({
+      init: { body: JSON.stringify(request), headers, method: 'POST' },
+      providerName: 'YourService',
+      url,
+  });
   const signature = data?.result?.signature;
   if (!signature) {
       throwSignerError(SignerErrorCode.SIGNING_FAILED, { ... });
   }
   ```
-- Wrap all `fetch()` calls in try/catch — use `throwSignerError(SignerErrorCode.HTTP_ERROR, { cause: error, ... })` from `@solana/keychain-core`
+  Validate provider-specific response shape (with optional chaining) after the call.
+- **Batch staggering**: support the `requestDelayMs` config field for rate-limited APIs. Validate it with `validateRequestDelayMs()` and implement `signMessages`/`signTransactions` with `signBatchStaggered()` from `@solana/keychain-core` (see any existing signer).
+- **One-time crypto at construction**: import/validate static key material (PEM parsing, `importPKCS8`, point decompression) once in `create()`/`init()` and store the imported key — only genuinely request-bound work (e.g. minting a per-request JWT) belongs in the request path.
 - Add `cause` to catch blocks to preserve stack traces
-- Use `requestDelayMs` pattern if your API has rate limits (see any existing signer for the `delay()` + `validateRequestDelayMs()` pattern)
 - Add `@throws` JSDoc to factory functions listing the error codes they can throw
 
 #### Index Exports
@@ -798,7 +788,7 @@ describe('YourSigner Integration', () => {
 
 ### Umbrella Package
 
-Update `typescript/packages/keychain/` to register your signer in the unified factory. There are 6 files to modify:
+Update `typescript/packages/keychain/` to register your signer in the unified factory. There are 7 files to modify:
 
 **a) `keychain/src/types.ts`** — add your config to the discriminated union:
 
@@ -863,7 +853,9 @@ export { YourSigner } from '@solana/keychain-your-signer';
 { "path": "../your-signer" }
 ```
 
-> **Note:** The `createSigner()` and `resolveAddress()` switch statements have exhaustive `never` checks — TypeScript will emit a compile error if you add your config to the union but forget to handle it in the switch.
+> **Note:** The `createSigner()` and `resolveAddress()` switch statements have exhaustive `never` checks — TypeScript will emit a compile error if you add your config to the union but forget to handle it in the switch. The umbrella test tables are typed `satisfies Record<BackendName, …>`, so typecheck also fails until your backend is covered there.
+
+**g) `typescript/scripts/test-treeshake-umbrella.mjs`** — add your package to `SIGNER_MARKERS` (two distinctive strings that appear in your built `dist/` output — verify with grep before picking them) and your factory to the `FACTORIES` list. Without this, your backend leaking into other factories' bundles goes undetected.
 
 ### README
 
@@ -974,7 +966,7 @@ Before submitting your PR:
 - [ ] Added to README.md supported backends table
 - [ ] CI changes included
 - [ ] TypeScript package with unit + integration tests
-- [ ] Umbrella package updated (6 files — see [Umbrella Package](#umbrella-package))
+- [ ] Umbrella package updated (7 files — see [Umbrella Package](#umbrella-package))
 - [ ] Coordinated with maintainers on Phase 1 CI preparation
 
 ## Implementation Tips
