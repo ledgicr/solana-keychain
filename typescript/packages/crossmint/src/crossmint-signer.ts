@@ -222,12 +222,11 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
             ) {
                 response = await this.submitApproval(response, pending);
                 approvalSubmitted = true;
-                // Re-evaluate the new status immediately; the approvalSubmitted
-                // guard prevents this branch from re-running, so we cannot
-                // busy-loop re-signing/re-submitting the same approval.
+                // Re-evaluate the new status immediately; approvalSubmitted
+                // ensures the approval is signed and submitted at most once.
                 continue;
             }
-            const terminalSignature = await this.resolveTerminalStatus(response, transaction);
+            const terminalSignature = await this.resolveTerminalStatus(response, transaction, approvalSubmitted);
             if (terminalSignature) {
                 return terminalSignature;
             }
@@ -236,7 +235,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
             response = await this.getTransaction(response.id);
         }
 
-        const terminalSignature = await this.resolveTerminalStatus(response, transaction);
+        const terminalSignature = await this.resolveTerminalStatus(response, transaction, approvalSubmitted);
         if (terminalSignature) {
             return terminalSignature;
         }
@@ -249,6 +248,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
     private async resolveTerminalStatus(
         response: CrossmintTransactionResponse,
         transaction: Transaction & TransactionWithinSizeLimit & TransactionWithLifetime,
+        approvalSubmitted: boolean,
     ): Promise<SignatureBytes | undefined> {
         const status = response.status as CrossmintTransactionStatus;
         switch (status) {
@@ -259,6 +259,12 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
                     message: `Crossmint transaction failed: ${stringifyError(response.error)}`,
                 });
             case 'awaiting-approval':
+                // Crossmint may register a submitted approval asynchronously, so
+                // awaiting-approval is only terminal while no approval of ours is
+                // in flight; otherwise keep polling until the status advances.
+                if (approvalSubmitted) {
+                    return undefined;
+                }
                 return throwSignerError(SignerErrorCode.SIGNING_FAILED, {
                     message: 'Crossmint transaction is awaiting approval; additional signer approvals are required',
                 });
