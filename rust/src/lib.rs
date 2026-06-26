@@ -73,6 +73,14 @@ pub mod para;
 #[cfg(feature = "utila")]
 pub mod utila;
 
+#[cfg(feature = "ledger")]
+pub mod ledger;
+
+// The `ledger` backend reuses solana-remote-wallet, whose solana-* crate
+// versions line up with the v3 SDK. Other SDK versions are not yet supported.
+#[cfg(all(feature = "ledger", not(feature = "sdk-v3")))]
+compile_error!("the `ledger` feature currently requires `sdk-v3`");
+
 // Re-export core types
 pub use error::SignerError;
 pub use http_client_config::HttpClientConfig;
@@ -113,6 +121,9 @@ pub use para::{ParaSigner, ParaSignerConfig};
 #[cfg(feature = "utila")]
 pub use utila::{UtilaSigner, UtilaSignerConfig};
 
+#[cfg(feature = "ledger")]
+pub use ledger::LedgerSigner;
+
 // Ensure at least one signer backend is enabled
 #[cfg(not(any(
     feature = "memory",
@@ -127,10 +138,11 @@ pub use utila::{UtilaSigner, UtilaSignerConfig};
     feature = "para",
     feature = "crossmint",
     feature = "openfort",
-    feature = "utila"
+    feature = "utila",
+    feature = "ledger"
 )))]
 compile_error!(
-    "At least one signer backend feature must be enabled: memory, vault, privy, turnkey, aws_kms, fireblocks, gcp_kms, cdp, para, dfns, crossmint, openfort, or utila"
+    "At least one signer backend feature must be enabled: memory, vault, privy, turnkey, aws_kms, fireblocks, gcp_kms, cdp, para, dfns, crossmint, openfort, utila, or ledger"
 );
 
 /// Unified signer enum supporting multiple backends
@@ -168,6 +180,9 @@ pub enum Signer {
     Crossmint(CrossmintSigner),
     #[cfg(feature = "utila")]
     Utila(UtilaSigner),
+
+    #[cfg(feature = "ledger")]
+    Ledger(LedgerSigner),
 }
 
 impl Signer {
@@ -375,6 +390,22 @@ impl Signer {
         signer.init().await?;
         Ok(Self::Utila(signer))
     }
+
+    /// Connect to a Ledger hardware wallet.
+    ///
+    /// `derivation_path` defaults to `m/44'/501'/0'/0'` when `None`. Set
+    /// `confirm_pubkey_on_device` to display the derived address on-screen for
+    /// the user to verify (use when registering an account, not when signing).
+    #[cfg(feature = "ledger")]
+    pub fn from_ledger(
+        derivation_path: Option<&str>,
+        confirm_pubkey_on_device: bool,
+    ) -> Result<Self, SignerError> {
+        Ok(Self::Ledger(LedgerSigner::connect(
+            derivation_path,
+            confirm_pubkey_on_device,
+        )?))
+    }
 }
 
 #[async_trait::async_trait]
@@ -414,6 +445,8 @@ impl SolanaSigner for Signer {
             Signer::Crossmint(s) => s.pubkey(),
             #[cfg(feature = "utila")]
             Signer::Utila(s) => s.pubkey(),
+            #[cfg(feature = "ledger")]
+            Signer::Ledger(s) => s.pubkey(),
         }
     }
 
@@ -455,6 +488,8 @@ impl SolanaSigner for Signer {
             Signer::Crossmint(s) => s.sign_transaction(tx).await,
             #[cfg(feature = "utila")]
             Signer::Utila(s) => s.sign_transaction(tx).await,
+            #[cfg(feature = "ledger")]
+            Signer::Ledger(s) => s.sign_transaction(tx).await,
         }
     }
 
@@ -493,6 +528,8 @@ impl SolanaSigner for Signer {
             Signer::Crossmint(s) => s.sign_message(message).await,
             #[cfg(feature = "utila")]
             Signer::Utila(s) => s.sign_message(message).await,
+            #[cfg(feature = "ledger")]
+            Signer::Ledger(s) => s.sign_message(message).await,
         }
     }
 
@@ -531,6 +568,8 @@ impl SolanaSigner for Signer {
             Signer::Crossmint(s) => s.is_available().await,
             #[cfg(feature = "utila")]
             Signer::Utila(s) => s.is_available().await,
+            #[cfg(feature = "ledger")]
+            Signer::Ledger(s) => s.is_available().await,
         }
     }
 }

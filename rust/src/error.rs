@@ -38,6 +38,11 @@ pub enum SignerError {
     #[error("Signer not available")]
     NotAvailable(String),
 
+    /// The signing request was rejected by the user (e.g. declined on a
+    /// hardware-wallet device screen).
+    #[error("Request rejected by user")]
+    UserRejected(String),
+
     /// IO error (file operations)
     #[error("IO error")]
     IoError(String),
@@ -97,6 +102,7 @@ impl fmt::Debug for SignerError {
             }
             SignerError::ConfigError(_) => write!(f, "SignerError::ConfigError([REDACTED])"),
             SignerError::NotAvailable(_) => write!(f, "SignerError::NotAvailable([REDACTED])"),
+            SignerError::UserRejected(_) => write!(f, "SignerError::UserRejected([REDACTED])"),
             SignerError::IoError(_) => write!(f, "SignerError::IoError([REDACTED])"),
             SignerError::Other(_) => write!(f, "SignerError::Other([REDACTED])"),
         }
@@ -119,6 +125,7 @@ mod tests {
             SignerError::SerializationError(secret.to_string()),
             SignerError::ConfigError(secret.to_string()),
             SignerError::NotAvailable(secret.to_string()),
+            SignerError::UserRejected(secret.to_string()),
             SignerError::IoError(secret.to_string()),
             SignerError::Other(secret.to_string()),
         ];
@@ -165,6 +172,10 @@ mod tests {
         assert_eq!(
             format!("{}", SignerError::NotAvailable("x".to_string())),
             "Signer not available"
+        );
+        assert_eq!(
+            format!("{}", SignerError::UserRejected("x".to_string())),
+            "Request rejected by user"
         );
         assert_eq!(
             format!("{}", SignerError::IoError("x".to_string())),

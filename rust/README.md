@@ -29,6 +29,7 @@
 | **Crossmint** | Crossmint managed wallets (`smart` and `mpc`) | `crossmint` |
 | **Openfort** | Openfort backend wallets with TEE-stored keys | `openfort` |
 | **Utila** | Utila MPC wallets and automated co-signer flow | `utila` |
+| **Ledger** | Ledger hardware wallet over USB-HID; key never leaves the device, per-signature on-device confirmation (requires `sdk-v3`) | `ledger` |
 
 ## Installation
 
@@ -268,6 +269,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 **Note:** Utila `sign_message` is intentionally unsupported in this signer and returns `SigningFailed`. Transaction signing requests are created with `publish=false`; callers remain responsible for broadcasting.
+
+### Ledger Signer
+
+[Ledger](https://www.ledger.com/) hardware-wallet signer over USB-HID, built on
+[`solana-remote-wallet`](https://docs.rs/solana-remote-wallet). The private key
+never leaves the device and every signature must be confirmed on the device
+screen. Requires the `ledger` + `sdk-v3` features, a connected and unlocked
+device running the Solana app (and, on Linux, Ledger's `udev` rules).
+
+```rust
+use solana_keychain::{Signer, SolanaSigner};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `None` → default derivation path m/44'/501'/0'/0'.
+    // Pass `true` to display the address on-device for the user to verify.
+    let signer = Signer::from_ledger(None, true)?;
+
+    println!("Public key: {}", signer.pubkey());
+    Ok(())
+}
+```
+
+**Note:** signing blocks until the user approves on the device. A user
+declining on the device surfaces as `SignerError::UserRejected`; an
+absent/locked device as `SignerError::NotAvailable`. The Solana app's
+clear-signing coverage determines what the device screen can display for a given
+transaction; anything it does not recognize is blind-signed.
 
 ### Openfort Signer
 
