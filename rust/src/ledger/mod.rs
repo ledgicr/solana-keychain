@@ -211,10 +211,13 @@ fn device_actor(
             ));
         }
 
+        // `list_devices` already filters to valid Ledger wallets (VID/PID +
+        // HID usage). Select by manufacturer, not model — the model is the
+        // device name ("nano-gen5", "nano-x", "stax", …), never "ledger".
         let info = manager
             .list_devices()
             .into_iter()
-            .find(|d| d.model.to_lowercase().contains("ledger"))
+            .find(|d| d.manufacturer == solana_remote_wallet::locator::Manufacturer::Ledger)
             .ok_or_else(|| SignerError::NotAvailable("no Ledger device found".to_string()))?;
 
         let ledger = manager
