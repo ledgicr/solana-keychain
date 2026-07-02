@@ -207,6 +207,29 @@ impl SolanaSigner for LedgerSigner {
         Ok(Signature::from(sig_bytes))
     }
 
+    async fn sign_transaction_message(
+        &self,
+        message: &[u8],
+    ) -> Result<Signature, SignerError> {
+        // A serialized transaction message (legacy or versioned/v0). Route it
+        // through the device's transaction-parsing APDU — NOT the off-chain
+        // envelope that `sign_message` uses. This is the same device command
+        // `sign_transaction` uses; it just takes pre-serialized bytes and
+        // returns the raw signature for the caller to place at the signer index
+        // (used by the x402 versioned-transaction path).
+        let message = message.to_vec();
+        let cmd_tx = self.cmd_tx.clone();
+        let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
+            request_on(&cmd_tx, |reply| DeviceCommand::SignTransactionMessage {
+                message,
+                reply,
+            })
+        })
+        .await
+        .map_err(|e| SignerError::Other(format!("Ledger signing task failed: {e}")))??;
+        Ok(Signature::from(sig_bytes))
+    }
+
     async fn is_available(&self) -> bool {
         let cmd_tx = self.cmd_tx.clone();
         tokio::task::spawn_blocking(move || {

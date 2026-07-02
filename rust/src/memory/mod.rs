@@ -164,6 +164,22 @@ mod tests {
 
     #[cfg_attr(miri, ignore)]
     #[tokio::test]
+    async fn test_sign_transaction_message_matches_sign_message() {
+        // The default `sign_transaction_message` delegates to `sign_message`,
+        // so for a software backend the two are byte-identical. This is the
+        // backward-compatibility guarantee: any client that switches a
+        // transaction-message signing site from `sign_message` to
+        // `sign_transaction_message` gets the same signature from software
+        // signers, and correct device routing from hardware signers.
+        let signer = create_test_signer();
+        let message = b"serialized-transaction-message-bytes";
+        let via_message = signer.sign_message(message).await.unwrap();
+        let via_tx_message = signer.sign_transaction_message(message).await.unwrap();
+        assert_eq!(via_message.as_ref(), via_tx_message.as_ref());
+    }
+
+    #[cfg_attr(miri, ignore)]
+    #[tokio::test]
     async fn test_is_available() {
         let signer = create_test_signer();
         assert!(signer.is_available().await);

@@ -542,6 +542,52 @@ impl SolanaSigner for Signer {
         }
     }
 
+    async fn sign_transaction_message(
+        &self,
+        message: &[u8],
+    ) -> Result<sdk_adapter::Signature, SignerError> {
+        // Forward per-variant so a backend that overrides `sign_transaction_message`
+        // (e.g. Ledger, which routes to the device tx-APDU) is used instead of the
+        // trait default. Software backends fall through to the default (sign_message).
+        match self {
+            #[cfg(feature = "memory")]
+            Signer::Memory(s) => s.sign_transaction_message(message).await,
+
+            #[cfg(feature = "vault")]
+            Signer::Vault(s) => s.sign_transaction_message(message).await,
+
+            #[cfg(feature = "privy")]
+            Signer::Privy(s) => s.sign_transaction_message(message).await,
+
+            #[cfg(feature = "turnkey")]
+            Signer::Turnkey(s) => s.sign_transaction_message(message).await,
+
+            #[cfg(feature = "aws_kms")]
+            Signer::AwsKms(s) => s.sign_transaction_message(message).await,
+
+            #[cfg(feature = "fireblocks")]
+            Signer::Fireblocks(s) => s.sign_transaction_message(message).await,
+
+            #[cfg(feature = "gcp_kms")]
+            Signer::GcpKms(s) => s.sign_transaction_message(message).await,
+
+            #[cfg(feature = "cdp")]
+            Signer::Cdp(s) => s.sign_transaction_message(message).await,
+            #[cfg(feature = "dfns")]
+            Signer::Dfns(s) => s.sign_transaction_message(message).await,
+            #[cfg(feature = "openfort")]
+            Signer::Openfort(s) => s.sign_transaction_message(message).await,
+            #[cfg(feature = "para")]
+            Signer::Para(s) => s.sign_transaction_message(message).await,
+            #[cfg(feature = "crossmint")]
+            Signer::Crossmint(s) => s.sign_transaction_message(message).await,
+            #[cfg(feature = "utila")]
+            Signer::Utila(s) => s.sign_transaction_message(message).await,
+            #[cfg(feature = "ledger")]
+            Signer::Ledger(s) => s.sign_transaction_message(message).await,
+        }
+    }
+
     async fn is_available(&self) -> bool {
         match self {
             #[cfg(feature = "memory")]
