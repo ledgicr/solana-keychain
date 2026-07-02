@@ -35,8 +35,13 @@ use crate::sdk_adapter::{Pubkey, Signature, Transaction};
 use crate::traits::{SignTransactionResult, SolanaSigner};
 use crate::transaction_util::TransactionUtil;
 
-/// Default Solana BIP44 derivation path: `m/44'/501'/0'/0'`.
-pub const DEFAULT_DERIVATION_PATH: &str = "m/44'/501'/0'/0'";
+/// Default Solana derivation path: `m/44'/501'/0'`.
+///
+/// This matches **Ledger Live**'s Solana accounts (account index, no "change"
+/// component), so the address pay derives equals the one a user sees and funds
+/// in Ledger Live. (The 4-component `m/44'/501'/0'/0'` is the older Solana-CLI
+/// style and derives a *different* address.)
+pub const DEFAULT_DERIVATION_PATH: &str = "m/44'/501'/0'";
 
 /// Requests sent to the device-actor thread. Each carries a one-shot reply
 /// channel the actor uses to return the result.
@@ -281,8 +286,13 @@ fn signature_bytes(sig: solana_signature::Signature) -> [u8; 64] {
 /// Map `solana-remote-wallet` errors onto [`SignerError`], preserving the
 /// user-rejection and device-absence cases the caller wants to distinguish.
 fn map_rw_err(e: RemoteWalletError) -> SignerError {
+    use solana_remote_wallet::ledger_error::LedgerError;
     match e {
-        RemoteWalletError::UserCancel => {
+        // Two distinct "cancel"s: the host-side `UserCancel`, and the device
+        // returning APDU status 0x6985 (`LedgerError::UserCancel`) when the
+        // user rejects on-screen. A real on-device decline is the latter.
+        RemoteWalletError::UserCancel
+        | RemoteWalletError::LedgerError(LedgerError::UserCancel) => {
             SignerError::UserRejected("request rejected on Ledger device".to_string())
         }
         RemoteWalletError::NoDeviceFound => {

@@ -394,7 +394,7 @@ impl Signer {
 
     /// Connect to a Ledger hardware wallet.
     ///
-    /// `derivation_path` defaults to `m/44'/501'/0'/0'` when `None`. Set
+    /// `derivation_path` defaults to `m/44'/501'/0'` (Ledger Live's path) when `None`. Set
     /// `confirm_pubkey_on_device` to display the derived address on-screen for
     /// the user to verify (use when registering an account, not when signing).
     #[cfg(feature = "ledger")]
