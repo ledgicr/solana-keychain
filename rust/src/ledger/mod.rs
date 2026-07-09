@@ -350,8 +350,7 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
         // Two distinct "cancel"s: the host-side `UserCancel`, and the device
         // returning APDU status 0x6985 (`LedgerError::UserCancel`) when the
         // user rejects on-screen. A real on-device decline is the latter.
-        RemoteWalletError::UserCancel
-        | RemoteWalletError::LedgerError(LedgerError::UserCancel) => {
+        RemoteWalletError::UserCancel | RemoteWalletError::LedgerError(LedgerError::UserCancel) => {
             SignerError::UserRejected("request rejected on Ledger device".to_string())
         }
         RemoteWalletError::NoDeviceFound => {
