@@ -11,6 +11,9 @@ pub use solana_sdk_v4::pubkey::Pubkey;
 pub use solana_sdk_v4::signature::{Keypair, Signature};
 #[allow(unused_imports)]
 pub use solana_sdk_v4::signer::Signer;
+// `VersionedTransaction` is used only by some backends (utila, crossmint); allow
+// it to be unused when those features are off.
+#[allow(unused_imports)]
 pub use solana_sdk_v4::transaction::{Transaction, VersionedTransaction};
 
 /// Parse a keypair from bytes (v4 adapter)
