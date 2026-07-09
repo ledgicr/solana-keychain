@@ -398,16 +398,27 @@ impl Signer {
     /// `confirm_pubkey_on_device` to display the derived address on-screen for
     /// the user to verify (use when registering an account, not when signing).
     #[cfg(feature = "ledger")]
-    pub fn from_ledger(
+    pub async fn from_ledger(
         derivation_path: Option<&str>,
         confirm_pubkey_on_device: bool,
         host_device_path: Option<&str>,
     ) -> Result<Self, SignerError> {
-        Ok(Self::Ledger(LedgerSigner::connect(
-            derivation_path,
-            confirm_pubkey_on_device,
-            host_device_path,
-        )?))
+        // `LedgerSigner::connect` blocks the calling thread on device I/O
+        // (including waiting for a physical button press when
+        // `confirm_pubkey_on_device` is set). Run it on the blocking pool so it
+        // never stalls the async runtime.
+        let derivation_path = derivation_path.map(str::to_string);
+        let host_device_path = host_device_path.map(str::to_string);
+        let signer = tokio::task::spawn_blocking(move || {
+            LedgerSigner::connect(
+                derivation_path.as_deref(),
+                confirm_pubkey_on_device,
+                host_device_path.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| SignerError::Other(format!("Ledger connect task failed: {e}")))??;
+        Ok(Self::Ledger(signer))
     }
 }
 

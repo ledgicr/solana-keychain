@@ -94,6 +94,12 @@ impl LedgerSigner {
     ///
     /// Requires the Ledger to be plugged in, unlocked, and running the Solana
     /// app. On Linux, the appropriate `udev` rules must be installed.
+    ///
+    /// **Blocking:** this blocks the calling thread until the device responds —
+    /// with `confirm_pubkey_on_device` set, until the user presses a button. Do
+    /// not call it directly from an async task; use the async
+    /// [`Signer::from_ledger`](crate::Signer::from_ledger) factory (which runs it
+    /// on the blocking pool) or wrap it in [`tokio::task::spawn_blocking`].
     pub fn connect(
         derivation_path: Option<&str>,
         confirm_pubkey_on_device: bool,

@@ -287,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pass `true` to display the address on-device for the user to verify.
     // Final `None` → auto-select the sole connected Ledger (pass a host device
     // path to disambiguate when several are attached).
-    let signer = Signer::from_ledger(None, true, None)?;
+    let signer = Signer::from_ledger(None, true, None).await?;
 
     println!("Public key: {}", signer.pubkey());
     Ok(())
