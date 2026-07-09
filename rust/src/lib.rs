@@ -401,10 +401,12 @@ impl Signer {
     pub fn from_ledger(
         derivation_path: Option<&str>,
         confirm_pubkey_on_device: bool,
+        host_device_path: Option<&str>,
     ) -> Result<Self, SignerError> {
         Ok(Self::Ledger(LedgerSigner::connect(
             derivation_path,
             confirm_pubkey_on_device,
+            host_device_path,
         )?))
     }
 }

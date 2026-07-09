@@ -86,22 +86,38 @@ impl LedgerSigner {
     /// device screen for the user to verify — use this when *registering* an
     /// account, not on every signing connection.
     ///
+    /// `host_device_path` selects a specific device by its OS HID path when more
+    /// than one Ledger is connected. Pass `None` to use the sole connected
+    /// device; if several are attached and `None` is given, this returns
+    /// [`SignerError::NotAvailable`] listing each device's path so the caller can
+    /// retry with a specific one.
+    ///
     /// Requires the Ledger to be plugged in, unlocked, and running the Solana
     /// app. On Linux, the appropriate `udev` rules must be installed.
     pub fn connect(
         derivation_path: Option<&str>,
         confirm_pubkey_on_device: bool,
+        host_device_path: Option<&str>,
     ) -> Result<Self, SignerError> {
         let path_str = derivation_path
             .unwrap_or(DEFAULT_DERIVATION_PATH)
             .to_string();
+        let host_device_path = host_device_path.map(str::to_string);
 
         let (setup_tx, setup_rx) = mpsc::channel::<Result<[u8; 32], SignerError>>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<DeviceCommand>();
 
         let worker = std::thread::Builder::new()
             .name("ledger-device".to_string())
-            .spawn(move || device_actor(path_str, confirm_pubkey_on_device, setup_tx, cmd_rx))
+            .spawn(move || {
+                device_actor(
+                    path_str,
+                    confirm_pubkey_on_device,
+                    host_device_path,
+                    setup_tx,
+                    cmd_rx,
+                )
+            })
             .map_err(|e| {
                 SignerError::Other(format!("failed to spawn Ledger device thread: {e}"))
             })?;
@@ -200,6 +216,7 @@ fn request_on<T: Send + 'static>(
 fn device_actor(
     path_str: String,
     confirm_pubkey_on_device: bool,
+    host_device_path: Option<String>,
     setup_tx: Sender<Result<[u8; 32], SignerError>>,
     cmd_rx: Receiver<DeviceCommand>,
 ) {
@@ -219,11 +236,41 @@ fn device_actor(
         // `list_devices` already filters to valid Ledger wallets (VID/PID +
         // HID usage). Select by manufacturer, not model — the model is the
         // device name ("nano-gen5", "nano-x", "stax", …), never "ledger".
-        let info = manager
+        let ledgers: Vec<_> = manager
             .list_devices()
             .into_iter()
-            .find(|d| d.manufacturer == solana_remote_wallet::locator::Manufacturer::Ledger)
-            .ok_or_else(|| SignerError::NotAvailable("no Ledger device found".to_string()))?;
+            .filter(|d| d.manufacturer == solana_remote_wallet::locator::Manufacturer::Ledger)
+            .collect();
+
+        // Deterministic device selection: honor an explicit host path; otherwise
+        // require exactly one device rather than silently picking the first (the
+        // enumeration order is OS-dependent and unstable across re-plugs).
+        let info = match host_device_path.as_deref() {
+            Some(want) => ledgers
+                .into_iter()
+                .find(|d| d.host_device_path == want)
+                .ok_or_else(|| {
+                    SignerError::NotAvailable(format!("no Ledger device at host path `{want}`"))
+                })?,
+            None => match ledgers.len() {
+                0 => {
+                    return Err(SignerError::NotAvailable(
+                        "no Ledger device found".to_string(),
+                    ))
+                }
+                1 => ledgers.into_iter().next().expect("len == 1"),
+                _ => {
+                    let list = ledgers
+                        .iter()
+                        .map(|d| format!("  {} ({})", d.host_device_path, d.model))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(SignerError::NotAvailable(format!(
+                        "multiple Ledger devices connected; pass host_device_path to select one:\n{list}"
+                    )));
+                }
+            },
+        };
 
         let ledger = manager
             .get_ledger(&info.host_device_path)
@@ -342,7 +389,7 @@ mod tests {
     fn connect_without_device_errors_not_available() {
         // No Ledger attached in CI: connect must fail cleanly (NotAvailable),
         // never hang or panic. (If a device *is* attached this is skipped.)
-        match LedgerSigner::connect(None, false) {
+        match LedgerSigner::connect(None, false, None) {
             Err(SignerError::NotAvailable(_)) => {}
             Err(other) => panic!("expected NotAvailable, got {other:?}"),
             Ok(_) => { /* a device is plugged in; nothing to assert here */ }

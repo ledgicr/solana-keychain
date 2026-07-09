@@ -285,7 +285,9 @@ use solana_keychain::{Signer, SolanaSigner};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `None` → default derivation path m/44'/501'/0' (matches Ledger Live).
     // Pass `true` to display the address on-device for the user to verify.
-    let signer = Signer::from_ledger(None, true)?;
+    // Final `None` → auto-select the sole connected Ledger (pass a host device
+    // path to disambiguate when several are attached).
+    let signer = Signer::from_ledger(None, true, None)?;
 
     println!("Public key: {}", signer.pubkey());
     Ok(())

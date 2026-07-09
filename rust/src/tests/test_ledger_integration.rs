@@ -18,10 +18,10 @@ mod tests {
     use crate::ledger::LedgerSigner;
     use crate::traits::SolanaSigner;
 
-    /// `connect(None, false)` either succeeds (device present) or returns a
+    /// `connect(None, false, None)` either succeeds (device present) or returns a
     /// clean `NotAvailable`/`UserRejected` error — it must never hang or panic.
     fn try_connect() -> Option<LedgerSigner> {
-        match LedgerSigner::connect(None, false) {
+        match LedgerSigner::connect(None, false, None) {
             Ok(signer) => Some(signer),
             Err(e) => {
                 eprintln!("skipping: no usable Ledger device ({e:?})");
