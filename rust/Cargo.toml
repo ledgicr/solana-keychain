@@ -48,6 +48,10 @@ utila = ["dep:reqwest", "dep:jsonwebtoken", "dep:chrono"]
 # Ledger hardware-wallet signing over USB-HID. Requires sdk-v3 (matches the
 # solana-* 3.x crates solana-remote-wallet pins). Not yet supported on sdk-v2/v4.
 ledger = ["dep:solana-remote-wallet", "dep:solana-derivation-path"]
+# NOTE: `ledger` is intentionally omitted here. It requires `sdk-v3` (enforced by
+# a `compile_error!` in lib.rs), so folding it into `all` would break the common
+# `--features all` build under the default `sdk-v2`. Enable it explicitly with
+# `--features ledger,sdk-v3`.
 all = [
     "memory",
     "vault",
