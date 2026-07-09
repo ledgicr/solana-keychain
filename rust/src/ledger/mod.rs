@@ -171,12 +171,26 @@ impl SolanaSigner for LedgerSigner {
         ))
     }
 
+    /// Sign `message` as a Solana **off-chain message**.
+    ///
+    /// A hardware wallet cannot raw-ed25519-sign arbitrary bytes the way the
+    /// software backends do. It signs a *structured* off-chain message: the
+    /// payload is wrapped in the Solana off-chain envelope (the
+    /// `\xffsolana offchain` signing domain + header) and the device signs that.
+    /// The returned signature therefore covers the **serialized
+    /// `OffchainMessage`**, not the raw `message` bytes. Verify it against the
+    /// serialized form (`OffchainMessage::new(0, message)?.serialize()?`) — a
+    /// plain `signature.verify(pubkey, message)` over the raw bytes will fail.
+    /// This deviates from the raw-bytes contract of the software backends by
+    /// necessity; see the `sign_message` note on [`SolanaSigner`].
     async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
-        let message = message.to_vec();
+        let serialized = solana_offchain_message::OffchainMessage::new(0, message)
+            .and_then(|m| m.serialize())
+            .map_err(|e| SignerError::ConfigError(format!("invalid off-chain message: {e:?}")))?;
         let cmd_tx = self.cmd_tx.clone();
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
             request_on(&cmd_tx, |reply| DeviceCommand::SignOffchainMessage {
-                message,
+                message: serialized,
                 reply,
             })
         })

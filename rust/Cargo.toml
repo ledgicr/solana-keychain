@@ -47,7 +47,11 @@ openfort = [
 utila = ["dep:reqwest", "dep:jsonwebtoken", "dep:chrono"]
 # Ledger hardware-wallet signing over USB-HID. Requires sdk-v3 (matches the
 # solana-* 3.x crates solana-remote-wallet pins). Not yet supported on sdk-v2/v4.
-ledger = ["dep:solana-remote-wallet", "dep:solana-derivation-path"]
+ledger = [
+    "dep:solana-remote-wallet",
+    "dep:solana-derivation-path",
+    "dep:solana-offchain-message",
+]
 # NOTE: `ledger` is intentionally omitted here. It requires `sdk-v3` (enforced by
 # a `compile_error!` in lib.rs), so folding it into `all` would break the common
 # `--features all` build under the default `sdk-v2`. Enable it explicitly with
@@ -101,6 +105,10 @@ solana-sdk-v4 = { package = "solana-sdk", version = "=4.0.1", optional = true }
 solana-remote-wallet = { version = "3.1.14", optional = true, features = ["agave-unstable-api"] }
 # DerivationPath type used by the ledger backend (same version solana-remote-wallet pins).
 solana-derivation-path = { version = "3.0.0", optional = true }
+# Off-chain message envelope for sign_message: a hardware wallet signs the
+# serialized OffchainMessage (\xffsolana offchain …), not raw bytes. Same 3.0.0
+# solana-remote-wallet already pulls, so no extra resolution.
+solana-offchain-message = { version = "3.0.0", optional = true }
 
 # Core dependencies
 async-trait = "0.1.89"

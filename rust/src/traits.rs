@@ -52,6 +52,16 @@ pub trait SolanaSigner: Send + Sync {
     /// # Returns
     ///
     /// The signature produced by signing the message
+    ///
+    /// # Backend divergence
+    ///
+    /// Software backends (memory, KMS, …) raw-ed25519-sign `message`, so the
+    /// result verifies with `signature.verify(pubkey, message)`. A **hardware**
+    /// backend (Ledger) cannot raw-sign arbitrary bytes; it wraps `message` in a
+    /// Solana off-chain message envelope (`\xffsolana offchain` …) and signs
+    /// that, so its signature verifies against the *serialized off-chain
+    /// message*, not the raw bytes. Callers/verifiers that need to accept
+    /// hardware signers must be off-chain-message aware.
     async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError>;
 
     /// Check if the signer is available and healthy

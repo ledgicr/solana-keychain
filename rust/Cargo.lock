@@ -6649,6 +6649,7 @@ dependencies = [
  "serial_test",
  "sha2 0.10.9",
  "solana-derivation-path 3.0.0",
+ "solana-offchain-message 3.0.0",
  "solana-remote-wallet",
  "solana-sdk 2.3.1",
  "solana-sdk 3.0.0",

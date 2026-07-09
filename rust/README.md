@@ -300,6 +300,12 @@ absent/locked device as `SignerError::NotAvailable`. The Solana app's
 clear-signing coverage determines what the device screen can display for a given
 transaction; anything it does not recognize is blind-signed.
 
+`sign_message` signs a Solana **off-chain message**: unlike the software
+backends (which raw-sign the bytes), the Ledger wraps the payload in the
+`\xffsolana offchain` envelope and signs that, so the signature verifies against
+the *serialized off-chain message*, not the raw bytes. Verifiers that accept
+hardware signers must be off-chain-message aware.
+
 ### Openfort Signer
 
 [Openfort backend wallet](https://www.openfort.io/docs/products/server) signer for Solana transactions.

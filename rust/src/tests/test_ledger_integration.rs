@@ -53,9 +53,15 @@ mod tests {
             .await
             .expect("device should sign the off-chain message");
         assert_eq!(signature.as_ref().len(), 64);
+        // `sign_message` signs the off-chain *envelope*, not the raw bytes, so
+        // verify against the serialized `OffchainMessage` (see the sign_message
+        // docs on the Ledger backend).
+        let serialized = solana_offchain_message::OffchainMessage::new(0, message)
+            .and_then(|m| m.serialize())
+            .expect("valid off-chain message");
         assert!(
-            signature.verify(&signer.pubkey().to_bytes(), message),
-            "signature must verify against the device pubkey"
+            signature.verify(&signer.pubkey().to_bytes(), &serialized),
+            "signature must verify against the serialized off-chain message"
         );
     }
 
