@@ -54,6 +54,7 @@ ledger = [
     "dep:solana-remote-wallet",
     "dep:solana-derivation-path",
     "dep:solana-offchain-message",
+    "dep:hidapi",
     "dep:tokio",
     "tokio/rt",
 ]
@@ -114,6 +115,12 @@ solana-derivation-path = { version = "3.0.0", optional = true }
 # serialized OffchainMessage (\xffsolana offchain …), not raw bytes. Same 3.0.0
 # solana-remote-wallet already pulls, so no extra resolution.
 solana-offchain-message = { version = "3.0.0", optional = true }
+# Direct HID access for the BOLOS dashboard (open-app / get-app) APDUs, which
+# solana-remote-wallet does not expose. Same version solana-remote-wallet pins,
+# so no extra resolution. Only used to auto-launch the Solana app before the
+# signer connects (the dashboard speaks different APDUs than the Solana app, and
+# get_ledger() fails while the app is closed).
+hidapi = { version = "2.6.6", optional = true }
 
 # Core dependencies
 async-trait = "0.1.89"
@@ -178,3 +185,4 @@ solana-transaction-litesvm-v4 = { package = "solana-transaction", version = "=3.
 agave-feature-set-pin = { package = "agave-feature-set", version = "=3.0.11" }
 serial_test = "3.3.1"
 scoped-env = "2.1"
+

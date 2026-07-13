@@ -22,6 +22,8 @@
 //! Currently gated to `sdk-v3` (see the `compile_error!` in `lib.rs`): the
 //! solana-* crate versions `solana-remote-wallet` pins line up with the v3 SDK.
 
+mod dashboard;
+
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
@@ -241,7 +243,7 @@ fn device_actor(
     cmd_rx: Receiver<DeviceCommand>,
 ) {
     // ── Connect ────────────────────────────────────────────────────────────
-    let connected = (|| {
+    let attempt = || {
         let path = DerivationPath::from_absolute_path_str(&path_str)
             .map_err(|e| SignerError::ConfigError(format!("invalid derivation path: {e}")))?;
 
@@ -306,7 +308,37 @@ fn device_actor(
             .map_err(map_rw_err)?;
 
         Ok::<_, SignerError>((ledger, path, pubkey.to_bytes()))
-    })();
+    };
+
+    // Try the normal Solana-app connection first: when the app is already open
+    // (the common case) this succeeds immediately and we never touch the
+    // dashboard — no second HID handle, no contention, no added latency.
+    let mut connected = attempt();
+
+    // If it failed, the Solana app may simply not be running. Once the user has
+    // unlocked with their PIN, auto-launch it for them (via the BOLOS dashboard)
+    // instead of erroring out with "open the Solana app", then retry across the
+    // USB re-enumeration that launching an app triggers. Best-effort: if the
+    // dashboard is unreachable we keep the original connect error. Declining the
+    // launch prompt on-device, though, is a real user decision — surface it.
+    if connected.is_err() {
+        match dashboard::ensure_solana_app_open(host_device_path.as_deref()) {
+            Ok(_launched) => {
+                for _ in 0..20 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    connected = attempt();
+                    if connected.is_ok() {
+                        break;
+                    }
+                }
+            }
+            Err(e @ SignerError::UserRejected(_)) => {
+                let _ = setup_tx.send(Err(e));
+                return;
+            }
+            Err(e) => log::debug!("could not auto-open the Solana app ({e:?}); continuing"),
+        }
+    }
 
     let (ledger, path) = match connected {
         Ok((ledger, path, pubkey_bytes)) => {
