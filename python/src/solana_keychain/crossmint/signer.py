@@ -20,6 +20,7 @@ from solana_keychain.core.transaction_util import (
     add_signature_to_transaction,
     classify_signed_transaction,
     serialize_transaction,
+    signed_message_bytes,
 )
 from solana_keychain.crossmint.derive import derive_signing_key
 
@@ -64,6 +65,10 @@ class CrossmintSignerConfig:
 
 class CrossmintSigner(SolanaSigner):
     """Signer backed by a Crossmint smart or MPC wallet.
+
+    Crossmint is a broadcast-managed signer: it rewrites the transaction (gas
+    sponsorship, priority fee, its own blockhash) and broadcasts server-side, so
+    returned signatures cover Crossmint's bytes rather than the caller's.
 
     ``init()`` must be awaited before signing — it resolves the wallet address.
     ``create_crossmint_signer()`` does this for you. ``sign_message`` is
@@ -311,7 +316,7 @@ class CrossmintSigner(SolanaSigner):
             )
 
     def _extract_signature_from_serialized_transaction(
-        self, serialized_transaction: str, expected_message: bytes
+        self, serialized_transaction: str
     ) -> Signature:
         try:
             transaction_bytes = base58.b58decode(serialized_transaction)
@@ -351,10 +356,12 @@ class CrossmintSigner(SolanaSigner):
                 "Crossmint onChain.transaction did not contain a signer signature",
             )
         signature = signatures[position]
-        # Verify against the caller's message bytes, not the returned ones: if the
-        # service rewrote the transaction (blockhash, wrapping), its signature does
-        # not sign the caller's transaction and must not be attached to it.
-        self._verify_signature_matches_message(signature, expected_message)
+        # Verify against the bytes Crossmint actually signed, not the caller's:
+        # Crossmint is a broadcast-managed signer that rewrites the transaction
+        # (gas sponsorship, priority fee, its own blockhash) and broadcasts
+        # server-side, so a strict check against caller bytes rejects legitimately
+        # landed transactions.
+        self._verify_signature_matches_message(signature, signed_message_bytes(message))
         return signature
 
     def _extract_signature_from_response(
@@ -366,7 +373,7 @@ class CrossmintSigner(SolanaSigner):
             if isinstance(serialized_transaction, str):
                 try:
                     return self._extract_signature_from_serialized_transaction(
-                        serialized_transaction, expected_message
+                        serialized_transaction
                     )
                 except SignerError:
                     pass
