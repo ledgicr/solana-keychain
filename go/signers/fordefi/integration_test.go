@@ -1,12 +1,13 @@
 //go:build integration
 
-package privy
+package fordefi
 
 import (
 	"bytes"
 	"context"
 	"encoding/base64"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gagliardetto/solana-go"
@@ -15,23 +16,28 @@ import (
 	"github.com/solana-foundation/solana-keychain/go/testutils"
 )
 
-// integrationSigner builds a signer against the live Privy API configured by
-// the environment, run by `just go-test-integration` (loads .env) or CI with
-// Doppler secrets.
+// integrationSigner builds a black-box signer against the live Fordefi API
+// configured by the environment, run by `just go-test-integration` (loads
+// .env) or CI with Doppler secrets.
 func integrationSigner(t *testing.T) *Signer {
 	t.Helper()
-	cfg := Config{
-		AppID:      requireEnv(t, "PRIVY_APP_ID"),
-		AppSecret:  requireEnv(t, "PRIVY_APP_SECRET"),
-		WalletID:   requireEnv(t, "PRIVY_WALLET_ID"),
-		APIBaseURL: os.Getenv("PRIVY_API_BASE_URL"),
+	pemPath := requireEnv(t, "FORDEFI_PRIVATE_KEY_PEM_PATH")
+	if !filepath.IsAbs(pemPath) {
+		pemPath = filepath.Join("..", "..", "..", pemPath)
 	}
-	if key := os.Getenv("PRIVY_AUTHORIZATION_PRIVATE_KEY"); key != "" {
-		cfg.AuthorizationContext = &AuthorizationContext{AuthorizationPrivateKeys: []string{key}}
-	}
-	s, err := New(context.Background(), cfg)
+	pemBytes, err := os.ReadFile(pemPath)
 	if err != nil {
-		t.Fatalf("failed to create privy signer: %v", err)
+		t.Fatalf("failed to read FORDEFI_PRIVATE_KEY_PEM_PATH: %v", err)
+	}
+	s, err := New(context.Background(), Config{
+		AccessToken:   requireEnv(t, "FORDEFI_ACCESS_TOKEN"),
+		VaultID:       requireEnv(t, "FORDEFI_BB_VAULT_ID"),
+		PublicKey:     requireEnv(t, "FORDEFI_BB_PUBLIC_KEY"),
+		PrivateKeyPEM: string(pemBytes),
+		APIBaseURL:    os.Getenv("FORDEFI_API_BASE_URL"),
+	})
+	if err != nil {
+		t.Fatalf("failed to create fordefi signer: %v", err)
 	}
 	return s
 }
@@ -64,7 +70,6 @@ func TestIntegrationSignMessage(t *testing.T) {
 	}
 }
 
-// There are no LiteSVM bindings for Go, so verification is cryptographic only.
 func TestIntegrationSignTransaction(t *testing.T) {
 	s := integrationSigner(t)
 	tx, err := testutils.CreateTestTransaction(s.Pubkey())
