@@ -23,6 +23,7 @@ vi.mock('@solana/keychain-cdp', () => ({ createCdpSigner: vi.fn() }));
 vi.mock('@solana/keychain-crossmint', () => ({ createCrossmintSigner: vi.fn() }));
 vi.mock('@solana/keychain-dfns', () => ({ createDfnsSigner: vi.fn() }));
 vi.mock('@solana/keychain-fireblocks', () => ({ createFireblocksSigner: vi.fn() }));
+vi.mock('@solana/keychain-fordefi', () => ({ createFordefiSigner: vi.fn() }));
 vi.mock('@solana/keychain-gcp-kms', () => ({ createGcpKmsSigner: vi.fn() }));
 vi.mock('@solana/keychain-memory', () => ({ createMemorySigner: vi.fn() }));
 vi.mock('@solana/keychain-openfort', () => ({ createOpenfortSigner: vi.fn() }));
@@ -64,6 +65,17 @@ const BACKEND_CONFIGS = {
         config: { backend: 'fireblocks', apiKey: 'key', privateKeyPem: 'pem', vaultAccountId: 'v' },
         factoryName: 'createFireblocksSigner',
         modulePath: '@solana/keychain-fireblocks',
+    },
+    fordefi: {
+        config: {
+            backend: 'fordefi',
+            accessToken: 'token',
+            privateKeyPem: 'pem',
+            publicKey: TEST_ADDRESS,
+            vaultId: 'vault',
+        },
+        factoryName: 'createFordefiSigner',
+        modulePath: '@solana/keychain-fordefi',
     },
     'gcp-kms': {
         config: { backend: 'gcp-kms', keyName: 'key', publicKey: TEST_ADDRESS },
@@ -175,5 +187,26 @@ describe('createKeychainSigner', () => {
         } catch (error) {
             expect((error as { code: string }).code).toBe(SignerErrorCode.CONFIG_ERROR);
         }
+    });
+
+    it('preserves the native Fordefi TransactionSendingSigner type', async () => {
+        const mod = await import('@solana/keychain-fordefi');
+        const factory = mod.createFordefiSigner as ReturnType<typeof vi.fn>;
+        const mockSigner = {
+            ...makeMockSigner(),
+            signAndSendTransactions: vi.fn().mockResolvedValue([]),
+        };
+        factory.mockResolvedValue(mockSigner);
+
+        const signer = await createKeychainSigner({
+            accessToken: 'token',
+            backend: 'fordefi',
+            chain: 'solana_devnet',
+            privateKeyPem: 'pem',
+            publicKey: TEST_ADDRESS,
+            vaultId: 'vault',
+        });
+
+        expect(signer.signAndSendTransactions).toBe(mockSigner.signAndSendTransactions);
     });
 });

@@ -1,5 +1,6 @@
 import type { SolanaSigner } from '@solana/keychain-core';
 import { SignerErrorCode, throwSignerError } from '@solana/keychain-core';
+import type { FordefiNativeSigner, FordefiSignerConfig, SolanaChainUniqueId } from '@solana/keychain-fordefi';
 
 import type { KeychainSignerConfig } from './types.js';
 
@@ -25,6 +26,10 @@ function stripBackend<T extends { backend: string }>({ backend: _, ...rest }: T)
  * });
  * ```
  */
+export function createKeychainSigner(
+    config: FordefiSignerConfig & { backend: 'fordefi'; chain: SolanaChainUniqueId },
+): Promise<FordefiNativeSigner>;
+export function createKeychainSigner(config: KeychainSignerConfig): Promise<SolanaSigner>;
 export async function createKeychainSigner(config: KeychainSignerConfig): Promise<SolanaSigner> {
     switch (config.backend) {
         case 'aws-kms': {
@@ -46,6 +51,10 @@ export async function createKeychainSigner(config: KeychainSignerConfig): Promis
         case 'fireblocks': {
             const { createFireblocksSigner } = await import('@solana/keychain-fireblocks');
             return await createFireblocksSigner(stripBackend(config));
+        }
+        case 'fordefi': {
+            const { createFordefiSigner } = await import('@solana/keychain-fordefi');
+            return await createFordefiSigner(stripBackend(config));
         }
         case 'gcp-kms': {
             const { createGcpKmsSigner } = await import('@solana/keychain-gcp-kms');
