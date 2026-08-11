@@ -129,11 +129,11 @@ jobs:
               ['dfns', 'dfns'],
               ['crossmint', 'crossmint'],
               ['openfort', 'openfort'],
+              ['utila', 'utila'],
             ];
 
             const goLiveModuleMap = [
               // gcpkms omitted: Workload Identity OIDC is not available in the fork external-live environment.
-              // fordefi omitted: no Go backend.
               ['privy', 'signers/privy'],
               ['turnkey', 'signers/turnkey'],
               ['fireblocks', 'signers/fireblocks'],
@@ -143,6 +143,8 @@ jobs:
               ['dfns', 'signers/dfns'],
               ['crossmint', 'signers/crossmint'],
               ['openfort', 'signers/openfort'],
+              ['utila', 'signers/utila'],
+              ['fordefi', 'signers/fordefi'],
             ];
 
             const rustFeatures = rustFeatureOrder.filter((backend) => enabled[backend]);
