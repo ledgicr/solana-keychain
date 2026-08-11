@@ -137,6 +137,7 @@ jobs:
               ['privy', 'signers/privy'],
               ['turnkey', 'signers/turnkey'],
               ['fireblocks', 'signers/fireblocks'],
+              ['fordefi', 'signers/fordefi'],
               ['aws_kms', 'signers/awskms'],
               ['para', 'signers/para'],
               ['cdp', 'signers/cdp'],
