@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -397,6 +398,18 @@ func TestSignTransactionSuccess(t *testing.T) {
 		if req.Params.Transaction == "" {
 			t.Error("create request missing base58 transaction")
 		}
+		submittedMessage, marshalErr := localTx.Message.MarshalBinary()
+		if marshalErr != nil {
+			t.Errorf("serialize submitted message: %v", marshalErr)
+		}
+		digest := sha256.Sum256(submittedMessage)
+		key := digest[:16]
+		key[6] = (key[6] & 0x0f) | 0x40
+		key[8] = (key[8] & 0x3f) | 0x80
+		want := fmt.Sprintf("%x-%x-%x-%x-%x", key[0:4], key[4:6], key[6:8], key[8:10], key[10:16])
+		if got := r.Header.Get("x-idempotency-key"); got != want {
+			t.Errorf("x-idempotency-key = %q, want %q", got, want)
+		}
 		writeJSON(w, http.StatusCreated, fmt.Sprintf(
 			`{"id":"tx-123","status":"success","chainType":"solana","walletType":"smart","onChain":{"transaction":%q}}`,
 			onChainTransaction))
@@ -424,6 +437,64 @@ func TestSignTransactionSuccess(t *testing.T) {
 	if decoded.Signatures[0] != expectedSignature {
 		t.Error("encoded transaction signature mismatch at position 0")
 	}
+}
+
+// createStatusSigner points a signer at a create endpoint answering status/body.
+func createStatusSigner(t *testing.T, status int, body string) *Signer {
+	t.Helper()
+	priv := testutils.TestPrivateKey()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+testWalletPath, walletHandler(t, testAPIKey, pubkeyOf(priv).String()))
+	mux.HandleFunc("POST "+testWalletPath+"/transactions", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, status, body)
+	})
+	cfg := baseConfig(startServer(t, mux))
+	cfg.MaxPollAttempts = 1
+	return newTestSigner(t, cfg)
+}
+
+// assertUnconfirmedWithoutID checks for an unconfirmed broadcast with no id,
+// carrying wantStatus (0 when the provider sent no failing status).
+func assertUnconfirmedWithoutID(t *testing.T, err error, wantStatus int) {
+	t.Helper()
+	assertCode(t, err, core.CodeBroadcastUnconfirmed)
+	var se *core.SignerError
+	if !errors.As(err, &se) || se.ProviderTxID != "" {
+		t.Errorf("error must carry no provider transaction id, got %v", err)
+	}
+	if se != nil && se.ProviderStatus != wantStatus {
+		t.Errorf("provider status = %d, want %d", se.ProviderStatus, wantStatus)
+	}
+}
+
+func TestCreateServerErrorIsUnconfirmedWithoutID(t *testing.T) {
+	s := createStatusSigner(t, http.StatusServiceUnavailable, `{"message":"unavailable"}`)
+	tx, err := testutils.CreateTestTransaction(s.Pubkey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignTransaction(context.Background(), tx)
+	assertUnconfirmedWithoutID(t, err, http.StatusServiceUnavailable)
+}
+
+func TestCreateAcceptedWithoutIDIsUnconfirmed(t *testing.T) {
+	s := createStatusSigner(t, http.StatusCreated, `{"status":"pending"}`)
+	tx, err := testutils.CreateTestTransaction(s.Pubkey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignTransaction(context.Background(), tx)
+	assertUnconfirmedWithoutID(t, err, 0)
+}
+
+func TestCreateRejectionStaysPlainFailure(t *testing.T) {
+	s := createStatusSigner(t, http.StatusBadRequest, `{"message":"invalid transaction"}`)
+	tx, err := testutils.CreateTestTransaction(s.Pubkey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignTransaction(context.Background(), tx)
+	assertCode(t, err, core.CodeRemoteAPIError)
 }
 
 // TestSignTransactionRejectsApprovalSignaturesForLocalTransactionBytes:
@@ -454,7 +525,7 @@ func TestSignTransactionRejectsApprovalSignaturesForLocalTransactionBytes(t *tes
 		t.Fatal(err)
 	}
 	_, err = s.SignTransaction(context.Background(), tx)
-	assertCode(t, err, core.CodeSigningFailed)
+	assertCode(t, err, core.CodeBroadcastUnconfirmed)
 	if detail := detailOf(t, err); !strings.Contains(detail, "unable to extract signature") {
 		t.Errorf("detail = %q, want it to contain %q", detail, "unable to extract signature")
 	}
@@ -494,6 +565,281 @@ func TestSignTransactionAcceptsSignatureFromOnChainTransactionBytes(t *testing.T
 	}
 	if res.Signature != remoteSignature {
 		t.Errorf("signature = %s, want %s", res.Signature, remoteSignature)
+	}
+	// Crossmint sponsors gas, so it is the fee payer and the message it signs
+	// differs from the caller's. Its signature must never be placed in the
+	// caller's transaction, which could not verify with it.
+	if res.EncodedTransaction != "" {
+		t.Error("a Crossmint-broadcast transaction leaves nothing for the caller to send")
+	}
+	for _, sig := range localTx.Signatures {
+		if !sig.IsZero() {
+			t.Error("the caller's transaction must not carry a signature over other bytes")
+		}
+	}
+}
+
+// A returned transaction whose message matches the submitted one really is signed
+// over the caller's bytes, so the signature belongs in the caller's transaction.
+// A smart wallet is signed by its delegated signer, not by the wallet address the
+// API reports, so the delegated key must be a verification candidate.
+func TestSignTransactionLocatesDelegatedSignerSignature(t *testing.T) {
+	secret := signerSecretPrefix + strings.Repeat("ab", 32)
+	derivableAPIKey := "sk_staging_" + base58.Encode([]byte("proj:sig"))
+	delegatedPriv, err := deriveSigningKey(secret, derivableAPIKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegated := solana.PublicKeyFromBytes(delegatedPriv.Public().(ed25519.PublicKey))
+	walletPub := testutils.TestPublicKey()
+	if delegated.Equals(walletPub) {
+		t.Fatal("delegated signer must differ from the wallet address for this test")
+	}
+
+	rewritten, err := testutils.CreateTestTransaction(delegated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewrittenMsg, err := rewritten.Message.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSignature := solana.SignatureFromBytes(ed25519.Sign(delegatedPriv, rewrittenMsg))
+	rewritten.Signatures = []solana.Signature{expectedSignature}
+	wireBytes, err := rewritten.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+testWalletPath, walletHandler(t, derivableAPIKey, walletPub.String()))
+	mux.HandleFunc("POST "+testWalletPath+"/transactions", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusCreated, fmt.Sprintf(
+			`{"id":"tx-delegated","status":"success","onChain":{"transaction":%q}}`,
+			base58.Encode(wireBytes)))
+	})
+	srv := startServer(t, mux)
+
+	cfg := baseConfig(srv)
+	cfg.APIKey = derivableAPIKey
+	cfg.MaxPollAttempts = 1
+	cfg.SignerSecret = secret
+	s := newTestSigner(t, cfg)
+
+	localTx, err := testutils.CreateTestTransaction(walletPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.SignTransaction(context.Background(), localTx)
+	if err != nil {
+		t.Fatalf("SignTransaction: %v (detail: %s)", err, detailOf(t, err))
+	}
+	if res.Signature != expectedSignature {
+		t.Errorf("signature = %s, want %s", res.Signature, expectedSignature)
+	}
+	if !s.Pubkey().Equals(walletPub) {
+		t.Error("the wallet address remains the signer's public identity")
+	}
+}
+
+// Under sponsorship the returned signature must be the sponsor fee-payer's
+// slot-0 signature, not the wallet's approval, so RPC lookups resolve.
+func TestSignTransactionSponsoredReturnsFeePayerTransactionID(t *testing.T) {
+	secret := signerSecretPrefix + strings.Repeat("cd", 32)
+	derivableAPIKey := "sk_staging_" + base58.Encode([]byte("proj:sig"))
+	delegatedPriv, err := deriveSigningKey(secret, derivableAPIKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegated := solana.PublicKeyFromBytes(delegatedPriv.Public().(ed25519.PublicKey))
+	walletPub := testutils.TestPublicKey()
+
+	sponsorPriv := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x5e}, ed25519.SeedSize))
+	sponsor := solana.PublicKeyFromBytes(sponsorPriv.Public().(ed25519.PublicKey))
+	executed, err := testutils.CreateTestTransaction(sponsor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executedMsg, err := executed.Message.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	feePayerSignature := solana.SignatureFromBytes(ed25519.Sign(sponsorPriv, executedMsg))
+	executed.Signatures = []solana.Signature{feePayerSignature}
+	wireBytes, err := executed.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvalSignature := solana.SignatureFromBytes(ed25519.Sign(delegatedPriv, executedMsg))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+testWalletPath, walletHandler(t, derivableAPIKey, walletPub.String()))
+	mux.HandleFunc("POST "+testWalletPath+"/transactions", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusCreated, fmt.Sprintf(
+			`{"id":"tx-sponsored","status":"success","approvals":{"submitted":[{"signature":%q,"signer":{"address":%q}}]},"onChain":{"transaction":%q}}`,
+			approvalSignature.String(), delegated.String(), base58.Encode(wireBytes)))
+	})
+	srv := startServer(t, mux)
+
+	cfg := baseConfig(srv)
+	cfg.APIKey = derivableAPIKey
+	cfg.MaxPollAttempts = 1
+	cfg.SignerSecret = secret
+	s := newTestSigner(t, cfg)
+
+	localTx, err := testutils.CreateTestTransaction(walletPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.SignTransaction(context.Background(), localTx)
+	if err != nil {
+		t.Fatalf("SignTransaction: %v (detail: %s)", err, detailOf(t, err))
+	}
+	if res.Signature != feePayerSignature {
+		t.Errorf("signature = %s, want fee payer %s", res.Signature, feePayerSignature)
+	}
+	if res.Signature == approvalSignature {
+		t.Error("the approval signature must not be returned as the transaction id")
+	}
+	if res.EncodedTransaction != "" {
+		t.Error("a Crossmint-broadcast transaction leaves nothing for the caller to send")
+	}
+}
+
+// A wallet can be configured with both SignerSecret and an explicit Signer locator
+// naming a different key, e.g. the wallet's admin signer. Either may be the key
+// that actually signs, so both must be candidates.
+func TestSignTransactionExplicitLocatorSignerIsACandidate(t *testing.T) {
+	walletPub := testutils.TestPublicKey()
+	adminPriv := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x7c}, ed25519.SeedSize))
+	admin := solana.PublicKeyFromBytes(adminPriv.Public().(ed25519.PublicKey))
+
+	rewritten, err := testutils.CreateTestTransaction(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewrittenMsg, err := rewritten.Message.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSignature := solana.SignatureFromBytes(ed25519.Sign(adminPriv, rewrittenMsg))
+	rewritten.Signatures = []solana.Signature{expectedSignature}
+	wireBytes, err := rewritten.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	derivableAPIKey := "sk_staging_" + base58.Encode([]byte("proj:sig"))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+testWalletPath, walletHandler(t, derivableAPIKey, walletPub.String()))
+	mux.HandleFunc("POST "+testWalletPath+"/transactions", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusCreated, fmt.Sprintf(
+			`{"id":"tx-admin","status":"success","onChain":{"transaction":%q}}`, base58.Encode(wireBytes)))
+	})
+	srv := startServer(t, mux)
+
+	cfg := baseConfig(srv)
+	cfg.APIKey = derivableAPIKey
+	cfg.MaxPollAttempts = 1
+	cfg.SignerSecret = signerSecretPrefix + strings.Repeat("ab", 32)
+	cfg.Signer = "server:" + admin.String()
+	s := newTestSigner(t, cfg)
+
+	localTx, err := testutils.CreateTestTransaction(walletPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.SignTransaction(context.Background(), localTx)
+	if err != nil {
+		t.Fatalf("SignTransaction: %v (detail: %s)", err, detailOf(t, err))
+	}
+	if res.Signature != expectedSignature {
+		t.Errorf("signature = %s, want %s", res.Signature, expectedSignature)
+	}
+}
+
+// Widening the candidate set must not accept a key that is neither the wallet
+// address nor the configured delegated signer.
+func TestSignTransactionRejectsUnrelatedSignerKey(t *testing.T) {
+	walletPub := testutils.TestPublicKey()
+	strangerPriv := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x5a}, ed25519.SeedSize))
+	stranger := solana.PublicKeyFromBytes(strangerPriv.Public().(ed25519.PublicKey))
+
+	rewritten, err := testutils.CreateTestTransaction(stranger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewrittenMsg, err := rewritten.Message.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewritten.Signatures = []solana.Signature{solana.SignatureFromBytes(ed25519.Sign(strangerPriv, rewrittenMsg))}
+	wireBytes, err := rewritten.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	derivableAPIKey := "sk_staging_" + base58.Encode([]byte("proj:sig"))
+	mux.HandleFunc("GET "+testWalletPath, walletHandler(t, derivableAPIKey, walletPub.String()))
+	mux.HandleFunc("POST "+testWalletPath+"/transactions", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusCreated, fmt.Sprintf(
+			`{"id":"tx-stranger","status":"success","onChain":{"transaction":%q}}`,
+			base58.Encode(wireBytes)))
+	})
+	srv := startServer(t, mux)
+
+	cfg := baseConfig(srv)
+	cfg.APIKey = derivableAPIKey
+	cfg.MaxPollAttempts = 1
+	cfg.SignerSecret = signerSecretPrefix + strings.Repeat("ab", 32)
+	s := newTestSigner(t, cfg)
+
+	localTx, err := testutils.CreateTestTransaction(walletPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignTransaction(context.Background(), localTx)
+	if code, _ := core.CodeOf(err); code != core.CodeBroadcastUnconfirmed {
+		t.Errorf("got %s, want BROADCAST_UNCONFIRMED", code)
+	}
+}
+
+func TestSignTransactionUnrewrittenTransactionSignsCallerBytes(t *testing.T) {
+	priv := testutils.TestPrivateKey()
+	signerPubkey := pubkeyOf(priv)
+
+	localTx, err := testutils.CreateTestTransaction(signerPubkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	returned, err := testutils.CreateTestTransaction(signerPubkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	onChainTransaction, expectedSignature := signAndEncodeB58(t, returned, priv)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+testWalletPath, walletHandler(t, testAPIKey, signerPubkey.String()))
+	mux.HandleFunc("POST "+testWalletPath+"/transactions", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusCreated, fmt.Sprintf(
+			`{"id":"tx-exact","status":"success","onChain":{"transaction":%q}}`, onChainTransaction))
+	})
+	srv := startServer(t, mux)
+
+	cfg := baseConfig(srv)
+	cfg.MaxPollAttempts = 1
+	s := newTestSigner(t, cfg)
+
+	res, err := s.SignTransaction(context.Background(), localTx)
+	if err != nil {
+		t.Fatalf("SignTransaction: %v (detail: %s)", err, detailOf(t, err))
+	}
+	if res.EncodedTransaction == "" {
+		t.Error("an unrewritten transaction is the caller's to broadcast")
+	}
+	if len(localTx.Signatures) == 0 || localTx.Signatures[0] != expectedSignature {
+		t.Error("the signature covers the caller's bytes and belongs in its transaction")
 	}
 }
 
@@ -550,7 +896,7 @@ func TestSignTransactionAwaitingApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = s.SignTransaction(context.Background(), tx)
-	assertCode(t, err, core.CodeSigningFailed)
+	assertCode(t, err, core.CodeBroadcastUnconfirmed)
 	if detail := detailOf(t, err); !strings.Contains(detail, "awaiting approval") {
 		t.Errorf("detail = %q, want it to contain %q", detail, "awaiting approval")
 	}
@@ -616,7 +962,7 @@ func TestSignTransactionFailedStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = s.SignTransaction(context.Background(), tx)
-	assertCode(t, err, core.CodeSigningFailed)
+	assertCode(t, err, core.CodeBroadcastUnconfirmed)
 	detail := detailOf(t, err)
 	if !strings.Contains(detail, "Crossmint transaction failed") || !strings.Contains(detail, "insufficient funds") {
 		t.Errorf("detail = %q, want it to contain the failed-status message and remote reason", detail)
@@ -642,9 +988,13 @@ func TestSignTransactionPollingTimesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = s.SignTransaction(context.Background(), tx)
-	assertCode(t, err, core.CodeRemoteAPIError)
+	assertCode(t, err, core.CodeBroadcastUnconfirmed)
 	if detail := detailOf(t, err); !strings.Contains(detail, "polling timed out after 2 attempts") {
 		t.Errorf("detail = %q, want it to contain %q", detail, "polling timed out after 2 attempts")
+	}
+	var se *core.SignerError
+	if !errors.As(err, &se) || se.ProviderTxID != "tx-123" {
+		t.Errorf("ProviderTxID = %v, want tx-123", se)
 	}
 }
 
@@ -837,7 +1187,7 @@ func TestSignTransactionAwaitingApprovalNoPendingMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = s.SignTransaction(context.Background(), tx)
-	assertCode(t, err, core.CodeSigningFailed)
+	assertCode(t, err, core.CodeBroadcastUnconfirmed)
 	if detail := detailOf(t, err); !strings.Contains(detail, "no pending message found") {
 		t.Errorf("detail = %q, want it to contain %q", detail, "no pending message found")
 	}

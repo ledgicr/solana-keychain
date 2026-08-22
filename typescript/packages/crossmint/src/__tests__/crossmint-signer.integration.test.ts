@@ -1,11 +1,10 @@
 import {
     type Blockhash,
-    createSignableMessage,
     createTransactionMessage,
     pipe,
     setTransactionMessageFeePayerSigner,
     setTransactionMessageLifetimeUsingBlockhash,
-    signTransactionMessageWithSigners,
+    signAndSendTransactionMessageWithSigners,
 } from '@solana/kit';
 import { describe, expect, it } from 'vitest';
 import { getConfig } from './setup';
@@ -37,7 +36,7 @@ const SIGN_TEST_TIMEOUT_MS = 90_000;
 
 describe('CrossmintSigner Integration', () => {
     it.skipIf(!process.env.CROSSMINT_API_KEY)(
-        'signs transactions with real API',
+        'signs and broadcasts transactions with real API',
         { timeout: SIGN_TEST_TIMEOUT_MS },
         async () => {
             const { createSigner } = await getConfig(['signTransaction']);
@@ -50,18 +49,20 @@ describe('CrossmintSigner Integration', () => {
                 tx => setTransactionMessageLifetimeUsingBlockhash({ blockhash, lastValidBlockHeight }, tx),
             );
 
-            const signedTx = await signTransactionMessageWithSigners(transaction);
+            // Crossmint broadcasts server-side, so the result is the signature of
+            // the transaction it landed, not a signature over these message bytes.
+            const signature = await signAndSendTransactionMessageWithSigners(transaction);
 
-            expect(signedTx.signatures[signer.address]).toBeDefined();
-            expect(signedTx.signatures[signer.address]?.byteLength).toBe(64);
+            expect(signature).toBeDefined();
+            expect(signature.byteLength).toBe(64);
         },
     );
 
-    it.skipIf(!process.env.CROSSMINT_API_KEY)('returns not supported for signMessages', async () => {
-        const { createSigner } = await getConfig(['signMessage']);
+    it.skipIf(!process.env.CROSSMINT_API_KEY)('does not expose partial-signer methods', async () => {
+        const { createSigner } = await getConfig([]);
         const signer = await createSigner();
-        const message = createSignableMessage(new Uint8Array([1, 2, 3]));
-        await expect(signer.signMessages([message])).rejects.toThrow('not supported');
+        expect('signMessages' in signer).toBe(false);
+        expect('signTransactions' in signer).toBe(false);
     });
 
     it.skipIf(!process.env.CROSSMINT_API_KEY)('checks availability', async () => {

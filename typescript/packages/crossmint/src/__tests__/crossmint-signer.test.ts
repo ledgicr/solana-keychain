@@ -1,4 +1,11 @@
-import { createPrivateKey, createPublicKey, hkdfSync, sign as cryptoSign, verify as cryptoVerify } from 'node:crypto';
+import {
+    createHash,
+    createPrivateKey,
+    createPublicKey,
+    hkdfSync,
+    sign as cryptoSign,
+    verify as cryptoVerify,
+} from 'node:crypto';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { getBase16Encoder, getBase58Decoder, getBase58Encoder } from '@solana/codecs-strings';
@@ -17,7 +24,8 @@ vi.mock('@solana/transactions', async importOriginal => {
     };
 });
 
-import { assertIsSolanaSigner, assertSignatureValid } from '@solana/keychain-core';
+import { assertSignatureValid, isSolanaSendingSigner, isSolanaSigner, type SignerError } from '@solana/keychain-core';
+import { isMessagePartialSigner, isTransactionPartialSigner, isTransactionSendingSigner } from '@solana/signers';
 import { getTransactionDecoder } from '@solana/transactions';
 import { createCrossmintSigner } from '../crossmint-signer.js';
 
@@ -109,7 +117,7 @@ describe('CrossmintSigner', () => {
             const signer = await createCrossmintSigner(mockConfig);
 
             expect(signer.address).toBe(MOCK_ADDRESS);
-            assertIsSolanaSigner(signer);
+            expect(isSolanaSendingSigner(signer)).toBe(true);
             expect(fetch).toHaveBeenCalledWith(
                 'https://api.test.crossmint.com/api/2025-06-09/wallets/userId%3Atest-user%3Asolana%3Asmart',
                 expect.objectContaining({
@@ -204,24 +212,26 @@ describe('CrossmintSigner', () => {
         });
     });
 
-    describe('signMessages', () => {
-        it('returns not supported error', async () => {
+    describe('signer classification', () => {
+        it('is a sending signer in both directions of every guard', async () => {
             vi.mocked(fetch).mockResolvedValueOnce(mockWalletResponse());
             const signer = await createCrossmintSigner(mockConfig);
+            const guardInput = signer as unknown as { [key: string]: unknown; address: typeof signer.address };
 
-            const message = {
-                content: new Uint8Array([1, 2, 3]),
-                signatures: {},
-            };
-
-            await expect(signer.signMessages([message])).rejects.toMatchObject({
-                code: 'SIGNER_SIGNING_FAILED',
-                message: expect.stringContaining('not supported'),
-            });
+            // Kit classifies by method presence, so the absent methods are the
+            // contract: a present-but-throwing signTransactions/signMessages
+            // would make Kit partial-sign and fail at runtime.
+            expect('signTransactions' in signer).toBe(false);
+            expect('signMessages' in signer).toBe(false);
+            expect(isTransactionPartialSigner(guardInput)).toBe(false);
+            expect(isMessagePartialSigner(guardInput)).toBe(false);
+            expect(isTransactionSendingSigner(guardInput)).toBe(true);
+            expect(isSolanaSigner(signer)).toBe(false);
+            expect(isSolanaSendingSigner(signer)).toBe(true);
         });
     });
 
-    describe('signTransactions', () => {
+    describe('signAndSendTransactions', () => {
         it('signs via managed flow and extracts signature from txId', async () => {
             vi.mocked(fetch)
                 .mockResolvedValueOnce(mockWalletResponse()) // create()
@@ -251,9 +261,9 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            const results = await signer.signTransactions([createMockTransaction()]);
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
             expect(results).toHaveLength(1);
-            const signature = results[0]![signer.address];
+            const signature = results[0];
 
             expect(signature).toBeDefined();
             expect(signature?.length).toBe(64);
@@ -291,8 +301,12 @@ describe('CrossmintSigner', () => {
             });
 
             await expect(
-                signer.signTransactions([createMockTransaction(), createMockTransaction(), createMockTransaction()]),
-            ).rejects.toMatchObject({ code: 'SIGNER_REMOTE_API_ERROR' });
+                signer.signAndSendTransactions([
+                    createMockTransaction(),
+                    createMockTransaction(),
+                    createMockTransaction(),
+                ]),
+            ).rejects.toMatchObject({ code: 'SIGNER_BROADCAST_UNCONFIRMED' });
 
             // wallet create + tx0 create + tx1 create = 3 fetches; tx2 must not be created.
             expect(vi.mocked(fetch)).toHaveBeenCalledTimes(3);
@@ -318,9 +332,9 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            const results = await signer.signTransactions([createMockTransaction()]);
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
             expect(results).toHaveLength(1);
-            expect(results[0]![signer.address]).toEqual(MOCK_SIGNATURE_BYTES);
+            expect(results[0]).toEqual(MOCK_SIGNATURE_BYTES);
             // Signature is verified against the returned transaction's message bytes
             // (Crossmint may refresh the blockhash before signing).
             expect(assertSignatureValid).toHaveBeenCalledWith({
@@ -328,6 +342,80 @@ describe('CrossmintSigner', () => {
                 signature: MOCK_SIGNATURE_BYTES,
                 signerAddress: signer.address,
             });
+        });
+
+        /**
+         * Aborting stops this client from waiting; it cannot recall work Crossmint
+         * has accepted, so the point is that polling ends rather than running to
+         * the full attempt budget.
+         */
+        it('stops polling when the abort signal fires mid-flight', async () => {
+            const controller = new AbortController();
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockWalletResponse())
+                .mockResolvedValueOnce(
+                    new Response(JSON.stringify({ id: 'tx-abort', status: 'pending' }), { status: 201 }),
+                )
+                .mockImplementation(async () => {
+                    controller.abort();
+                    return new Response(JSON.stringify({ id: 'tx-abort', status: 'pending' }), { status: 200 });
+                });
+
+            const signer = await createCrossmintSigner({
+                ...mockConfig,
+                maxPollAttempts: 50,
+                pollIntervalMs: 1,
+            });
+
+            await expect(
+                signer.signAndSendTransactions([createMockTransaction()], { abortSignal: controller.signal }),
+            ).rejects.toThrow();
+            // Far fewer than the 50-attempt budget: wallet + create + a poll or two.
+            expect(vi.mocked(fetch).mock.calls.length).toBeLessThan(6);
+        });
+
+        /**
+         * `AbortSignal.any` requires Node.js >= 20.3 while the package supports
+         * >= 18, so the abort-plus-timeout composition must also work without it.
+         */
+        it('honors the abort signal on runtimes without AbortSignal.any', async () => {
+            const originalAny = AbortSignal.any;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (AbortSignal as any).any = undefined;
+            try {
+                const controller = new AbortController();
+                vi.mocked(fetch)
+                    .mockResolvedValueOnce(mockWalletResponse())
+                    .mockImplementation(async (_input, init) => {
+                        controller.abort();
+                        expect(init?.signal?.aborted).toBe(true);
+                        return new Response(JSON.stringify({ id: 'tx-abort', status: 'pending' }), { status: 201 });
+                    });
+
+                const signer = await createCrossmintSigner({
+                    ...mockConfig,
+                    maxPollAttempts: 50,
+                    pollIntervalMs: 1,
+                });
+
+                await expect(
+                    signer.signAndSendTransactions([createMockTransaction()], { abortSignal: controller.signal }),
+                ).rejects.toThrow();
+                expect(vi.mocked(fetch).mock.calls.length).toBeLessThan(6);
+            } finally {
+                AbortSignal.any = originalAny;
+            }
+        });
+
+        it('exposes a TransactionSendingSigner so Kit routes it through send, not partial signing', async () => {
+            vi.mocked(fetch).mockResolvedValueOnce(mockWalletResponse());
+            const signer = await createCrossmintSigner(mockConfig);
+
+            expect(
+                isTransactionSendingSigner(
+                    signer as unknown as { [key: string]: unknown; address: typeof signer.address },
+                ),
+            ).toBe(true);
         });
 
         it('extracts signature from serialized transaction even when returned message bytes differ', async () => {
@@ -354,8 +442,8 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            const results = await signer.signTransactions([createMockTransaction()]);
-            expect(results[0]![signer.address]).toEqual(MOCK_SIGNATURE_BYTES);
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
+            expect(results[0]).toEqual(MOCK_SIGNATURE_BYTES);
             // Verification uses the returned message bytes, not the original ones
             expect(assertSignatureValid).toHaveBeenCalledWith({
                 data: returnedMessageBytes,
@@ -386,11 +474,142 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toMatchObject({
-                code: 'SIGNER_SIGNING_FAILED',
-                message: expect.stringContaining('Unable to extract signature'),
+            await expect(signer.signAndSendTransactions([createMockTransaction()])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({
+                    cause: expect.objectContaining({
+                        code: 'SIGNER_SIGNING_FAILED',
+                        message: expect.stringContaining('Unable to extract signature'),
+                    }),
+                    providerTransactionId: 'tx-approval',
+                }),
             });
             expect(assertSignatureValid).not.toHaveBeenCalled();
+        });
+
+        /**
+         * A smart wallet is signed by its delegated signer, not by the wallet address
+         * the API reports, so the delegated address must be a verification candidate.
+         */
+        it('locates a signature made by the delegated signer', async () => {
+            const DELEGATED_ADDRESS = 'SysvarC1ock11111111111111111111111111111111';
+            vi.mocked(getTransactionDecoder).mockReturnValue({
+                decode: vi.fn(() => createDecodedTransaction({ signerAddress: DELEGATED_ADDRESS })),
+            } as any);
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockWalletResponse())
+                .mockResolvedValueOnce(
+                    new Response(
+                        JSON.stringify({
+                            id: 'tx-delegated',
+                            status: 'success',
+                            onChain: { transaction: MOCK_SERIALIZED_TRANSACTION_B58 },
+                        }),
+                        { status: 201 },
+                    ),
+                );
+
+            const signer = await createCrossmintSigner({
+                ...mockConfig,
+                maxPollAttempts: 1,
+                pollIntervalMs: 1,
+                signer: `server:${DELEGATED_ADDRESS}`,
+            });
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
+
+            expect(results[0]).toEqual(MOCK_SIGNATURE_BYTES);
+            // Verified against the delegated signer, not the wallet address.
+            expect(assertSignatureValid).toHaveBeenCalledWith(
+                expect.objectContaining({ signerAddress: DELEGATED_ADDRESS }),
+            );
+            // The wallet address remains the signer's public identity.
+            expect(signer.address).toBe(MOCK_ADDRESS);
+        });
+
+        /**
+         * A submitted approval may carry its identity only as a `server:<address>`
+         * locator, with no `address` field — the same identity format `pending`
+         * entries use.
+         */
+        it('locates a submitted approval identified only by its server locator', async () => {
+            const DELEGATED_ADDRESS = 'SysvarC1ock11111111111111111111111111111111';
+            // No candidate holds a slot signature, so extraction falls through to
+            // approvals.submitted.
+            vi.mocked(getTransactionDecoder).mockReturnValue({
+                decode: vi.fn(() => createDecodedTransaction({ signerAddress: 'someone-else' })),
+            } as any);
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockWalletResponse())
+                .mockResolvedValueOnce(
+                    new Response(
+                        JSON.stringify({
+                            id: 'tx-locator-only',
+                            status: 'success',
+                            approvals: {
+                                submitted: [
+                                    {
+                                        signature: MOCK_SIGNATURE_B58,
+                                        signer: { locator: `server:${DELEGATED_ADDRESS}` },
+                                    },
+                                ],
+                            },
+                            onChain: { transaction: MOCK_SERIALIZED_TRANSACTION_B58 },
+                        }),
+                        { status: 201 },
+                    ),
+                );
+
+            const signer = await createCrossmintSigner({
+                ...mockConfig,
+                maxPollAttempts: 1,
+                pollIntervalMs: 1,
+                signer: `server:${DELEGATED_ADDRESS}`,
+            });
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
+
+            expect(results[0]).toEqual(MOCK_SIGNATURE_BYTES);
+            expect(assertSignatureValid).toHaveBeenCalledWith(
+                expect.objectContaining({ signerAddress: DELEGATED_ADDRESS }),
+            );
+        });
+
+        /**
+         * A wallet can be configured with both signerSecret and an explicit signer
+         * locator naming a different key, e.g. the wallet's admin signer. Either may
+         * be the key that actually signs, so both must be candidates.
+         */
+        it('treats an explicit locator signer as a candidate alongside the derived key', async () => {
+            const ADMIN_ADDRESS = 'SysvarRent111111111111111111111111111111111';
+            vi.mocked(getTransactionDecoder).mockReturnValue({
+                decode: vi.fn(() => createDecodedTransaction({ signerAddress: ADMIN_ADDRESS })),
+            } as any);
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockWalletResponse())
+                .mockResolvedValueOnce(
+                    new Response(
+                        JSON.stringify({
+                            id: 'tx-admin',
+                            status: 'success',
+                            onChain: { transaction: MOCK_SERIALIZED_TRANSACTION_B58 },
+                        }),
+                        { status: 201 },
+                    ),
+                );
+
+            const signer = await createCrossmintSigner({
+                ...mockConfig,
+                apiKey: `sk_staging_${base58Decoder.decode(new TextEncoder().encode('proj:sig'))}`,
+                maxPollAttempts: 1,
+                pollIntervalMs: 1,
+                signer: `server:${ADMIN_ADDRESS}`,
+                signerSecret: 'a'.repeat(64),
+            });
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
+
+            expect(results[0]).toEqual(MOCK_SIGNATURE_BYTES);
+            expect(assertSignatureValid).toHaveBeenCalledWith(
+                expect.objectContaining({ signerAddress: ADMIN_ADDRESS }),
+            );
         });
 
         it('rejects when no signature can be extracted', async () => {
@@ -416,9 +635,15 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toMatchObject({
-                code: 'SIGNER_SIGNING_FAILED',
-                message: expect.stringContaining('Unable to extract signature'),
+            await expect(signer.signAndSendTransactions([createMockTransaction()])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({
+                    cause: expect.objectContaining({
+                        code: 'SIGNER_SIGNING_FAILED',
+                        message: expect.stringContaining('Unable to extract signature'),
+                    }),
+                    providerTransactionId: 'tx-no-sig',
+                }),
             });
             expect(assertSignatureValid).not.toHaveBeenCalled();
         });
@@ -451,8 +676,8 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            const results = await signer.signTransactions([createMockTransaction()]);
-            expect(results[0]![signer.address]).toEqual(MOCK_SIGNATURE_BYTES);
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
+            expect(results[0]).toEqual(MOCK_SIGNATURE_BYTES);
             expect(assertSignatureValid).toHaveBeenCalledWith({
                 data: MOCK_MESSAGE_BYTES,
                 signature: MOCK_SIGNATURE_BYTES,
@@ -460,7 +685,11 @@ describe('CrossmintSigner', () => {
             });
         });
 
-        it('rejects txId when transaction decode throws and txId validation fails', async () => {
+        /**
+         * When both paths fail, callers still get a stable SignerError code with
+         * the embedded-transaction error as its cause.
+         */
+        it('reports the embedded-transaction failure when txId validation also fails', async () => {
             vi.mocked(getTransactionDecoder).mockReturnValue({
                 decode: vi.fn(() => {
                     throw new Error('decode failed');
@@ -489,9 +718,80 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toThrow(
-                'signature validation failed',
+            await expect(signer.signAndSendTransactions([createMockTransaction()])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({
+                    cause: expect.objectContaining({
+                        code: 'SIGNER_SIGNING_FAILED',
+                        context: expect.objectContaining({
+                            cause: expect.objectContaining({ message: 'decode failed' }),
+                        }),
+                    }),
+                    providerTransactionId: 'tx-fallthrough-invalid',
+                }),
+            });
+        });
+
+        /**
+         * Under sponsorship the returned value must be the sponsor fee-payer's
+         * slot-0 signature, not the wallet's approval, so RPC lookups resolve.
+         */
+        it('returns the sponsor fee-payer signature as the transaction id for a sponsored transaction', async () => {
+            const SPONSOR_ADDRESS = 'Sysvar1nstructions1111111111111111111111111';
+            const DELEGATED_ADDRESS = 'SysvarC1ock11111111111111111111111111111111';
+            const SPONSOR_SIGNATURE_BYTES = new Uint8Array(64).fill(9);
+            const APPROVAL_SIGNATURE_B58 = base58Decoder.decode(new Uint8Array(64).fill(5));
+            const rewrittenMessageBytes = new Uint8Array([9, 9, 9]);
+            vi.mocked(getTransactionDecoder).mockReturnValue({
+                decode: vi.fn(() => ({
+                    messageBytes: rewrittenMessageBytes,
+                    signatures: {
+                        [SPONSOR_ADDRESS]: SPONSOR_SIGNATURE_BYTES,
+                        [DELEGATED_ADDRESS]: null,
+                    },
+                })),
+            } as any);
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockWalletResponse())
+                .mockResolvedValueOnce(
+                    new Response(
+                        JSON.stringify({
+                            id: 'tx-sponsored',
+                            status: 'success',
+                            approvals: {
+                                submitted: [
+                                    {
+                                        signature: APPROVAL_SIGNATURE_B58,
+                                        signer: {
+                                            address: DELEGATED_ADDRESS,
+                                            locator: `server:${DELEGATED_ADDRESS}`,
+                                        },
+                                    },
+                                ],
+                            },
+                            onChain: { transaction: MOCK_SERIALIZED_TRANSACTION_B58 },
+                        }),
+                        { status: 201 },
+                    ),
+                );
+
+            const signer = await createCrossmintSigner({
+                ...mockConfig,
+                maxPollAttempts: 1,
+                pollIntervalMs: 1,
+                signer: `server:${DELEGATED_ADDRESS}`,
+            });
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
+
+            expect(results[0]).toEqual(SPONSOR_SIGNATURE_BYTES);
+            expect(assertSignatureValid).toHaveBeenCalledWith(
+                expect.objectContaining({ data: rewrittenMessageBytes, signerAddress: DELEGATED_ADDRESS }),
             );
+            expect(assertSignatureValid).toHaveBeenCalledWith({
+                data: rewrittenMessageBytes,
+                signature: SPONSOR_SIGNATURE_BYTES,
+                signerAddress: SPONSOR_ADDRESS,
+            });
         });
 
         it('throws on failed transaction status', async () => {
@@ -514,9 +814,14 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toMatchObject({
-                code: 'SIGNER_SIGNING_FAILED',
-                message: expect.stringContaining('Insufficient funds'),
+            await expect(signer.signAndSendTransactions([createMockTransaction()])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({
+                    cause: expect.objectContaining({
+                        code: 'SIGNER_SIGNING_FAILED',
+                        message: expect.stringContaining('Insufficient funds'),
+                    }),
+                }),
             });
         });
 
@@ -539,9 +844,15 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toMatchObject({
-                code: 'SIGNER_SIGNING_FAILED',
-                message: expect.stringContaining('awaiting approval'),
+            await expect(signer.signAndSendTransactions([createMockTransaction()])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({
+                    cause: expect.objectContaining({
+                        code: 'SIGNER_SIGNING_FAILED',
+                        message: expect.stringContaining('awaiting approval'),
+                    }),
+                    providerTransactionId: 'tx-1',
+                }),
             });
         });
 
@@ -559,13 +870,20 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toMatchObject({
-                code: 'SIGNER_REMOTE_API_ERROR',
-                message: expect.stringContaining('timed out'),
+            await expect(signer.signAndSendTransactions([createMockTransaction()])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({
+                    cause: expect.objectContaining({
+                        code: 'SIGNER_REMOTE_API_ERROR',
+                        message: expect.stringContaining('timed out'),
+                    }),
+                    providerTransactionId: 'tx-1',
+                }),
+                message: expect.stringContaining('tx-1'),
             });
         });
 
-        it('throws on HTTP error during transaction creation', async () => {
+        it('keeps a 4xx during transaction creation a plain failure', async () => {
             vi.mocked(fetch)
                 .mockResolvedValueOnce(mockWalletResponse()) // create()
                 .mockResolvedValueOnce(new Response(JSON.stringify({ message: 'Unauthorized' }), { status: 401 }));
@@ -576,7 +894,7 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toMatchObject({
+            await expect(signer.signAndSendTransactions([createMockTransaction()])).rejects.toMatchObject({
                 code: 'SIGNER_REMOTE_API_ERROR',
                 context: expect.objectContaining({
                     response: expect.stringContaining('Unauthorized'),
@@ -586,7 +904,7 @@ describe('CrossmintSigner', () => {
             });
         });
 
-        it('throws on network error during transaction creation', async () => {
+        it('reports a network error during transaction creation as unconfirmed with no transaction id', async () => {
             vi.mocked(fetch)
                 .mockResolvedValueOnce(mockWalletResponse()) // create()
                 .mockRejectedValueOnce(new Error('network down'));
@@ -597,9 +915,60 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toMatchObject({
-                code: 'SIGNER_HTTP_ERROR',
+            const error = await signer.signAndSendTransactions([createMockTransaction()]).then(
+                () => {
+                    throw new Error('expected the create failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.cause).toMatchObject({ code: 'SIGNER_HTTP_ERROR' });
+            expect(error.context?.providerTransactionId).toBeUndefined();
+            expect(error.context?.status).toBeUndefined();
+        });
+
+        it('reports a 5xx during transaction creation as unconfirmed with no transaction id', async () => {
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockWalletResponse()) // create()
+                .mockResolvedValueOnce(new Response(JSON.stringify({ message: 'unavailable' }), { status: 503 }));
+
+            const signer = await createCrossmintSigner({
+                ...mockConfig,
+                maxPollAttempts: 1,
+                pollIntervalMs: 1,
             });
+
+            const error = await signer.signAndSendTransactions([createMockTransaction()]).then(
+                () => {
+                    throw new Error('expected the create failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.cause).toMatchObject({ code: 'SIGNER_REMOTE_API_ERROR' });
+            expect(error.context?.providerTransactionId).toBeUndefined();
+            expect(error.context?.status).toBe(503);
+        });
+
+        it('reports an accepted create with no id as unconfirmed', async () => {
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockWalletResponse()) // create()
+                .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'pending' }), { status: 201 }));
+
+            const signer = await createCrossmintSigner({
+                ...mockConfig,
+                maxPollAttempts: 1,
+                pollIntervalMs: 1,
+            });
+
+            const error = await signer.signAndSendTransactions([createMockTransaction()]).then(
+                () => {
+                    throw new Error('expected the create failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.providerTransactionId).toBeUndefined();
         });
 
         it('uses the final polled response when maxPollAttempts is 1', async () => {
@@ -631,9 +1000,9 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            const results = await signer.signTransactions([createMockTransaction()]);
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
             expect(results).toHaveLength(1);
-            expect(results[0]![signer.address]?.length).toBe(64);
+            expect(results[0]?.length).toBe(64);
         });
 
         it('includes signer field in request body when configured', async () => {
@@ -657,11 +1026,42 @@ describe('CrossmintSigner', () => {
                 pollIntervalMs: 1,
             });
 
-            await signer.signTransactions([createMockTransaction()]);
+            await signer.signAndSendTransactions([createMockTransaction()]);
 
             const createCall = vi.mocked(fetch).mock.calls[1]!;
             const body = JSON.parse(createCall[1]?.body as string);
             expect(body.params.signer).toBe('my-signer-id');
+        });
+
+        it('sends a deterministic x-idempotency-key on the create', async () => {
+            const digest = createHash('sha256').update(MOCK_MESSAGE_BYTES).digest().subarray(0, 16);
+            digest[6] = (digest[6]! & 0x0f) | 0x40;
+            digest[8] = (digest[8]! & 0x3f) | 0x80;
+            const hex = digest.toString('hex');
+            const expectedKey = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockWalletResponse()) // create()
+                .mockResolvedValueOnce(
+                    new Response(
+                        JSON.stringify({
+                            id: 'tx-1',
+                            status: 'success',
+                            onChain: { txId: MOCK_SIGNATURE_B58 },
+                        }),
+                        { status: 201 },
+                    ),
+                );
+
+            const signer = await createCrossmintSigner({
+                ...mockConfig,
+                maxPollAttempts: 1,
+                pollIntervalMs: 1,
+            });
+            await signer.signAndSendTransactions([createMockTransaction()]);
+
+            const createOpts = vi.mocked(fetch).mock.calls[1]![1] as RequestInit;
+            expect(createOpts.headers).toHaveProperty('x-idempotency-key', expectedKey);
         });
     });
 
@@ -720,7 +1120,7 @@ describe('CrossmintSigner', () => {
                 );
 
             const signer = await createCrossmintSigner(approvalConfig());
-            const results = await signer.signTransactions([createMockTransaction()]);
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
             expect(results).toHaveLength(1);
 
             // The approval POST must carry OUR signer locator, and the signature
@@ -771,9 +1171,9 @@ describe('CrossmintSigner', () => {
                 );
 
             const signer = await createCrossmintSigner(approvalConfig());
-            const results = await signer.signTransactions([createMockTransaction()]);
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
             expect(results).toHaveLength(1);
-            expect(results[0]![signer.address]?.length).toBe(64);
+            expect(results[0]?.length).toBe(64);
             // wallet + create + approvals = 3 fetches; no extra polling.
             expect(vi.mocked(fetch)).toHaveBeenCalledTimes(3);
         });
@@ -795,9 +1195,14 @@ describe('CrossmintSigner', () => {
 
             const signer = await createCrossmintSigner(approvalConfig({ maxPollAttempts: 5 }));
 
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toMatchObject({
-                code: 'SIGNER_SIGNING_FAILED',
-                message: expect.stringContaining('additional signer approvals are required'),
+            await expect(signer.signAndSendTransactions([createMockTransaction()])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({
+                    cause: expect.objectContaining({
+                        message: expect.stringContaining('additional signer approvals are required'),
+                    }),
+                    providerTransactionId: 'tx-other-only',
+                }),
             });
 
             // No approval POST should ever happen (nothing pending for us).
@@ -842,9 +1247,13 @@ describe('CrossmintSigner', () => {
             // Once our approval is in, a persistent awaiting-approval status is
             // an in-flight state, not a terminal failure: the signer keeps
             // polling and surfaces its own timeout when the budget runs out.
-            await expect(signer.signTransactions([createMockTransaction()])).rejects.toMatchObject({
-                code: 'SIGNER_REMOTE_API_ERROR',
-                message: expect.stringContaining('polling timed out'),
+            await expect(signer.signAndSendTransactions([createMockTransaction()])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({
+                    cause: expect.objectContaining({
+                        message: expect.stringContaining('polling timed out'),
+                    }),
+                }),
             });
 
             const approvalPosts = vi.mocked(fetch).mock.calls.filter(call => String(call[0]).includes('/approvals'));
@@ -889,9 +1298,9 @@ describe('CrossmintSigner', () => {
                 );
 
             const signer = await createCrossmintSigner(approvalConfig());
-            const results = await signer.signTransactions([createMockTransaction()]);
+            const results = await signer.signAndSendTransactions([createMockTransaction()]);
             expect(results).toHaveLength(1);
-            expect(results[0]![signer.address]?.length).toBe(64);
+            expect(results[0]?.length).toBe(64);
 
             const approvalPosts = vi.mocked(fetch).mock.calls.filter(call => String(call[0]).includes('/approvals'));
             expect(approvalPosts.length).toBe(1);

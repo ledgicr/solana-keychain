@@ -81,7 +81,8 @@ One feature per backend (`memory` is default), `all` enables everything. At leas
 - **`sign_message` quirks:** `CrossmintSigner` returns `SigningFailed` (intentionally unsupported). `CdpSigner` only accepts UTF-8 payloads.
 - **Turnkey signature padding:** response `r,s` components must be left-padded to 32 bytes each before concatenation ([rust/src/turnkey/mod.rs](rust/src/turnkey/mod.rs)).
 - **GCP KMS:** PureEdDSA mode with `EC_SIGN_ED25519`.
-- **Transaction serialization:** all backends use `bincode` before signing.
+- **Transaction serialization:** go through `transaction_util::serialize_wire_transaction` / `deserialize_wire_transaction`, never `bincode` directly (`sdk-v4` needs `wincode` for v1).
+- **Transaction types:** `sign_transaction` takes a `VersionedTransaction` (legacy, v0 or v1). v1 messages exist only in the solana-sdk 4.x line, so v1 requires `sdk-v4` and is unrepresentable under `sdk-v2`/`sdk-v3`.
 - **Remote-signer tests** use `wiremock`; no live API calls in unit tests.
 
 ## TypeScript
@@ -106,7 +107,8 @@ See [typescript/README.md](typescript/README.md) for the full package list and u
 ### Gotchas
 
 - **Async construction:** always `await createXSigner(...)` — direct class construction is deprecated and skips `init()`.
-- **`signMessages` quirks (parity with Rust):** `CrossmintSigner` rejects with "not supported". `CdpSigner` requires UTF-8 message bytes.
+- **Managed-broadcast backends (Crossmint, Fordefi native mode):** implement `SolanaSendingSigner` from core — `signAndSendTransactions()` only, with **no** `signTransactions`/`signMessages` (Crossmint) because Kit classifies signers by duck-typed method presence. They are excluded from `@solana/keychain-kit-plugin` at the type level.
+- **`signMessages` quirks (parity with Rust):** `CrossmintSigner` does not expose `signMessages` at all (Rust returns `SigningFailed`). `CdpSigner` requires UTF-8 message bytes.
 - **HTTPS enforced:** all `apiBaseUrl` config fields must reject non-HTTPS URLs — validate with `assertHttpsUrl()` from `@solana/keychain-core`.
 - **Remote API calls:** go through `fetchSignerJson()` from `@solana/keychain-core` — it owns the HTTP_ERROR/REMOTE_API_ERROR/PARSING_ERROR pipeline, response sanitization (`sanitizeRemoteErrorResponse()`), redirect rejection, and a default 60s timeout. Batch signing uses core `signBatchStaggered()` + `validateRequestDelayMs()`.
 - **Integration tests:** use `runSignerIntegrationTest` + per-package `setup.ts`; spun up via `just ts-test-integration` (loads `.env`, starts local Vault).
@@ -119,7 +121,7 @@ Single package under [python/](python/) (PyPI `solana-keychain`, import `solana_
 
 ### Architecture
 
-- **Contract** (`solana_keychain.core`): `SolanaSigner` ABC — `pubkey` property, async `sign_transaction()` / `sign_message()` / `is_available()`. `sign_transaction` returns `SignedTransaction` with `is_complete`.
+- **Contract** (`solana_keychain.core`): `SolanaSigner` ABC — `pubkey` property, async `sign_transaction()` / `sign_message()` / `is_available()`. `sign_transaction` takes a `VersionedTransaction` (legacy, v0 or v1) and returns `SignedTransaction` with `is_complete`. Use `signed_message_bytes()` for the bytes a signature covers; never hand-roll the version prefix.
 - **Errors**: `SignerError` with stable `code` values; `str()`/`repr()` only surface generic messages (detail is redacted and must never leak key material or raw remote responses).
 - **Serialization**: built on `solders`; golden wire-format vectors pinned in `python/tests/test_parity.py` — never regenerate them to make the suite pass.
 - **Remote API calls** go through `fetch_signer_json()` from `solana_keychain.core` — it owns the HTTP_ERROR/REMOTE_API_ERROR/PARSING_ERROR pipeline, response sanitization, redirect rejection, and a default 60s timeout. Base URLs must pass `assert_https_url()`. Unit tests mock HTTP with `respx`; no live API calls in unit tests.

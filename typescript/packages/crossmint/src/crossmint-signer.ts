@@ -3,24 +3,26 @@ import { getBase16Encoder, getBase58Decoder, getBase58Encoder, getBase64Encoder 
 import {
     assertHttpsUrl,
     assertSignatureValid,
-    createSignatureDictionary,
-    createSignerError,
+    DEFAULT_FETCH_TIMEOUT_MS,
     ED25519_SIGNATURE_LENGTH,
     fetchSignerJson,
+    idempotencyKeyFromMessage,
     normalizeBaseUrl,
+    providerMayHaveAccepted,
+    providerStatus,
     sanitizeRemoteErrorResponse,
+    SignerError,
     SignerErrorCode,
-    SolanaSigner,
+    SolanaSendingSigner,
     throwSignerError,
     validateRequestDelayMs,
 } from '@solana/keychain-core';
 import { SignatureBytes } from '@solana/keys';
-import { SignableMessage, SignatureDictionary } from '@solana/signers';
+import { TransactionSendingSignerConfig } from '@solana/signers';
 import {
     getBase64EncodedWireTransaction,
     getTransactionDecoder,
     Transaction,
-    TransactionWithinSizeLimit,
     TransactionWithLifetime,
 } from '@solana/transactions';
 
@@ -32,9 +34,21 @@ import type {
     CrossmintWalletResponse,
 } from './types.js';
 
+/**
+ * Crossmint signer shape.
+ *
+ * Crossmint rewrites transactions to sponsor gas, so the message it signs
+ * generally differs from the caller's and its signatures cannot be applied to the
+ * caller's transaction. Hence Kit's sending-signer flow rather than a partial
+ * signer: no `signTransactions`, and no `signMessages` either — Crossmint does
+ * not support message signing for Solana wallets, and Kit classifies signers by
+ * method presence.
+ */
+export type CrossmintSendingSigner<TAddress extends string = string> = SolanaSendingSigner<TAddress>;
+
 export async function createCrossmintSigner<TAddress extends string = string>(
     config: CrossmintSignerConfig,
-): Promise<SolanaSigner<TAddress>> {
+): Promise<CrossmintSendingSigner<TAddress>> {
     return await CrossmintSigner.create(config);
 }
 
@@ -51,9 +65,27 @@ let base64Encoder: ReturnType<typeof getBase64Encoder> | undefined;
 /**
  * Crossmint is a broadcast-managed signer: it rewrites the transaction (gas
  * sponsorship, priority fee, its own blockhash) and broadcasts server-side, so
- * returned signatures cover Crossmint's bytes, not the caller's `messageBytes`.
+ * its signatures cover Crossmint's bytes, not the caller's `messageBytes`.
+ * The returned value is the landed transaction's fee-payer signature, the
+ * identifier Solana RPC looks it up by, which is why this signer implements
+ * {@link SolanaSendingSigner} instead of returning signature dictionaries
+ * keyed to the caller's message.
+ *
+ * Not retry-safe: any failure after the create is accepted rejects with
+ * `BROADCAST_UNCONFIRMED` carrying `context.providerTransactionId`; check that
+ * transaction with Crossmint before retrying. A create that fails without a
+ * usable response rejects with `BROADCAST_UNCONFIRMED` and no
+ * `providerTransactionId`.
+ *
+ * Each create carries an `x-idempotency-key` derived from the message bytes, so
+ * replaying these exact bytes cannot create a second transaction; a rebuilt
+ * transaction derives a different key and executes as a new transfer.
  */
-class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
+class CrossmintSigner<TAddress extends string = string> implements CrossmintSendingSigner<TAddress> {
+    // No signTransactions/signMessages: Kit classifies signers by duck-typed
+    // method presence, so a present-but-throwing method would make Kit
+    // partial-sign transactions (or collect message signatures) and fail at
+    // runtime. See SolanaSendingSigner in @solana/keychain-core.
     readonly address: Address<TAddress>;
     private readonly apiKey: string;
     private readonly walletLocator: string;
@@ -64,11 +96,17 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
     private readonly signer?: string;
 
     private readonly signerSeed?: Uint8Array;
+    /**
+     * Every delegated-signer address the configuration makes known. Smart wallets
+     * sign with one of these rather than with `address`.
+     */
+    private readonly delegatedAddresses: Address[];
 
     private constructor(config: {
         address: Address<TAddress>;
         apiBaseUrl: string;
         apiKey: string;
+        delegatedAddresses?: Address[];
         maxPollAttempts: number;
         pollIntervalMs: number;
         requestDelayMs: number;
@@ -85,6 +123,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
         this.requestDelayMs = config.requestDelayMs;
         this.signerSeed = config.signerSeed;
         this.signer = config.signer;
+        this.delegatedAddresses = config.delegatedAddresses ?? [];
     }
 
     static async create<TAddress extends string = string>(
@@ -123,11 +162,27 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
 
         let signerSeed: Uint8Array | undefined;
         let signer = config.signer;
+        // Both sources are collected because a caller locator may name a different
+        // key than signerSecret derives, and either can be the one that signs.
+        const delegatedAddresses: Address[] = [];
         if (config.signerSecret) {
             signerSeed = await deriveSignerSeed(config.signerSecret, config.apiKey);
+            base58Decoder ||= getBase58Decoder();
+            const derived = base58Decoder.decode(await ed25519PublicKeyFromSeed(signerSeed)) as Address;
+            delegatedAddresses.push(derived);
             if (!signer) {
-                base58Decoder ||= getBase58Decoder();
-                signer = `server:${base58Decoder.decode(await ed25519PublicKeyFromSeed(signerSeed))}`;
+                signer = `server:${derived}`;
+            }
+        }
+        const locatorAddress = addressFromServerLocator(signer);
+        if (locatorAddress) {
+            try {
+                assertIsAddress(locatorAddress);
+                if (!delegatedAddresses.includes(locatorAddress)) {
+                    delegatedAddresses.push(locatorAddress);
+                }
+            } catch {
+                // A locator that is not an address contributes no candidate.
             }
         }
 
@@ -158,6 +213,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
             address,
             apiBaseUrl,
             apiKey: config.apiKey,
+            delegatedAddresses,
             maxPollAttempts,
             pollIntervalMs,
             requestDelayMs,
@@ -167,17 +223,12 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
         });
     }
 
-    async signMessages(_messages: readonly SignableMessage[]): Promise<readonly SignatureDictionary[]> {
-        return await Promise.reject(
-            createSignerError(SignerErrorCode.SIGNING_FAILED, {
-                message: 'Crossmint signMessages is not supported for Solana wallets in this signer',
-            }),
-        );
-    }
+    async signAndSendTransactions(
+        transactions: readonly (Transaction | (Transaction & TransactionWithLifetime))[],
+        config?: TransactionSendingSignerConfig,
+    ): Promise<readonly SignatureBytes[]> {
+        config?.abortSignal?.throwIfAborted();
 
-    async signTransactions(
-        transactions: readonly (Transaction & TransactionWithinSizeLimit & TransactionWithLifetime)[],
-    ): Promise<readonly SignatureDictionary[]> {
         // Sign sequentially, not via Promise.all: each transaction has
         // irreversible server-side effects (createTransaction, and auto-approval
         // when signerSecret is set). Concurrent submission means a failure in one
@@ -185,13 +236,13 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
         // and may execute, leading to duplicate spends on retry. Sequential
         // execution stops on the first error before any further transaction is
         // created.
-        const results: SignatureDictionary[] = [];
+        const results: SignatureBytes[] = [];
         for (const [index, transaction] of transactions.entries()) {
             if (this.requestDelayMs > 0 && index > 0) {
-                await new Promise(resolve => setTimeout(resolve, this.requestDelayMs));
+                await sleep(this.requestDelayMs, config?.abortSignal);
             }
-            const signature = await this.signTransactionManaged(transaction);
-            results.push(createSignatureDictionary({ signature, signerAddress: this.address }));
+            config?.abortSignal?.throwIfAborted();
+            results.push(await this.signTransactionManaged(transaction, config?.abortSignal));
         }
         return results;
     }
@@ -205,13 +256,49 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
         }
     }
 
-    private async signTransactionManaged(
-        transaction: Transaction & TransactionWithinSizeLimit & TransactionWithLifetime,
+    /**
+     * `abortSignal` stops this client from waiting; it cannot recall work Crossmint
+     * has already accepted, so an aborted transaction may still land server-side.
+     */
+    private async signTransactionManaged(transaction: Transaction, abortSignal?: AbortSignal): Promise<SignatureBytes> {
+        let created: CrossmintTransactionResponse;
+        try {
+            created = await this.createTransaction(transaction, abortSignal);
+        } catch (error) {
+            if (!providerMayHaveAccepted(error)) {
+                throw error;
+            }
+            // Crossmint may be executing a transaction whose id never reached us.
+            const status = providerStatus(error);
+            return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
+                cause: error,
+                message: 'Crossmint may have created the transaction, but no transaction id was returned',
+                ...(status === undefined ? {} : { status }),
+            });
+        }
+        // Post-create failures leave an outcome Crossmint may still execute, so
+        // they surface as BROADCAST_UNCONFIRMED with the transaction id.
+        try {
+            return await this.driveTransactionToSignature(created, transaction, abortSignal);
+        } catch (error) {
+            return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
+                cause: error,
+                message: `Crossmint may have executed the transaction, but the outcome could not be confirmed (provider transaction id: ${created.id})`,
+                providerTransactionId: created.id,
+            });
+        }
+    }
+
+    private async driveTransactionToSignature(
+        created: CrossmintTransactionResponse,
+        transaction: Transaction,
+        abortSignal?: AbortSignal,
     ): Promise<SignatureBytes> {
-        let response = await this.createTransaction(transaction);
+        let response = created;
         let approvalSubmitted = false;
 
         for (let attempt = 0; attempt < this.maxPollAttempts; attempt++) {
+            abortSignal?.throwIfAborted();
             const pending = this.findPendingApprovalForSigner(response);
             if (
                 response.status === 'awaiting-approval' &&
@@ -220,7 +307,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
                 !approvalSubmitted &&
                 pending !== undefined
             ) {
-                response = await this.submitApproval(response, pending);
+                response = await this.submitApproval(response, pending, abortSignal);
                 approvalSubmitted = true;
                 // Re-evaluate the new status immediately; approvalSubmitted
                 // ensures the approval is signed and submitted at most once.
@@ -231,8 +318,8 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
                 return terminalSignature;
             }
 
-            await new Promise(resolve => setTimeout(resolve, this.pollIntervalMs));
-            response = await this.getTransaction(response.id);
+            await sleep(this.pollIntervalMs, abortSignal);
+            response = await this.getTransaction(response.id, abortSignal);
         }
 
         const terminalSignature = await this.resolveTerminalStatus(response, transaction, approvalSubmitted);
@@ -247,7 +334,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
 
     private async resolveTerminalStatus(
         response: CrossmintTransactionResponse,
-        transaction: Transaction & TransactionWithinSizeLimit & TransactionWithLifetime,
+        transaction: Transaction,
         approvalSubmitted: boolean,
     ): Promise<SignatureBytes | undefined> {
         const status = response.status as CrossmintTransactionStatus;
@@ -292,6 +379,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
     private async submitApproval(
         response: CrossmintTransactionResponse,
         pending: { message?: string; signer?: { locator?: string } },
+        abortSignal?: AbortSignal,
     ): Promise<CrossmintTransactionResponse> {
         const message = pending.message;
         if (!message) {
@@ -308,14 +396,20 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
         const signatureB58 = base58Decoder.decode(signatureBytes);
 
         const path = `/${API_VERSION}/wallets/${encodeURIComponent(this.walletLocator)}/transactions/${encodeURIComponent(response.id)}/approvals`;
-        const result = await this.request(path, 'POST', {
-            approvals: [{ signature: signatureB58, signer: this.signer }],
-        });
+        const result = await this.request(
+            path,
+            'POST',
+            {
+                approvals: [{ signature: signatureB58, signer: this.signer }],
+            },
+            abortSignal,
+        );
         return parseTransactionResponse(result, 'submit approval');
     }
 
     private async createTransaction(
-        transaction: Transaction & TransactionWithinSizeLimit & TransactionWithLifetime,
+        transaction: Transaction,
+        abortSignal?: AbortSignal,
     ): Promise<CrossmintTransactionResponse> {
         const wireTransaction = getBase64EncodedWireTransaction(transaction);
         base64Encoder ||= getBase64Encoder();
@@ -331,17 +425,32 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
         };
 
         const path = `/${API_VERSION}/wallets/${encodeURIComponent(this.walletLocator)}/transactions`;
-        const response = await this.request(path, 'POST', body);
+        const response = await this.request(
+            path,
+            'POST',
+            body,
+            abortSignal,
+            await idempotencyKeyFromMessage(transaction.messageBytes),
+        );
         return parseTransactionResponse(response, 'create transaction');
     }
 
-    private async getTransaction(transactionId: string): Promise<CrossmintTransactionResponse> {
+    private async getTransaction(
+        transactionId: string,
+        abortSignal?: AbortSignal,
+    ): Promise<CrossmintTransactionResponse> {
         const path = `/${API_VERSION}/wallets/${encodeURIComponent(this.walletLocator)}/transactions/${encodeURIComponent(transactionId)}`;
-        const response = await this.request(path, 'GET');
+        const response = await this.request(path, 'GET', undefined, abortSignal);
         return parseTransactionResponse(response, 'get transaction');
     }
 
-    private async request(path: string, method: 'GET' | 'POST', body?: unknown): Promise<unknown> {
+    private async request(
+        path: string,
+        method: 'GET' | 'POST',
+        body?: unknown,
+        abortSignal?: AbortSignal,
+        idempotencyKey?: string,
+    ): Promise<unknown> {
         const url = `${this.apiBaseUrl}${path}`;
         const headers: Record<string, string> = {
             'X-API-KEY': this.apiKey,
@@ -349,12 +458,20 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
         if (method === 'POST' && body != null) {
             headers['Content-Type'] = 'application/json';
         }
+        if (idempotencyKey !== undefined) {
+            headers['x-idempotency-key'] = idempotencyKey;
+        }
 
         return await fetchSignerJson<unknown>({
             init: {
                 body: body != null ? JSON.stringify(body) : undefined,
                 headers,
                 method,
+                // Combine with the default timeout: fetchSignerJson only applies
+                // its own timeout when no signal is supplied.
+                ...(abortSignal
+                    ? { signal: anyAbortSignal([abortSignal, AbortSignal.timeout(DEFAULT_FETCH_TIMEOUT_MS)]) }
+                    : {}),
             },
             providerName: 'Crossmint',
             url,
@@ -363,55 +480,176 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSigner<
 
     private async extractSignature(
         response: CrossmintTransactionResponse,
-        transaction: Transaction & TransactionWithinSizeLimit & TransactionWithLifetime,
+        transaction: Transaction,
     ): Promise<SignatureBytes> {
+        let embeddedError: unknown;
         if (response.onChain?.transaction) {
+            let executedTransaction: Transaction | undefined;
             try {
-                return await this.extractSignatureFromSerializedTransaction(response.onChain.transaction);
-            } catch {
-                // If Crossmint returned an onChain.transaction but it could not be
-                // decoded or validated, fall through to txId and still require
-                // cryptographic validation against the original message bytes.
+                base58Encoder ||= getBase58Encoder();
+                executedTransaction = getTransactionDecoder().decode(
+                    base58Encoder.encode(response.onChain.transaction),
+                );
+            } catch (error) {
+                embeddedError = error;
+            }
+            if (executedTransaction) {
+                try {
+                    return await this.transactionIdFromExecuted(response, executedTransaction);
+                } catch (error) {
+                    // Keep this error as the cause: it names the check that failed,
+                    // where the txId path only reports a mismatch.
+                    embeddedError = error;
+                }
             }
         }
 
         const fromTxId = decodeSignatureString(response.onChain?.txId);
         if (fromTxId) {
-            await assertSignatureValid({
-                data: transaction.messageBytes,
-                signature: fromTxId,
-                signerAddress: this.address,
+            // A txId counts only if it covers the caller's bytes, and any configured
+            // signer may have produced it.
+            let lastError: unknown;
+            for (const candidate of this.verificationCandidates()) {
+                try {
+                    await assertSignatureValid({
+                        data: transaction.messageBytes,
+                        signature: fromTxId,
+                        signerAddress: candidate,
+                    });
+                    return fromTxId;
+                } catch (error) {
+                    lastError = error;
+                }
+            }
+            const cause = embeddedError ?? lastError;
+            if (cause instanceof SignerError) throw cause;
+            throwSignerError(SignerErrorCode.SIGNING_FAILED, {
+                address: this.address,
+                cause,
+                message: 'Crossmint returned no signature verifiable by a configured signer',
             });
-            return fromTxId;
         }
 
         throwSignerError(SignerErrorCode.SIGNING_FAILED, {
+            cause: embeddedError,
             message: 'Unable to extract signature from Crossmint transaction response',
         });
     }
 
-    private async extractSignatureFromSerializedTransaction(serializedTransaction: string): Promise<SignatureBytes> {
-        base58Encoder ||= getBase58Encoder();
-        const txBytes = base58Encoder.encode(serializedTransaction);
-        const decodedTransaction = getTransactionDecoder().decode(txBytes);
-
-        const signature = decodedTransaction.signatures[this.address];
-        if (!signature) {
+    /**
+     * The landed transaction's fee-payer (slot 0) signature, the value RPC
+     * lookups accept, returned only after a configured signer's signature
+     * verifies over the executed bytes.
+     */
+    private async transactionIdFromExecuted(
+        response: CrossmintTransactionResponse,
+        executedTransaction: Transaction,
+    ): Promise<SignatureBytes> {
+        const participant =
+            (await this.verifiedSignatureFromSlots(executedTransaction)) ??
+            (await this.verifiedSignatureFromApprovals(response, executedTransaction));
+        if (!participant) {
             throwSignerError(SignerErrorCode.SIGNING_FAILED, {
                 address: this.address,
-                message: `No signature found for address ${this.address}`,
+                message: 'No configured signer holds a verifying signature in the Crossmint transaction',
             });
         }
 
-        // Verify against the bytes Crossmint actually signed, not the caller's
-        // messageBytes: Crossmint rewrites the tx (blockhash/fees) before signing,
-        // so a strict check against caller bytes would reject legitimately landed txs.
-        await assertSignatureValid({
-            data: decodedTransaction.messageBytes,
-            signature,
-            signerAddress: this.address,
-        });
-        return signature;
+        const [feePayer, feePayerSignature] = Object.entries(executedTransaction.signatures)[0] ?? [];
+        if (participant.address === feePayer) {
+            return participant.signature;
+        }
+        if (!feePayerSignature) {
+            throwSignerError(SignerErrorCode.SIGNING_FAILED, {
+                message: 'Crossmint transaction carries no fee-payer signature to identify it by',
+            });
+        }
+        try {
+            await assertSignatureValid({
+                data: executedTransaction.messageBytes,
+                signature: feePayerSignature,
+                signerAddress: feePayer as Address,
+            });
+        } catch (error) {
+            throwSignerError(SignerErrorCode.SIGNING_FAILED, {
+                cause: error,
+                message: 'Crossmint fee-payer signature does not verify over the executed transaction',
+            });
+        }
+        return feePayerSignature;
+    }
+
+    /**
+     * This wallet's signature over the transaction Crossmint executed.
+     *
+     * For a rewritten transaction it arrives in `approvals.submitted` covering the
+     * rewritten message, not in a signature slot. Verified locally regardless.
+     */
+    private async verifiedSignatureFromApprovals(
+        response: CrossmintTransactionResponse,
+        executedTransaction: Transaction,
+    ): Promise<{ address: Address; signature: SignatureBytes } | undefined> {
+        const submitted = response.approvals?.submitted;
+        if (!submitted?.length) return undefined;
+
+        const candidates = this.verificationCandidates();
+        for (const entry of submitted) {
+            // The identity may arrive as `address`, or only as a
+            // `server:<address>` locator (the same identity format used by
+            // `pending` entries).
+            const address = entry.signer?.address ?? addressFromServerLocator(entry.signer?.locator);
+            const signature = decodeSignatureString(entry.signature);
+            if (!address || !signature || !candidates.includes(address as Address)) continue;
+            try {
+                await assertSignatureValid({
+                    data: executedTransaction.messageBytes,
+                    signature,
+                    signerAddress: address as Address,
+                });
+                return { address: address as Address, signature };
+            } catch {
+                // Try the next submitted approval.
+            }
+        }
+        return undefined;
+    }
+
+    /**
+     * Keys that may have signed: the wallet address for an mpc wallet, the
+     * delegated signer for a smart wallet. The response does not say which.
+     */
+    private verificationCandidates(): Address[] {
+        const candidates: Address[] = [this.address];
+        for (const delegated of this.delegatedAddresses) {
+            if (!candidates.includes(delegated)) {
+                candidates.push(delegated);
+            }
+        }
+        return candidates;
+    }
+
+    private async verifiedSignatureFromSlots(
+        executedTransaction: Transaction,
+    ): Promise<{ address: Address; signature: SignatureBytes } | undefined> {
+        // Verify against the bytes Crossmint signed, which differ from the caller's
+        // messageBytes once it rewrites to sponsor gas. Require a verifying signature,
+        // not just presence in a slot: the wallet address can occupy a slot it never
+        // signed. The signature is only ever returned as a send result.
+        for (const candidate of this.verificationCandidates()) {
+            const signature = executedTransaction.signatures[candidate];
+            if (!signature) continue;
+            try {
+                await assertSignatureValid({
+                    data: executedTransaction.messageBytes,
+                    signature,
+                    signerAddress: candidate,
+                });
+                return { address: candidate, signature };
+            } catch {
+                // Try the next configured signer.
+            }
+        }
+        return undefined;
     }
 }
 
@@ -449,6 +687,51 @@ function parseTransactionResponse(payload: unknown, context: string): CrossmintT
         });
     }
     return transaction as CrossmintTransactionResponse;
+}
+
+/** Extract the base58 address from a `server:<address>` signer locator. */
+function addressFromServerLocator(locator?: string): string | undefined {
+    if (!locator?.startsWith('server:')) return undefined;
+    const encoded = locator.slice('server:'.length).trim();
+    return encoded || undefined;
+}
+
+/**
+ * `AbortSignal.any` with a fallback for runtimes that lack it
+ * (`AbortSignal.any` requires Node.js >= 20.3; the package supports >= 18).
+ */
+function anyAbortSignal(signals: readonly AbortSignal[]): AbortSignal {
+    if (typeof AbortSignal.any === 'function') {
+        return AbortSignal.any([...signals]);
+    }
+    const controller = new AbortController();
+    for (const signal of signals) {
+        if (signal.aborted) {
+            controller.abort(signal.reason);
+            break;
+        }
+        signal.addEventListener('abort', () => controller.abort(signal.reason), {
+            once: true,
+            signal: controller.signal,
+        });
+    }
+    return controller.signal;
+}
+
+/** Resolve after `ms`, or reject with the abort reason as soon as `abortSignal` fires. */
+async function sleep(ms: number, abortSignal?: AbortSignal): Promise<void> {
+    abortSignal?.throwIfAborted();
+    await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+            abortSignal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        function onAbort() {
+            clearTimeout(timer);
+            reject(abortSignal?.reason instanceof Error ? abortSignal.reason : new Error(String(abortSignal?.reason)));
+        }
+        abortSignal?.addEventListener('abort', onAbort, { once: true });
+    });
 }
 
 function decodeSignatureString(value?: string): SignatureBytes | undefined {

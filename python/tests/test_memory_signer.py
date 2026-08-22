@@ -5,6 +5,7 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 
 from solana_keychain import MemorySigner, MemorySignerConfig, SignerError, SignerErrorCode
+from solana_keychain.core import signed_message_bytes
 from tests.util import (
     TEST_KEYPAIR_BASE58,
     TEST_KEYPAIR_BYTES,
@@ -19,6 +20,10 @@ def create_test_signer() -> MemorySigner:
 
 def test_create_from_u8_array() -> None:
     assert str(create_test_signer().pubkey) == TEST_PUBKEY
+
+
+def test_does_not_broadcast_transactions() -> None:
+    assert not create_test_signer().broadcasts_transactions
 
 
 def test_create_from_config() -> None:
@@ -61,7 +66,7 @@ async def test_sign_transaction() -> None:
     assert result.encoded_transaction
     assert len(bytes(result.signature)) == 64
     assert list(transaction.signatures) == [result.signature]
-    assert result.signature.verify(signer.pubkey, transaction.message_data())
+    assert result.signature.verify(signer.pubkey, signed_message_bytes(transaction.message))
 
 
 async def test_sign_transaction_rejects_tx_where_signer_is_not_required() -> None:

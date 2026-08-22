@@ -383,6 +383,9 @@ func TestSignMessageBlackBoxSuccess(t *testing.T) {
 				details["hash_binary"] != base64.StdEncoding.EncodeToString(message) {
 				t.Errorf("unexpected black box details: %v", details)
 			}
+			if got := r.Header.Get("x-idempotence-id"); got != "" {
+				t.Errorf("x-idempotence-id = %q, want none on the black-box path", got)
+			}
 
 			writeJSON(w, map[string]any{"id": "tx-123"})
 		})
@@ -552,6 +555,19 @@ func nativeConfig(t *testing.T) Config {
 	return cfg
 }
 
+// Native mode broadcasts, so batch helpers must reject it; black box may batch.
+func TestBroadcastsTransactionsFollowsMode(t *testing.T) {
+	pub := testutils.TestPublicKey()
+	native := newTestSigner(t, nativeConfig(t), pub.String(), func(*http.ServeMux) {})
+	if !native.BroadcastsTransactions() {
+		t.Error("native mode must report broadcasting")
+	}
+	blackBox := newTestSigner(t, baseConfig(t), pub.String(), func(*http.ServeMux) {})
+	if blackBox.BroadcastsTransactions() {
+		t.Error("black-box mode must not report broadcasting")
+	}
+}
+
 func TestSignTransactionNativeSuccess(t *testing.T) {
 	priv := testutils.TestPrivateKey()
 	pub := testutils.TestPublicKey()
@@ -592,6 +608,19 @@ func TestSignTransactionNativeSuccess(t *testing.T) {
 			if fee["type"] != FeeTypePriority || fee["priority_level"] != string(PriorityMedium) {
 				t.Errorf("unexpected fee: %v", fee)
 			}
+			encodedData, _ := details["data"].(string)
+			submittedMessage, decodeErr := base64.StdEncoding.DecodeString(encodedData)
+			if decodeErr != nil {
+				t.Errorf("decode submitted message: %v", decodeErr)
+			}
+			digest := sha256.Sum256(submittedMessage)
+			id := digest[:16]
+			id[6] = (id[6] & 0x0f) | 0x40
+			id[8] = (id[8] & 0x3f) | 0x80
+			want := fmt.Sprintf("%x-%x-%x-%x-%x", id[0:4], id[4:6], id[6:8], id[8:10], id[10:16])
+			if got := r.Header.Get("x-idempotence-id"); got != want {
+				t.Errorf("x-idempotence-id = %q, want %q", got, want)
+			}
 			writeJSON(w, map[string]any{"id": "tx-123"})
 		})
 		mux.HandleFunc(transactionsPath+"/tx-123", func(w http.ResponseWriter, _ *http.Request) {
@@ -619,8 +648,10 @@ func TestSignTransactionNativeSuccess(t *testing.T) {
 	if !res.IsComplete() {
 		t.Error("returned transaction is fully signed, want Complete")
 	}
-	if len(tx.Signatures) == 0 || tx.Signatures[0] != signature {
-		t.Error("caller's transaction must be replaced with the Fordefi-signed one")
+	for _, sig := range tx.Signatures {
+		if !sig.IsZero() {
+			t.Error("the caller's transaction must be left untouched by provider-chosen bytes")
+		}
 	}
 }
 
@@ -639,8 +670,113 @@ func TestSignTransactionNativeWaitsForCompleted(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected polling timeout when a pushable transaction never completes")
 	}
+	assertBroadcastUnconfirmed(t, err, "tx-123")
+}
+
+// assertBroadcastUnconfirmed checks that err is a CodeBroadcastUnconfirmed
+// SignerError carrying the expected provider transaction id.
+func assertBroadcastUnconfirmed(t *testing.T, err error, wantTxID string) {
+	t.Helper()
+	if code, _ := core.CodeOf(err); code != core.CodeBroadcastUnconfirmed {
+		t.Errorf("got %s, want BROADCAST_UNCONFIRMED", code)
+	}
+	var se *core.SignerError
+	if !errors.As(err, &se) || se.ProviderTxID != wantTxID {
+		t.Errorf("error must carry provider transaction id %q, got %v", wantTxID, err)
+	}
+	if !strings.Contains(err.Error(), wantTxID) {
+		t.Errorf("Error() must surface the provider transaction id, got %q", err.Error())
+	}
+}
+
+func TestSignTransactionNativeSubmitServerErrorIsUnconfirmedWithoutID(t *testing.T) {
+	pub := testutils.TestPublicKey()
+	s := newTestSigner(t, nativeConfig(t), pub.String(), func(mux *http.ServeMux) {
+		mux.HandleFunc(transactionsPath, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+		})
+	})
+
+	tx, err := testutils.CreateTestTransaction(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignTransaction(context.Background(), tx)
+	if err == nil {
+		t.Fatal("expected a failed submit to be reported")
+	}
+	assertBroadcastUnconfirmedWithoutID(t, err, http.StatusBadGateway)
+}
+
+func TestSignTransactionNativeSubmitWithoutIDIsUnconfirmed(t *testing.T) {
+	pub := testutils.TestPublicKey()
+	s := newTestSigner(t, nativeConfig(t), pub.String(), func(mux *http.ServeMux) {
+		mux.HandleFunc(transactionsPath, func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]any{"state": "pending"})
+		})
+	})
+
+	tx, err := testutils.CreateTestTransaction(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignTransaction(context.Background(), tx)
+	if err == nil {
+		t.Fatal("expected an accepted submit without an id to be reported")
+	}
+	assertBroadcastUnconfirmedWithoutID(t, err, 0)
+}
+
+func TestSignTransactionNativeSubmitRejectionStaysPlainFailure(t *testing.T) {
+	pub := testutils.TestPublicKey()
+	s := newTestSigner(t, nativeConfig(t), pub.String(), func(mux *http.ServeMux) {
+		mux.HandleFunc(transactionsPath, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+	})
+
+	tx, err := testutils.CreateTestTransaction(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignTransaction(context.Background(), tx)
 	if code, _ := core.CodeOf(err); code != core.CodeRemoteAPIError {
 		t.Errorf("got %s, want REMOTE_API_ERROR", code)
+	}
+}
+
+// Black-box mode only signs, so a failed submit has no on-chain outcome to be unconfirmed about.
+func TestSignTransactionBlackBoxSubmitServerErrorIsNotUnconfirmed(t *testing.T) {
+	pub := testutils.TestPublicKey()
+	s := newTestSigner(t, baseConfig(t), pub.String(), func(mux *http.ServeMux) {
+		mux.HandleFunc(transactionsPath, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+		})
+	})
+
+	tx, err := testutils.CreateTestTransaction(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignTransaction(context.Background(), tx)
+	if code, _ := core.CodeOf(err); code != core.CodeRemoteAPIError {
+		t.Errorf("got %s, want REMOTE_API_ERROR", code)
+	}
+}
+
+// assertBroadcastUnconfirmedWithoutID checks for an unconfirmed broadcast with no
+// id, carrying wantStatus (0 when the provider sent no failing status).
+func assertBroadcastUnconfirmedWithoutID(t *testing.T, err error, wantStatus int) {
+	t.Helper()
+	if code, _ := core.CodeOf(err); code != core.CodeBroadcastUnconfirmed {
+		t.Errorf("got %s, want BROADCAST_UNCONFIRMED", code)
+	}
+	var se *core.SignerError
+	if !errors.As(err, &se) || se.ProviderTxID != "" {
+		t.Errorf("error must carry no provider transaction id, got %v", err)
+	}
+	if se != nil && se.ProviderStatus != wantStatus {
+		t.Errorf("provider status = %d, want %d", se.ProviderStatus, wantStatus)
 	}
 }
 
@@ -684,9 +820,7 @@ func TestSignTransactionNativeMissingRawTransaction(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when raw_transaction is missing")
 	}
-	if code, _ := core.CodeOf(err); code != core.CodeSigningFailed {
-		t.Errorf("got %s, want SIGNING_FAILED", code)
-	}
+	assertBroadcastUnconfirmed(t, err, "tx-123")
 }
 
 func TestSignTransactionNativeUndecodableRawTransaction(t *testing.T) {
@@ -711,9 +845,7 @@ func TestSignTransactionNativeUndecodableRawTransaction(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for an undecodable wire transaction")
 	}
-	if code, _ := core.CodeOf(err); code != core.CodeSerializationError {
-		t.Errorf("got %s, want SERIALIZATION_ERROR", code)
-	}
+	assertBroadcastUnconfirmed(t, err, "tx-123")
 }
 
 func TestSignMessageNativeUsesSolanaMessage(t *testing.T) {

@@ -1,21 +1,22 @@
-import { generateKeyPairSync } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { assertIsSolanaSigner, assertSignatureValid, extractSignatureFromWireTransaction } from '@solana/keychain-core';
-import { isTransactionSendingSigner } from '@solana/signers';
+import {
+    assertIsSolanaSigner,
+    assertSignatureValid,
+    isSolanaSendingSigner,
+    isSolanaSigner,
+    type SignerError,
+} from '@solana/keychain-core';
+import { createCosignedWireTransaction, createSignedWireTransaction } from '@solana/keychain-test-utils';
+import { isTransactionPartialSigner, isTransactionSendingSigner } from '@solana/signers';
 
 vi.mock('@solana/keychain-core', async importOriginal => {
     const mod = await importOriginal<typeof import('@solana/keychain-core')>();
     return {
         ...mod,
         assertSignatureValid: vi.fn(),
-        // Stub extraction so we don't need to craft a byte-exact Solana
-        // wire transaction for the happy-path tests. The real extraction
-        // logic lives in @solana/keychain-core and is covered there.
-        extractSignatureFromWireTransaction: vi.fn(({ signerAddress }: { signerAddress: string }) =>
-            Object.freeze({ [signerAddress]: new Uint8Array(64).fill(0xab) }),
-        ),
         sanitizeRemoteErrorResponse:
             mod.sanitizeRemoteErrorResponse ??
             ((text: string) =>
@@ -41,7 +42,7 @@ const TEST_PEM = testPrivateKey.export({ type: 'sec1', format: 'pem' }) as strin
 const MOCK_SIGNATURE_BYTES = new Uint8Array(64).fill(0xab);
 const MOCK_SIGNATURE_BASE64 = Buffer.from(MOCK_SIGNATURE_BYTES).toString('base64');
 
-const mockConfig: FordefiSignerConfig = {
+const mockConfig: FordefiSignerConfig & { chain?: undefined } = {
     accessToken: 'test-token',
     apiBaseUrl: 'https://api.test.fordefi.com',
     privateKeyPem: TEST_PEM,
@@ -69,13 +70,15 @@ function mockPollResponse(state: string, sigBase64?: string, rawTransaction?: st
     return new Response(JSON.stringify(body), { status: 200 });
 }
 
-/** Build a fake base64 wire transaction (1-byte sig count + 64-byte sig + message). */
-function mockWireTransaction(messageBytes = new Uint8Array(32)): string {
-    const wire = new Uint8Array(1 + 64 + messageBytes.length);
-    wire[0] = 1;
-    wire.set(new Uint8Array(64).fill(0xab), 1);
-    wire.set(messageBytes, 65);
-    return Buffer.from(wire).toString('base64');
+// Native mode parses real wire bytes, and a v1 envelope cannot be faked by hand.
+async function setupNativeBroadcast(version: 0 | 1) {
+    const fixture = await createSignedWireTransaction(version);
+    const config = {
+        ...mockConfig,
+        chain: 'solana_mainnet',
+        publicKey: fixture.feePayer,
+    } satisfies FordefiSignerConfig;
+    return { config, fixture };
 }
 
 function mockVaultResponse(address: string = MOCK_ADDRESS) {
@@ -217,7 +220,7 @@ describe('FordefiSigner', () => {
 
     describe('custom requestSigner', () => {
         // Config using a custom request signer instead of a PEM key.
-        const customConfig: FordefiSignerConfig = {
+        const customConfig: FordefiSignerConfig & { chain?: undefined } = {
             accessToken: 'test-token',
             apiBaseUrl: 'https://api.test.fordefi.com',
             publicKey: MOCK_ADDRESS,
@@ -301,6 +304,7 @@ describe('FordefiSigner', () => {
             expect(postOpts.headers).toHaveProperty('Authorization', 'Bearer test-token');
             expect(postOpts.headers).toHaveProperty('x-signature');
             expect(postOpts.headers).toHaveProperty('x-timestamp');
+            expect(postOpts.headers).not.toHaveProperty('x-idempotence-id');
         });
 
         it('should return the raw Fordefi signature directly without wire-tx round-trip', async () => {
@@ -318,7 +322,6 @@ describe('FordefiSigner', () => {
 
             const results = await signer.signTransactions([mockTx]);
 
-            expect(vi.mocked(extractSignatureFromWireTransaction)).not.toHaveBeenCalled();
             expect(results[0]).toHaveProperty(MOCK_ADDRESS);
             expect(Object.values(results[0]!)[0]).toEqual(MOCK_SIGNATURE_BYTES);
         });
@@ -361,6 +364,22 @@ describe('FordefiSigner', () => {
             const mockTx = { messageBytes: new Uint8Array(32) } as never;
 
             await expect(signer.signTransactions([mockTx])).rejects.toThrow();
+        });
+
+        // Black-box mode only signs, so a failed submit has no on-chain outcome to be unconfirmed about.
+        it('does not report a 5xx on a black-box submit as unconfirmed', async () => {
+            setupCreateVaultMock();
+            const signer = await FordefiSigner.create(mockConfig);
+            vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ message: 'boom' }), { status: 502 }));
+
+            const mockTx = { messageBytes: new Uint8Array(32) } as never;
+            const error = await signer.signTransactions([mockTx]).then(
+                () => {
+                    throw new Error('expected the submit failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_REMOTE_API_ERROR');
         });
 
         it('should handle completed state without signatures', async () => {
@@ -458,59 +477,87 @@ describe('FordefiSigner', () => {
     });
 
     describe('signAndSendTransactions (native solana mode)', () => {
-        it('should expose a TransactionSendingSigner and return the broadcast transaction signature', async () => {
-            const returnedMessage = new Uint8Array(32).fill(0xcd);
-            const wireTx = mockWireTransaction(returnedMessage);
+        it.each([0, 1] as const)(
+            'should expose a TransactionSendingSigner and return the broadcast signature from a v%i envelope',
+            async version => {
+                const { config, fixture } = await setupNativeBroadcast(version);
+                vi.mocked(fetch)
+                    .mockResolvedValueOnce(mockVaultResponse(fixture.feePayer))
+                    .mockResolvedValueOnce(mockCreateTxResponse('tx-native'))
+                    .mockResolvedValueOnce(
+                        mockPollResponse('completed', MOCK_SIGNATURE_BASE64, fixture.wireTransaction),
+                    );
+
+                const signer = await FordefiSigner.create(config);
+                expect(
+                    isTransactionSendingSigner(
+                        signer as unknown as { [key: string]: unknown; address: typeof signer.address },
+                    ),
+                ).toBe(true);
+
+                const mockTx = {
+                    messageBytes: new Uint8Array(32),
+                    signatures: { [fixture.feePayer]: null },
+                } as never;
+                const results = await signer.signAndSendTransactions([mockTx]);
+                expect(results).toHaveLength(1);
+
+                expect(results[0]).toStrictEqual(fixture.signature);
+                expect(assertSignatureValid).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                        data: fixture.messageBytes,
+                        signerAddress: fixture.feePayer,
+                    }),
+                );
+
+                // Verify POST body uses solana_transaction type
+                const call = vi.mocked(fetch).mock.calls[1]!;
+                const postOpts = call[1] as RequestInit;
+                const body = JSON.parse(postOpts.body as string);
+                expect(body.type).toBe('solana_transaction');
+                expect(body.details.type).toBe('solana_serialized_transaction_message');
+                expect(body.details.chain).toBe('solana_mainnet');
+                expect(body.details.push_mode).toBe('auto');
+                expect(body.details).toHaveProperty('data');
+                expect(body.details).not.toHaveProperty('signatures');
+            },
+        );
+
+        it('sends a deterministic x-idempotence-id on the native create', async () => {
+            const messageBytes = new Uint8Array(32).fill(0xab);
+            const digest = createHash('sha256').update(messageBytes).digest().subarray(0, 16);
+            digest[6] = (digest[6]! & 0x0f) | 0x40;
+            digest[8] = (digest[8]! & 0x3f) | 0x80;
+            const hex = digest.toString('hex');
+            const expectedId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+
+            const { config, fixture } = await setupNativeBroadcast(1);
             vi.mocked(fetch)
-                .mockResolvedValueOnce(mockVaultResponse())
+                .mockResolvedValueOnce(mockVaultResponse(fixture.feePayer))
                 .mockResolvedValueOnce(mockCreateTxResponse('tx-native'))
-                .mockResolvedValueOnce(mockPollResponse('completed', MOCK_SIGNATURE_BASE64, wireTx));
+                .mockResolvedValueOnce(mockPollResponse('completed', MOCK_SIGNATURE_BASE64, fixture.wireTransaction));
 
-            const signer = await FordefiSigner.create(nativeConfig);
-            expect(
-                isTransactionSendingSigner(
-                    signer as unknown as { [key: string]: unknown; address: typeof signer.address },
-                ),
-            ).toBe(true);
+            const signer = await FordefiSigner.create(config);
+            const mockTx = { messageBytes, signatures: { [fixture.feePayer]: null } } as never;
+            await signer.signAndSendTransactions([mockTx]);
 
-            const mockTx = {
-                messageBytes: new Uint8Array(32),
-                signatures: { [MOCK_ADDRESS]: null },
-            } as never;
-            const results = await signer.signAndSendTransactions([mockTx]);
-            expect(results).toHaveLength(1);
-            expect(results[0]).toEqual(MOCK_SIGNATURE_BYTES);
-            expect(assertSignatureValid).toHaveBeenCalledWith(
-                expect.objectContaining({
-                    data: returnedMessage,
-                    signerAddress: MOCK_ADDRESS,
-                }),
-            );
-
-            // Verify POST body uses solana_transaction type
-            const call = vi.mocked(fetch).mock.calls[1]!;
-            const postOpts = call[1] as RequestInit;
-            const body = JSON.parse(postOpts.body as string);
-            expect(body.type).toBe('solana_transaction');
-            expect(body.details.type).toBe('solana_serialized_transaction_message');
-            expect(body.details.chain).toBe('solana_mainnet');
-            expect(body.details.push_mode).toBe('auto');
-            expect(body.details).toHaveProperty('data');
-            expect(body.details).not.toHaveProperty('signatures');
+            const postOpts = vi.mocked(fetch).mock.calls[1]![1] as RequestInit;
+            expect(postOpts.headers).toHaveProperty('x-idempotence-id', expectedId);
         });
 
-        it('should reject partial-signer usage before submitting native remote work', async () => {
+        it('does not expose the partial-signer method in native mode', async () => {
             setupCreateVaultMock();
             const signer = await FordefiSigner.create(nativeConfig);
-            const mockTx = {
-                messageBytes: new Uint8Array(32),
-                signatures: { [MOCK_ADDRESS]: null },
-            } as never;
+            const guardInput = signer as unknown as { [key: string]: unknown; address: typeof signer.address };
 
-            await expect(signer.signTransactions([mockTx])).rejects.toMatchObject({
-                code: 'SIGNER_CONFIG_ERROR',
-            });
-            expect(fetch).toHaveBeenCalledTimes(1);
+            // Kit classifies by method presence: a present-but-throwing
+            // signTransactions would make Kit partial-sign and fail at runtime.
+            expect(signer.signTransactions).toBeUndefined();
+            expect('signTransactions' in signer).toBe(false);
+            expect(isTransactionPartialSigner(guardInput)).toBe(false);
+            expect(isTransactionSendingSigner(guardInput)).toBe(true);
+            expect(isSolanaSigner(guardInput)).toBe(false);
+            expect(isSolanaSendingSigner(guardInput)).toBe(true);
         });
 
         it('should reject native multi-signer auto-broadcast before submitting remote work', async () => {
@@ -533,30 +580,126 @@ describe('FordefiSigner', () => {
         it('should not expose TransactionSendingSigner in black box mode', async () => {
             setupCreateVaultMock();
             const signer = await FordefiSigner.create(mockConfig);
-            expect(
-                isTransactionSendingSigner(
-                    signer as unknown as { [key: string]: unknown; address: typeof signer.address },
-                ),
-            ).toBe(false);
+            const guardInput = signer as unknown as { [key: string]: unknown; address: typeof signer.address };
+
+            expect('signAndSendTransactions' in signer).toBe(false);
+            expect(isTransactionSendingSigner(guardInput)).toBe(false);
+            expect(isTransactionPartialSigner(guardInput)).toBe(true);
+            expect(isSolanaSigner(guardInput)).toBe(true);
+            expect(isSolanaSendingSigner(guardInput)).toBe(false);
         });
 
         it('should poll through intermediate pushable states', async () => {
-            const wireTx = mockWireTransaction();
+            const { config, fixture } = await setupNativeBroadcast(1);
             vi.mocked(fetch)
-                .mockResolvedValueOnce(mockVaultResponse())
+                .mockResolvedValueOnce(mockVaultResponse(fixture.feePayer))
                 .mockResolvedValueOnce(mockCreateTxResponse('tx-push'))
                 .mockResolvedValueOnce(mockPollResponse('pushing'))
                 .mockResolvedValueOnce(mockPollResponse('confirming'))
-                .mockResolvedValueOnce(mockPollResponse('completed', MOCK_SIGNATURE_BASE64, wireTx));
+                .mockResolvedValueOnce(mockPollResponse('completed', MOCK_SIGNATURE_BASE64, fixture.wireTransaction));
 
-            const signer = await FordefiSigner.create({ ...nativeConfig, pollIntervalMs: 1 });
+            const signer = await FordefiSigner.create({ ...config, pollIntervalMs: 1 });
             const mockTx = {
                 messageBytes: new Uint8Array(32),
-                signatures: { [MOCK_ADDRESS]: null },
+                signatures: { [fixture.feePayer]: null },
             } as never;
             const results = await signer.signAndSendTransactions([mockTx]);
             expect(results).toHaveLength(1);
             expect(fetch).toHaveBeenCalledTimes(5);
+        });
+
+        it('rejects a returned transaction whose fee-payer slot is unsigned', async () => {
+            // Fordefi rewrites what it broadcasts, so the returned fee payer need not
+            // be the vault, and without its signature there is no broadcast id.
+            const fixture = await createCosignedWireTransaction(1);
+            const config = {
+                ...mockConfig,
+                chain: 'solana_mainnet',
+                publicKey: fixture.cosigner,
+            } satisfies FordefiSignerConfig;
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockVaultResponse(fixture.cosigner))
+                .mockResolvedValueOnce(mockCreateTxResponse('tx-unsigned-payer'))
+                .mockResolvedValueOnce(mockPollResponse('completed', MOCK_SIGNATURE_BASE64, fixture.wireTransaction));
+
+            const signer = await FordefiSigner.create(config);
+            const mockTx = {
+                messageBytes: new Uint8Array(32),
+                signatures: { [fixture.cosigner]: null },
+            } as never;
+
+            const error = await signer.signAndSendTransactions([mockTx]).then(
+                () => {
+                    throw new Error('expected the unsigned fee payer to be rejected');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+
+            // Our own error, not a raw kit SolanaError leaking through.
+            const cause = error.context?.cause as SignerError;
+            expect(cause.code).toBe('SIGNER_SIGNING_FAILED');
+            expect(cause.context?.message).toContain('no fee-payer signature');
+        });
+
+        it('reports a 5xx on submit as unconfirmed with no transaction id', async () => {
+            setupCreateVaultMock();
+            const signer = await FordefiSigner.create(nativeConfig);
+            vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ message: 'boom' }), { status: 502 }));
+
+            const mockTx = {
+                messageBytes: new Uint8Array(32),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+            const error = await signer.signAndSendTransactions([mockTx]).then(
+                () => {
+                    throw new Error('expected the submit failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.providerTransactionId).toBeUndefined();
+            expect(error.context?.status).toBe(502);
+        });
+
+        it('reports an accepted submit with no id as unconfirmed', async () => {
+            setupCreateVaultMock();
+            const signer = await FordefiSigner.create(nativeConfig);
+            vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ state: 'pending' }), { status: 200 }));
+
+            const mockTx = {
+                messageBytes: new Uint8Array(32),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+            const error = await signer.signAndSendTransactions([mockTx]).then(
+                () => {
+                    throw new Error('expected the submit failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.providerTransactionId).toBeUndefined();
+            expect(error.context?.status).toBeUndefined();
+        });
+
+        it('keeps a 4xx on submit a plain failure', async () => {
+            setupCreateVaultMock();
+            const signer = await FordefiSigner.create(nativeConfig);
+            vi.mocked(fetch).mockResolvedValueOnce(
+                new Response(JSON.stringify({ message: 'Unauthorized' }), { status: 401 }),
+            );
+
+            const mockTx = {
+                messageBytes: new Uint8Array(32),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+            const error = await signer.signAndSendTransactions([mockTx]).then(
+                () => {
+                    throw new Error('expected the submit failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_REMOTE_API_ERROR');
         });
 
         it('should throw when raw_transaction is missing from response', async () => {
@@ -571,7 +714,9 @@ describe('FordefiSigner', () => {
                 signatures: { [MOCK_ADDRESS]: null },
             } as never;
             await expect(signer.signAndSendTransactions([mockTx])).rejects.toMatchObject({
-                code: 'SIGNER_SIGNING_FAILED',
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({ providerTransactionId: 'tx-no-raw' }) as object,
+                message: expect.stringContaining('tx-no-raw') as string,
             });
         });
 
@@ -587,7 +732,8 @@ describe('FordefiSigner', () => {
                 signatures: { [MOCK_ADDRESS]: null },
             } as never;
             await expect(signer.signAndSendTransactions([mockTx])).rejects.toMatchObject({
-                code: 'SIGNER_SIGNING_FAILED',
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({ providerTransactionId: 'tx-fail' }) as object,
             });
         });
     });

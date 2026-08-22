@@ -2,11 +2,29 @@ import { Address, assertIsAddress, getAddressEncoder } from '@solana/addresses';
 import { ReadonlyUint8Array } from '@solana/codecs-core';
 import { getBase64Encoder } from '@solana/codecs-strings';
 import { SignatureBytes, verifySignature } from '@solana/keys';
-import { isMessagePartialSigner, isTransactionPartialSigner, SignatureDictionary } from '@solana/signers';
+import {
+    isMessagePartialSigner,
+    isTransactionPartialSigner,
+    isTransactionSendingSigner,
+    SignatureDictionary,
+} from '@solana/signers';
 import { Base64EncodedWireTransaction, getTransactionDecoder } from '@solana/transactions';
 
 import { SignerErrorCode, throwSignerError } from './errors.js';
-import { SolanaSigner } from './types.js';
+import { SolanaSendingSigner, SolanaSigner } from './types.js';
+
+/**
+ * A UUID derived from SHA-256(message bytes), so a retry of the same bytes
+ * reuses the key and the provider deduplicates the create.
+ */
+export async function idempotencyKeyFromMessage(messageBytes: ReadonlyUint8Array): Promise<string> {
+    const { createHash } = await import('node:crypto');
+    const digest = createHash('sha256').update(new Uint8Array(messageBytes)).digest().subarray(0, 16);
+    digest[6] = (digest[6]! & 0x0f) | 0x40;
+    digest[8] = (digest[8]! & 0x3f) | 0x80;
+    const hex = digest.toString('hex');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
 
 interface AssertSignatureValidOptions {
     data: ReadonlyUint8Array;
@@ -172,6 +190,19 @@ export function isSolanaSigner<TAddress extends string>(value: {
         isMessagePartialSigner(value) &&
         isTransactionPartialSigner(value)
     );
+}
+
+/**
+ * Checks if the given value is a SolanaSendingSigner (a managed-broadcast
+ * signer). Such signers expose `signAndSendTransactions` and, by design, no
+ * `signTransactions`, so they are never also a {@link SolanaSigner}.
+ * @param value - The value to check
+ * @returns True if the value is a SolanaSendingSigner, false otherwise
+ */
+export function isSolanaSendingSigner<TAddress extends string>(value: {
+    address: Address<TAddress>;
+}): value is SolanaSendingSigner<TAddress> {
+    return 'address' in value && 'isAvailable' in value && isTransactionSendingSigner(value);
 }
 
 /**

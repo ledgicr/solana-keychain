@@ -1,29 +1,36 @@
 import { createPrivateKey, createSign, type KeyObject } from 'node:crypto';
 
 import { Address, assertIsAddress } from '@solana/addresses';
-import { getBase58Decoder } from '@solana/codecs-strings';
+import { getBase58Decoder, getBase58Encoder, getBase64Encoder } from '@solana/codecs-strings';
 import {
     assertHttpsUrl,
     assertSignatureValid,
     createSignatureDictionary,
-    extractSignatureFromWireTransaction,
     fetchSignerJson,
+    idempotencyKeyFromMessage,
     normalizeBaseUrl,
+    providerMayHaveAccepted,
+    providerStatus,
     signBatchStaggered,
     SignerErrorCode,
+    SolanaSendingSigner,
     SolanaSigner,
     throwSignerError,
     validateRequestDelayMs,
 } from '@solana/keychain-core';
 import { SignatureBytes } from '@solana/keys';
 import {
+    MessagePartialSigner,
     SignableMessage,
     SignatureDictionary,
+    TransactionPartialSigner,
     TransactionSendingSigner,
     TransactionSendingSignerConfig,
 } from '@solana/signers';
 import {
     Base64EncodedWireTransaction,
+    getSignatureFromTransaction,
+    getTransactionDecoder,
     Transaction,
     TransactionWithinSizeLimit,
     TransactionWithLifetime,
@@ -141,9 +148,21 @@ export interface FordefiSignerConfig {
  * Native mode may replace the recent blockhash and fees before signing and
  * broadcasts with `push_mode: 'auto'`, so it must be used through Kit's
  * {@link TransactionSendingSigner} flow rather than as a partial signer.
+ * Native instances expose no `signTransactions` — Kit classifies signers by
+ * duck-typed method presence — but do sign messages.
+ *
+ * Native mode is not retry-safe: any failure after Fordefi accepts the
+ * submission rejects with `BROADCAST_UNCONFIRMED` carrying
+ * `context.providerTransactionId`; check that transaction with Fordefi before
+ * retrying. A submission that fails without a usable response rejects with
+ * `BROADCAST_UNCONFIRMED` and no `providerTransactionId`.
+ *
+ * Each native create carries an `x-idempotence-id` derived from the message
+ * bytes, so replaying these exact bytes cannot create a second transaction; a
+ * rebuilt transaction derives a different id and is broadcast again.
  */
 export interface FordefiNativeSigner<TAddress extends string = string>
-    extends SolanaSigner<TAddress>, TransactionSendingSigner<TAddress> {}
+    extends SolanaSendingSigner<TAddress>, MessagePartialSigner<TAddress> {}
 
 /**
  * Create and initialize a Fordefi-backed signer.
@@ -154,12 +173,17 @@ export async function createFordefiSigner<TAddress extends string = string>(
     config: FordefiSignerConfig & { chain: SolanaChainUniqueId },
 ): Promise<FordefiNativeSigner<TAddress>>;
 export async function createFordefiSigner<TAddress extends string = string>(
-    config: FordefiSignerConfig,
+    config: FordefiSignerConfig & { chain?: undefined },
 ): Promise<SolanaSigner<TAddress>>;
 export async function createFordefiSigner<TAddress extends string = string>(
     config: FordefiSignerConfig,
-): Promise<SolanaSigner<TAddress>> {
-    return await FordefiSigner.create(config);
+): Promise<FordefiNativeSigner<TAddress> | SolanaSigner<TAddress>>;
+export async function createFordefiSigner<TAddress extends string = string>(
+    config: FordefiSignerConfig,
+): Promise<FordefiNativeSigner<TAddress> | SolanaSigner<TAddress>> {
+    // The instance's own properties expose the mode-appropriate signing
+    // method, which the class type cannot express statically.
+    return (await FordefiSigner.create(config)) as unknown as SolanaSigner<TAddress>;
 }
 
 /**
@@ -170,9 +194,10 @@ export async function createFordefiSigner<TAddress extends string = string>(
  *
  * Prefer `createFordefiSigner()`. Class export will be removed in a future version.
  */
-export class FordefiSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
+export class FordefiSigner<TAddress extends string = string> implements MessagePartialSigner<TAddress> {
     readonly address: Address<TAddress>;
     declare signAndSendTransactions?: TransactionSendingSigner<TAddress>['signAndSendTransactions'];
+    declare signTransactions?: TransactionPartialSigner<TAddress>['signTransactions'];
     private readonly accessToken: string;
     private readonly apiBaseUrl: string;
     private readonly chain?: SolanaChainUniqueId;
@@ -197,10 +222,16 @@ export class FordefiSigner<TAddress extends string = string> implements SolanaSi
         this.vaultId = config.vaultId;
         this.address = address;
 
-        // Keep this method off black-box instances so Kit does not misclassify
-        // them as sending signers. Native instances expose it as an own property.
+        // Kit classifies signers by duck-typed method presence, so each mode
+        // exposes exactly the method it can honor as an own property: native
+        // mode rewrites and auto-broadcasts, so it is a sending signer and
+        // must not present a partial-signer method; black-box mode signs the
+        // caller's exact bytes, so it is a partial signer and must not
+        // present a sending method.
         if (this.chain) {
             this.signAndSendTransactions = this.signAndSendNativeTransactions.bind(this);
+        } else {
+            this.signTransactions = this.signBlackBoxTransactions.bind(this);
         }
     }
 
@@ -211,8 +242,11 @@ export class FordefiSigner<TAddress extends string = string> implements SolanaSi
         config: FordefiSignerConfig & { chain: SolanaChainUniqueId },
     ): Promise<FordefiNativeSigner<TAddress> & FordefiSigner<TAddress>>;
     static async create<TAddress extends string = string>(
+        config: FordefiSignerConfig & { chain?: undefined },
+    ): Promise<FordefiSigner<TAddress> & SolanaSigner<TAddress>>;
+    static async create<TAddress extends string = string>(
         config: FordefiSignerConfig,
-    ): Promise<FordefiSigner<TAddress>>;
+    ): Promise<FordefiSigner<TAddress> & (FordefiNativeSigner<TAddress> | SolanaSigner<TAddress>)>;
     static async create<TAddress extends string = string>(
         config: FordefiSignerConfig,
     ): Promise<FordefiSigner<TAddress>> {
@@ -401,17 +435,13 @@ export class FordefiSigner<TAddress extends string = string> implements SolanaSi
         );
     }
 
-    async signTransactions(
+    /**
+     * Partial-signer path for black-box mode; attached as an own property only
+     * when `chain` is unset.
+     */
+    private async signBlackBoxTransactions(
         transactions: readonly (Transaction & TransactionWithinSizeLimit & TransactionWithLifetime)[],
     ): Promise<readonly SignatureDictionary[]> {
-        if (this.chain) {
-            return throwSignerError(SignerErrorCode.CONFIG_ERROR, {
-                address: this.address,
-                message:
-                    'Fordefi native Solana mode modifies and auto-broadcasts transactions; use signAndSendTransactions() or signAndSendTransactionMessageWithSigners()',
-            });
-        }
-
         return await signBatchStaggered(
             transactions,
             async transaction => {
@@ -489,38 +519,87 @@ export class FordefiSigner<TAddress extends string = string> implements SolanaSi
                 this.assertNativeAutoTransactionSupported(transaction);
 
                 const base64Data = Buffer.from(transaction.messageBytes).toString('base64');
-                const txId = await this.submitSolanaTransaction(base64Data);
-                const result = await this.pollForResult(txId, { pushable: true });
-                if (!result.raw_transaction) {
-                    return throwSignerError(SignerErrorCode.SIGNING_FAILED, {
-                        message: 'Fordefi solana_transaction response missing raw_transaction',
+                let txId: string;
+                try {
+                    txId = await this.submitSolanaTransaction(base64Data);
+                } catch (error) {
+                    if (!providerMayHaveAccepted(error)) {
+                        throw error;
+                    }
+                    // Fordefi may be broadcasting a transaction whose id never reached us.
+                    const status = providerStatus(error);
+                    return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
+                        cause: error,
+                        message: 'Fordefi may have accepted the transaction, but no transaction id was returned',
+                        ...(status === undefined ? {} : { status }),
                     });
                 }
-
-                const signedWireTx = result.raw_transaction as Base64EncodedWireTransaction;
-                const sigDict = extractSignatureFromWireTransaction({
-                    base64WireTransaction: signedWireTx,
-                    signerAddress: this.address,
-                });
-                const signerSignature = sigDict[this.address];
-                if (!signerSignature) {
-                    return throwSignerError(SignerErrorCode.SIGNING_FAILED, {
-                        address: this.address,
-                        message: 'Fordefi wire transaction did not contain the configured vault signature',
+                // Once the submit is accepted Fordefi is already broadcasting
+                // (push_mode 'auto'), so any later failure leaves an on-chain
+                // outcome this client cannot rule out. Report those as
+                // BROADCAST_UNCONFIRMED carrying the Fordefi transaction id
+                // instead of a generic error a caller might blindly retry into
+                // a duplicate spend.
+                try {
+                    return await this.finishNativeBroadcast(txId, config);
+                } catch (error) {
+                    return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
+                        cause: error,
+                        message: `Fordefi may have executed the transaction, but the outcome could not be confirmed (provider transaction id: ${txId})`,
+                        providerTransactionId: txId,
                     });
                 }
-
-                const { messageBytes, transactionSignature } = FordefiSigner.extractWireTransactionParts(signedWireTx);
-                await assertSignatureValid({
-                    data: messageBytes,
-                    signature: signerSignature,
-                    signerAddress: this.address,
-                });
-                config?.abortSignal?.throwIfAborted();
-                return transactionSignature;
             },
             this.requestDelayMs,
         );
+    }
+
+    /**
+     * Poll a submitted native transaction to completion and extract and verify
+     * the vault's signature from the returned wire bytes.
+     */
+    private async finishNativeBroadcast(
+        txId: string,
+        config?: TransactionSendingSignerConfig,
+    ): Promise<SignatureBytes> {
+        const result = await this.pollForResult(txId, { pushable: true });
+        if (!result.raw_transaction) {
+            return throwSignerError(SignerErrorCode.SIGNING_FAILED, {
+                message: 'Fordefi solana_transaction response missing raw_transaction',
+            });
+        }
+
+        const signedWireTx = result.raw_transaction as Base64EncodedWireTransaction;
+        const decodedTransaction = getTransactionDecoder().decode(getBase64Encoder().encode(signedWireTx));
+
+        const signerSignature = decodedTransaction.signatures[this.address];
+        if (!signerSignature) {
+            return throwSignerError(SignerErrorCode.SIGNING_FAILED, {
+                address: this.address,
+                message: 'Fordefi wire transaction did not contain the configured vault signature',
+            });
+        }
+
+        // Kit resolves the fee payer's signature, whichever slot the version puts it in.
+        let transactionSignature: SignatureBytes;
+        try {
+            transactionSignature = getBase58Encoder().encode(
+                getSignatureFromTransaction(decodedTransaction),
+            ) as SignatureBytes;
+        } catch (error) {
+            return throwSignerError(SignerErrorCode.SIGNING_FAILED, {
+                cause: error,
+                message: 'Fordefi wire transaction carries no fee-payer signature to identify the broadcast by',
+            });
+        }
+
+        await assertSignatureValid({
+            data: decodedTransaction.messageBytes,
+            signature: signerSignature,
+            signerAddress: this.address,
+        });
+        config?.abortSignal?.throwIfAborted();
+        return transactionSignature;
     }
 
     /**
@@ -545,12 +624,15 @@ export class FordefiSigner<TAddress extends string = string> implements SolanaSi
      */
     private async submitTransaction(
         requestBody: FordefiBlackBoxSignatureRequest | FordefiSolanaMessageRequest | FordefiSolanaTransactionRequest,
+        idempotenceId?: string,
     ): Promise<string> {
         const apiPath = '/api/v1/transactions';
         const createResponse = await this.request<FordefiCreateTransactionResponse>(
             'POST',
             apiPath,
             JSON.stringify(requestBody),
+            this.requestTimeoutMs,
+            idempotenceId,
         );
         return createResponse.id;
     }
@@ -589,7 +671,10 @@ export class FordefiSigner<TAddress extends string = string> implements SolanaSi
             type: 'solana_transaction',
             vault_id: this.vaultId,
         };
-        return await this.submitTransaction(requestBody);
+        return await this.submitTransaction(
+            requestBody,
+            await idempotencyKeyFromMessage(Buffer.from(base64Data, 'base64')),
+        );
     }
 
     /**
@@ -708,6 +793,7 @@ export class FordefiSigner<TAddress extends string = string> implements SolanaSi
         apiPath: string,
         body?: string,
         timeoutMs = this.requestTimeoutMs,
+        idempotenceId?: string,
     ): Promise<T> {
         const headers: Record<string, string> = {
             Authorization: `Bearer ${this.accessToken}`,
@@ -717,6 +803,9 @@ export class FordefiSigner<TAddress extends string = string> implements SolanaSi
             headers['Content-Type'] = 'application/json';
             headers['x-signature'] = await this.signRequest(apiPath, timestamp, body);
             headers['x-timestamp'] = timestamp.toString();
+        }
+        if (idempotenceId !== undefined) {
+            headers['x-idempotence-id'] = idempotenceId;
         }
 
         return await fetchSignerJson<T>({
@@ -746,62 +835,5 @@ export class FordefiSigner<TAddress extends string = string> implements SolanaSi
                 message: 'requestTimeoutMs must be a positive finite number',
             });
         }
-    }
-
-    /**
-     * Extract the message bytes portion from a base64-encoded wire transaction.
-     * Wire format: [compact-u16 sig_count][sig_count * 64 bytes][message bytes]
-     */
-    private static extractWireTransactionParts(base64WireTx: Base64EncodedWireTransaction): {
-        messageBytes: Uint8Array;
-        transactionSignature: SignatureBytes;
-    } {
-        const wireBytes = new Uint8Array(Buffer.from(base64WireTx, 'base64'));
-        let signatureCount = 0;
-        let signatureCountSize = 0;
-        let shift = 0;
-        let terminated = false;
-
-        while (signatureCountSize < 3) {
-            const byte = wireBytes[signatureCountSize];
-            if (byte === undefined) {
-                return throwSignerError(SignerErrorCode.PARSING_ERROR, {
-                    message: 'Fordefi wire transaction is missing its signature count',
-                });
-            }
-            signatureCount |= (byte & 0x7f) << shift;
-            signatureCountSize++;
-            if ((byte & 0x80) === 0) {
-                terminated = true;
-                break;
-            }
-            shift += 7;
-        }
-
-        if (!terminated) {
-            return throwSignerError(SignerErrorCode.PARSING_ERROR, {
-                message: 'Fordefi wire transaction has an invalid signature count',
-            });
-        }
-
-        if (signatureCount < 1) {
-            return throwSignerError(SignerErrorCode.SIGNING_FAILED, {
-                message: 'Fordefi wire transaction has no signatures',
-            });
-        }
-
-        const messageStart = signatureCountSize + signatureCount * 64;
-        if (wireBytes.length <= messageStart) {
-            return throwSignerError(SignerErrorCode.PARSING_ERROR, {
-                message: 'Fordefi wire transaction is truncated',
-            });
-        }
-
-        return {
-            messageBytes: wireBytes.subarray(messageStart),
-            transactionSignature: new Uint8Array(
-                wireBytes.subarray(signatureCountSize, signatureCountSize + 64),
-            ) as SignatureBytes,
-        };
     }
 }

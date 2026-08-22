@@ -7,6 +7,7 @@ from enum import Enum, unique
 class SignerErrorCode(str, Enum):
     """Stable, machine-readable error codes for every signer failure mode."""
 
+    BROADCAST_UNCONFIRMED = "SIGNER_BROADCAST_UNCONFIRMED"
     CONFIG_ERROR = "SIGNER_CONFIG_ERROR"
     EXPECTED_SOLANA_SIGNER = "SIGNER_EXPECTED_SOLANA_SIGNER"
     HTTP_ERROR = "SIGNER_HTTP_ERROR"
@@ -23,6 +24,9 @@ class SignerErrorCode(str, Enum):
 
 
 _GENERIC_MESSAGES: dict[SignerErrorCode, str] = {
+    SignerErrorCode.BROADCAST_UNCONFIRMED: (
+        "Broadcast unconfirmed; the provider may have executed the transaction"
+    ),
     SignerErrorCode.CONFIG_ERROR: "Configuration error",
     SignerErrorCode.EXPECTED_SOLANA_SIGNER: "Expected a Solana signer",
     SignerErrorCode.HTTP_ERROR: "HTTP request failed",
@@ -45,12 +49,27 @@ class SignerError(Exception):
     Security: ``str()``, ``repr()``, and ``args`` only ever expose the fixed generic
     message for the code. The per-error ``detail`` is kept private so key material and
     raw remote-API responses cannot leak through formatted output or logs.
+
+    ``status_code`` is the remote HTTP status when the failure came from a response,
+    and ``None`` otherwise.
     """
 
-    def __init__(self, code: SignerErrorCode, detail: str = "") -> None:
-        super().__init__(_GENERIC_MESSAGES[code])
+    def __init__(
+        self,
+        code: SignerErrorCode,
+        detail: str = "",
+        *,
+        provider_transaction_id: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        message = _GENERIC_MESSAGES[code]
+        if provider_transaction_id is not None:
+            message += f" (provider transaction id: {provider_transaction_id})"
+        super().__init__(message)
         self.code = code
         self._detail = detail
+        self.provider_transaction_id = provider_transaction_id
+        self.status_code = status_code
 
     def __repr__(self) -> str:
         return f"SignerError({self.code.value})"

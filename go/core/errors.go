@@ -26,6 +26,7 @@ const (
 	CodeSerializationError   Code = "SIGNER_SERIALIZATION_ERROR"
 	CodeNotInitialized       Code = "SIGNER_NOT_INITIALIZED"
 	CodeSigningFailed        Code = "SIGNER_SIGNING_FAILED"
+	CodeBroadcastUnconfirmed Code = "SIGNER_BROADCAST_UNCONFIRMED"
 	CodeOther                Code = "SIGNER_ERROR"
 )
 
@@ -45,6 +46,7 @@ var genericMessages = map[Code]string{
 	CodeSerializationError:   "Serialization error",
 	CodeNotInitialized:       "Signer not initialized",
 	CodeSigningFailed:        "Signing failed",
+	CodeBroadcastUnconfirmed: "Broadcast unconfirmed; the provider may have executed the transaction",
 	CodeOther:                "Signer error",
 }
 
@@ -62,9 +64,18 @@ func (c Code) message() string {
 // Code is surfaced, ensuring key material and raw remote-API responses never leak
 // through formatted output or logs.
 type SignerError struct {
-	Code   Code
-	detail string
-	cause  error
+	Code Code
+	// ProviderTxID is the provider-side transaction id for
+	// CodeBroadcastUnconfirmed errors ("" otherwise). It is deliberately
+	// exported and rendered by Error(): it is the caller's only handle to check
+	// the transaction's outcome before retrying, and contains no secret
+	// material.
+	ProviderTxID string
+	// ProviderStatus is the provider's HTTP status when its response was the
+	// failure, and 0 otherwise. Exported for the same reason as ProviderTxID.
+	ProviderStatus int
+	detail         string
+	cause          error
 }
 
 // NewSignerError builds a SignerError with a (private) detail string.
@@ -78,9 +89,12 @@ func WrapSignerError(code Code, detail string, cause error) *SignerError {
 	return &SignerError{Code: code, detail: detail, cause: cause}
 }
 
-// Error returns the fixed, generic message for the error's Code. It never
-// includes the detail or cause.
+// Error returns the fixed, generic message for the error's Code plus the
+// provider transaction id when present. It never includes the detail or cause.
 func (e *SignerError) Error() string {
+	if e.ProviderTxID != "" {
+		return e.Code.message() + " (provider transaction id: " + e.ProviderTxID + ")"
+	}
 	return e.Code.message()
 }
 
@@ -103,6 +117,33 @@ func (e *SignerError) Is(target error) bool {
 // Detail returns the unredacted detail string. It is opt-in: nothing calls this
 // during normal formatting, so detail only surfaces when a caller explicitly asks.
 func (e *SignerError) Detail() string { return e.detail }
+
+// NewBroadcastUnconfirmedError reports a failure after the provider has
+// accepted a transaction it broadcasts itself, carrying the provider-side
+// transaction id the caller must check before retrying. providerTxID is "" when
+// the create failed before an id was known.
+func NewBroadcastUnconfirmedError(providerTxID, detail string) *SignerError {
+	return &SignerError{Code: CodeBroadcastUnconfirmed, ProviderTxID: providerTxID, detail: detail}
+}
+
+// UnconfirmedUnlessRejected reports a failed create as CodeBroadcastUnconfirmed
+// with no transaction id unless a 4xx rules the transaction out. status is 0 when
+// no response arrived, and is passed on only when the response was the failure.
+func UnconfirmedUnlessRejected(status int, err error) error {
+	if status >= 400 && status < 500 {
+		return err
+	}
+	detail := err.Error()
+	var se *SignerError
+	if errors.As(err, &se) {
+		detail = se.Detail()
+	}
+	out := NewBroadcastUnconfirmedError("", detail)
+	if status >= 400 {
+		out.ProviderStatus = status
+	}
+	return out
+}
 
 // CodeOf extracts the Code from an error if it is (or wraps) a *SignerError.
 func CodeOf(err error) (Code, bool) {

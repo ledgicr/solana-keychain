@@ -14,9 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::SignerError;
 use crate::http_client_config::HttpClientConfig;
-use crate::sdk_adapter::{Pubkey, Signature, Transaction};
+use crate::sdk_adapter::{Pubkey, Signature, VersionedTransaction};
 use crate::traits::{SignTransactionResult, SignedTransaction, SolanaSigner};
-use crate::transaction_util::TransactionUtil;
+use crate::transaction_util::{
+    deserialize_wire_transaction, idempotency_key_from_message, unconfirmed_unless_rejected,
+    TransactionUtil,
+};
 pub use request_signer::{FordefiRequestSigner, PemRequestSigner};
 use types::{
     BlackBoxDetails, BlackBoxSignatureRequest, CreateTransactionResponse, SolanaMessageDetails,
@@ -71,8 +74,8 @@ pub struct FordefiSignerConfig {
 ///   API types. Fordefi will modify the transaction (at minimum updating the blockhash,
 ///   and optionally adding priority fees) and **auto-broadcasts** it on-chain
 ///   (`push_mode: "auto"`). Because the transaction is already submitted, the returned
-///   serialized transaction is **empty** — only the signature is returned. The caller's
-///   `&mut Transaction` is updated to the Fordefi-signed transaction.
+///   serialized transaction is **empty** — only the signature, the on-chain
+///   identifier, is returned. The caller's `&mut Transaction` is left untouched.
 pub struct FordefiSigner {
     access_token: String,
     vault_id: String,
@@ -235,9 +238,13 @@ impl FordefiSigner {
 
     /// POST a serialized request body to `/api/v1/transactions` with P-256
     /// request signing. Returns the Fordefi transaction ID.
+    /// `broadcast_managed` marks a submit whose acceptance means Fordefi is already
+    /// broadcasting, so an unresolved failure is reported as unconfirmed.
     async fn submit_request<T: serde::Serialize>(
         &self,
         request: &T,
+        idempotence_id: Option<&str>,
+        broadcast_managed: bool,
     ) -> Result<String, SignerError> {
         let path = "/api/v1/transactions";
         let body = serde_json::to_string(request)?;
@@ -248,22 +255,40 @@ impl FordefiSigner {
         let signature = self.sign_request(path, timestamp, &body).await?;
 
         let url = format!("{}{}", self.api_base_url, path);
-        let response = self
+        let mut builder = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.access_token))
             .header("x-signature", &signature)
             .header("x-timestamp", timestamp.to_string())
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        if let Some(id) = idempotence_id {
+            builder = builder.header("x-idempotence-id", id);
+        }
+        let classify = |status: Option<u16>, error: SignerError| {
+            if broadcast_managed {
+                unconfirmed_unless_rejected(status, error)
+            } else {
+                error
+            }
+        };
+
+        let response = builder
             .body(body)
             .send()
-            .await?;
+            .await
+            .map_err(|error| classify(None, error.into()))?;
 
+        let status = response.status().as_u16();
         if !response.status().is_success() {
-            return Err(Self::extract_api_error(response, "submit_request").await);
+            let error = Self::extract_api_error(response, "submit_request").await;
+            return Err(classify(Some(status), error));
         }
 
-        let create_response: CreateTransactionResponse = response.json().await?;
+        let create_response: CreateTransactionResponse = response
+            .json()
+            .await
+            .map_err(|error| classify(Some(status), error.into()))?;
         Ok(create_response.id)
     }
 
@@ -282,7 +307,7 @@ impl FordefiSigner {
             },
         };
 
-        self.submit_request(&request).await
+        self.submit_request(&request, None, false).await
     }
 
     /// Submit a native Solana transaction request.
@@ -306,7 +331,12 @@ impl FordefiSigner {
             },
         };
 
-        self.submit_request(&request).await
+        self.submit_request(
+            &request,
+            Some(&idempotency_key_from_message(data_bytes)),
+            true,
+        )
+        .await
     }
 
     /// Submit a native Solana message request.
@@ -328,7 +358,7 @@ impl FordefiSigner {
             },
         };
 
-        self.submit_request(&request).await
+        self.submit_request(&request, None, false).await
     }
 
     // -----------------------------------------------------------------------
@@ -451,9 +481,9 @@ impl FordefiSigner {
     /// Sign a transaction via the black box path: submit → poll → apply signature.
     async fn sign_and_serialize_black_box(
         &self,
-        transaction: &mut Transaction,
+        transaction: &mut VersionedTransaction,
     ) -> Result<SignedTransaction, SignerError> {
-        let message_data = transaction.message_data();
+        let message_data = transaction.message.serialize();
         let signature = self.sign_black_box(&message_data).await?;
 
         if !signature.verify(&self.public_key.to_bytes(), &message_data) {
@@ -475,24 +505,43 @@ impl FordefiSigner {
     /// Fordefi will modify the transaction (at minimum updating the blockhash, and
     /// optionally adding priority fees), so we verify the signature against the
     /// returned message bytes, not the original. The caller's `transaction` is
-    /// replaced with the Fordefi-returned transaction.
+    /// left untouched.
     ///
     /// Because native mode uses `push_mode: "auto"`, Fordefi has already broadcast
     /// the transaction on-chain by the time this returns. Re-sending it would be
     /// superfluous, so the returned serialized-transaction string is intentionally
-    /// empty — only the signature is returned. Callers that need the exact
-    /// broadcast bytes can serialize the (now Fordefi-signed) `transaction`.
+    /// empty — only the signature, usable with RPC transaction lookups, is
+    /// returned.
     ///
-    /// Only legacy transactions are supported: a versioned (v0) transaction
-    /// returned by Fordefi fails to deserialize with a [`SignerError::SerializationError`].
+    /// A submit that fails without a usable response returns
+    /// [`SignerError::BroadcastUnconfirmed`] with no transaction id.
+    ///
+    /// Each native create carries an `x-idempotence-id` derived from the message
+    /// bytes, so replaying these exact bytes cannot create a second transaction; a
+    /// rebuilt transaction derives a different id and is broadcast again.
     async fn sign_and_serialize_native(
         &self,
-        transaction: &mut Transaction,
+        transaction: &mut VersionedTransaction,
     ) -> Result<SignedTransaction, SignerError> {
         self.validate_native_auto_transaction(transaction)?;
-        let message_data = transaction.message_data();
+        let message_data = transaction.message.serialize();
         let tx_id = self.submit_solana_transaction(&message_data).await?;
-        let result = self.poll_for_result(&tx_id, true).await?;
+        // Once the submit is accepted Fordefi is already broadcasting
+        // (push_mode: "auto"), so any later failure leaves an on-chain outcome
+        // this client cannot rule out. Report those as BroadcastUnconfirmed
+        // carrying the Fordefi transaction id instead of a generic error a
+        // caller might blindly retry into a duplicate spend.
+        self.finish_native_broadcast(&tx_id).await.map_err(|error| {
+            SignerError::BroadcastUnconfirmed {
+                provider_tx_id: Some(tx_id),
+                provider_status: None,
+                detail: error.detail_string(),
+            }
+        })
+    }
+
+    async fn finish_native_broadcast(&self, tx_id: &str) -> Result<SignedTransaction, SignerError> {
+        let result = self.poll_for_result(tx_id, true).await?;
 
         let raw_tx_b64 = result.raw_transaction.as_ref().ok_or_else(|| {
             SignerError::SigningFailed(
@@ -504,38 +553,25 @@ impl FordefiSigner {
             SignerError::SerializationError(format!("Failed to decode raw_transaction base64: {e}"))
         })?;
 
-        // Deserialize the Fordefi-returned wire transaction with the Solana SDK
-        // (bincode of a Transaction is exactly the Solana wire format).
-        //
-        // NOTE: only *legacy* transactions are supported. A versioned (v0) wire
-        // transaction is prefixed with a version byte (high bit set on the first
-        // byte) that the legacy `Transaction` layout cannot represent, so if Fordefi
-        // ever returns a v0 transaction this deserialization fails rather than
-        // silently mis-parsing. Supporting v0 would mean decoding into
-        // `VersionedTransaction` and threading that type through the signer API.
-        let returned_tx: Transaction = bincode::deserialize(&wire_bytes).map_err(|e| {
-            SignerError::SerializationError(format!(
-                "Failed to deserialize Fordefi wire transaction (versioned/v0 \
-                 transactions are not supported, only legacy): {e}"
-            ))
-        })?;
+        let returned_tx: VersionedTransaction =
+            deserialize_wire_transaction(&wire_bytes).map_err(|e| {
+                SignerError::SerializationError(format!(
+                    "Failed to deserialize Fordefi wire transaction: {e}"
+                ))
+            })?;
 
         let signature = self.extract_vault_signature(&returned_tx)?;
 
         // Verify against the *returned* message (Fordefi modifies the tx, e.g. blockhash)
-        let returned_message = returned_tx.message_data();
+        let returned_message = returned_tx.message.serialize();
         if !signature.verify(&self.public_key.to_bytes(), &returned_message) {
             return Err(SignerError::SigningFailed(
                 "Signature verification failed against Fordefi-returned message".to_string(),
             ));
         }
 
-        // Replace the caller's transaction with the Fordefi-signed one
-        *transaction = returned_tx;
-
-        // Native mode auto-broadcasts (push_mode: "auto"), so there is nothing for
-        // the caller to send. Return an empty serialized transaction rather than
-        // re-broadcastable bytes; the signature is still returned.
+        // Auto-broadcast leaves nothing to send; the signature is the on-chain
+        // identifier and the caller's transaction stays untouched.
         Ok((String::new(), signature))
     }
 
@@ -544,11 +580,11 @@ impl FordefiSigner {
     /// forwarded through Fordefi's `details.signatures` request field.
     fn validate_native_auto_transaction(
         &self,
-        transaction: &Transaction,
+        transaction: &VersionedTransaction,
     ) -> Result<(), SignerError> {
-        let required_signatures = transaction.message.header.num_required_signatures as usize;
+        let required_signatures = transaction.message.header().num_required_signatures as usize;
         if required_signatures != 1
-            || transaction.message.account_keys.first() != Some(&self.public_key)
+            || transaction.message.static_account_keys().first() != Some(&self.public_key)
         {
             return Err(SignerError::SigningFailed(
                 "Fordefi native auto-broadcast currently supports only transactions whose sole required signer is the configured vault"
@@ -560,7 +596,10 @@ impl FordefiSigner {
 
     /// Locate the configured vault's signature by its required-signer account
     /// position rather than assuming it occupies slot zero.
-    fn extract_vault_signature(&self, returned_tx: &Transaction) -> Result<Signature, SignerError> {
+    fn extract_vault_signature(
+        &self,
+        returned_tx: &VersionedTransaction,
+    ) -> Result<Signature, SignerError> {
         let signer_index =
             TransactionUtil::get_signing_keypair_position(returned_tx, &self.public_key)?;
         returned_tx
@@ -577,7 +616,7 @@ impl FordefiSigner {
     /// Sign a transaction end-to-end, dispatching to black box or native path.
     async fn sign_and_serialize(
         &self,
-        transaction: &mut Transaction,
+        transaction: &mut VersionedTransaction,
     ) -> Result<SignedTransaction, SignerError> {
         if self.chain.is_some() {
             self.sign_and_serialize_native(transaction).await
@@ -695,11 +734,20 @@ impl SolanaSigner for FordefiSigner {
         self.public_key
     }
 
+    fn broadcasts_transactions(&self) -> bool {
+        self.chain.is_some()
+    }
+
     async fn sign_transaction(
         &self,
-        tx: &mut Transaction,
+        tx: &mut VersionedTransaction,
     ) -> Result<SignTransactionResult, SignerError> {
         let signed_transaction = self.sign_and_serialize(tx).await?;
+        if self.chain.is_some() {
+            // Native mode has already broadcast the transaction, so it is
+            // complete regardless of the caller's untouched signature slots.
+            return Ok(SignTransactionResult::Complete(signed_transaction));
+        }
         Ok(TransactionUtil::classify_signed_transaction(
             tx,
             signed_transaction,
@@ -742,7 +790,7 @@ impl SolanaSigner for FordefiSigner {
 mod tests {
     use super::*;
     use crate::sdk_adapter::{keypair_pubkey, Keypair, Signer as SdkSigner};
-    use crate::test_util::create_test_transaction;
+    use crate::test_util::{add_required_signer, create_test_transaction};
     use p256::ecdsa::SigningKey;
     use wiremock::{
         matchers::{header, method, path, path_regex},
@@ -850,6 +898,13 @@ mod tests {
             test_request_signer(),
             Some(SolanaChainUniqueId::SolanaMainnet),
         )
+    }
+
+    #[test]
+    fn test_broadcasts_transactions_by_mode() {
+        let pubkey = Pubkey::new_unique();
+        assert!(!create_test_signer("https://example.com", pubkey).broadcasts_transactions());
+        assert!(create_native_test_signer("https://example.com", pubkey).broadcasts_transactions());
     }
 
     /// Build a mock wire transaction: [1 byte sig_count][64-byte signature][message bytes]
@@ -1315,7 +1370,7 @@ mod tests {
         let signer = create_test_signer(&mock_server.uri(), pubkey);
 
         let tx = create_test_transaction(&pubkey);
-        let message_data = tx.message_data();
+        let message_data = tx.message.serialize();
         let real_signature = keypair.sign_message(&message_data);
         let sig_b64 = STANDARD.encode(real_signature.as_ref());
 
@@ -1605,9 +1660,8 @@ mod tests {
         let signer = create_native_test_signer("https://test.com", fordefi_pubkey);
 
         let mut returned_tx = create_test_transaction(&keypair_pubkey(&fee_payer));
-        returned_tx.message.account_keys.insert(1, fordefi_pubkey);
-        returned_tx.message.header.num_required_signatures = 2;
-        let returned_message = returned_tx.message_data();
+        add_required_signer(&mut returned_tx, fordefi_pubkey);
+        let returned_message = returned_tx.message.serialize();
         let fee_payer_signature = fee_payer.sign_message(&returned_message);
         let fordefi_signature = fordefi_keypair.sign_message(&returned_message);
         returned_tx.signatures = vec![fee_payer_signature, fordefi_signature];
@@ -1625,8 +1679,7 @@ mod tests {
         let signer = create_native_test_signer("https://test.com", fordefi_pubkey);
 
         let mut tx = create_test_transaction(&keypair_pubkey(&fee_payer));
-        tx.message.account_keys.insert(1, fordefi_pubkey);
-        tx.message.header.num_required_signatures = 2;
+        add_required_signer(&mut tx, fordefi_pubkey);
 
         let result = signer.validate_native_auto_transaction(&tx);
         assert!(matches!(result.unwrap_err(), SignerError::SigningFailed(_)));
@@ -1640,14 +1693,16 @@ mod tests {
         let signer = create_native_test_signer(&mock_server.uri(), pubkey);
 
         let tx = create_test_transaction(&pubkey);
-        let message_data = tx.message_data();
+        let message_data = tx.message.serialize();
 
         let wire_bytes = build_mock_wire_transaction(&keypair, &message_data);
         let wire_b64 = STANDARD.encode(&wire_bytes);
 
+        let expected_idempotence_id = idempotency_key_from_message(&message_data);
         Mock::given(method("POST"))
             .and(path("/api/v1/transactions"))
             .and(header("Authorization", "Bearer test-token"))
+            .and(header("x-idempotence-id", expected_idempotence_id.as_str()))
             .and(wiremock::matchers::body_partial_json(serde_json::json!({
                 "type": "solana_transaction",
                 "details": {
@@ -1679,13 +1734,23 @@ mod tests {
             "native sign_transaction failed: {:?}",
             result.err()
         );
-        let (serialized_tx, sig) = result.unwrap().into_signed_transaction();
+        let result = result.unwrap();
+        assert!(
+            matches!(result, SignTransactionResult::Complete(_)),
+            "a broadcast native transaction is complete even though the caller's \
+             signature slots stay untouched"
+        );
+        let (serialized_tx, sig) = result.into_signed_transaction();
         // Native mode auto-broadcasts, so no re-sendable wire tx is returned.
         assert!(
             serialized_tx.is_empty(),
             "native mode should return an empty serialized transaction"
         );
         assert!(sig.verify(&pubkey.to_bytes(), &message_data));
+        assert!(
+            tx.signatures.iter().all(|s| *s == Signature::default()),
+            "the caller's transaction must be left untouched by provider-chosen bytes"
+        );
     }
 
     #[tokio::test]
@@ -1715,8 +1780,100 @@ mod tests {
 
         let mut tx = create_test_transaction(&pubkey);
         let result = signer.sign_transaction(&mut tx).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SignerError::SigningFailed(_)));
+        match result.unwrap_err() {
+            SignerError::BroadcastUnconfirmed { provider_tx_id, .. } => {
+                assert_eq!(provider_tx_id.as_deref(), Some("native-tx-no-raw"));
+            }
+            other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_submit_server_error_is_unconfirmed_without_a_transaction_id() {
+        let mock_server = MockServer::start().await;
+        let pubkey = keypair_pubkey(&create_test_keypair());
+        let signer = create_native_test_signer(&mock_server.uri(), pubkey);
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/transactions"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&mock_server)
+            .await;
+
+        let mut tx = create_test_transaction(&pubkey);
+        match signer.sign_transaction(&mut tx).await.unwrap_err() {
+            SignerError::BroadcastUnconfirmed {
+                provider_tx_id,
+                provider_status,
+                ..
+            } => {
+                assert_eq!(provider_tx_id, None);
+                assert_eq!(provider_status, Some(502));
+            }
+            other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_submit_accepted_without_an_id_is_unconfirmed() {
+        let mock_server = MockServer::start().await;
+        let pubkey = keypair_pubkey(&create_test_keypair());
+        let signer = create_native_test_signer(&mock_server.uri(), pubkey);
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/transactions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "state": "pending" })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut tx = create_test_transaction(&pubkey);
+        match signer.sign_transaction(&mut tx).await.unwrap_err() {
+            SignerError::BroadcastUnconfirmed { provider_tx_id, .. } => {
+                assert_eq!(provider_tx_id, None);
+            }
+            other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_submit_rejected_by_fordefi_stays_a_plain_failure() {
+        let mock_server = MockServer::start().await;
+        let pubkey = keypair_pubkey(&create_test_keypair());
+        let signer = create_native_test_signer(&mock_server.uri(), pubkey);
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/transactions"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let mut tx = create_test_transaction(&pubkey);
+        match signer.sign_transaction(&mut tx).await.unwrap_err() {
+            SignerError::RemoteApiError(_) => {}
+            other => panic!("Expected RemoteApiError, got: {other:?}"),
+        }
+    }
+
+    /// Black-box mode only signs, so a failed submit has no on-chain outcome to be unconfirmed about.
+    #[tokio::test]
+    async fn test_black_box_submit_server_error_is_not_reported_as_unconfirmed() {
+        let mock_server = MockServer::start().await;
+        let pubkey = keypair_pubkey(&create_test_keypair());
+        let signer = create_test_signer(&mock_server.uri(), pubkey);
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/transactions"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&mock_server)
+            .await;
+
+        let mut tx = create_test_transaction(&pubkey);
+        match signer.sign_transaction(&mut tx).await.unwrap_err() {
+            SignerError::RemoteApiError(_) => {}
+            other => panic!("Expected RemoteApiError, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1746,8 +1903,20 @@ mod tests {
 
         let mut tx = create_test_transaction(&pubkey);
         let result = signer.sign_transaction(&mut tx).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SignerError::SigningFailed(_)));
+        match result.unwrap_err() {
+            SignerError::BroadcastUnconfirmed {
+                provider_tx_id,
+                detail,
+                ..
+            } => {
+                assert_eq!(provider_tx_id.as_deref(), Some("native-tx-fail"));
+                assert!(
+                    detail.contains("aborted"),
+                    "detail must carry the state, got: {detail}"
+                );
+            }
+            other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1823,6 +1992,48 @@ mod tests {
         assert!(matches!(result.unwrap_err(), SignerError::SigningFailed(_)));
     }
 
+    #[tokio::test]
+    async fn test_fordefi_native_sign_transaction_poll_timeout_is_broadcast_unconfirmed() {
+        let mock_server = MockServer::start().await;
+        let keypair = create_test_keypair();
+        let pubkey = keypair_pubkey(&keypair);
+        let signer = create_native_test_signer(&mock_server.uri(), pubkey);
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "native-tx-pending"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/transactions/native-tx-pending"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "pending_signature"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut tx = create_test_transaction(&pubkey);
+        let result = signer.sign_transaction(&mut tx).await;
+        match result.unwrap_err() {
+            SignerError::BroadcastUnconfirmed {
+                provider_tx_id,
+                detail,
+                ..
+            } => {
+                assert_eq!(provider_tx_id.as_deref(), Some("native-tx-pending"));
+                assert!(
+                    detail.contains("timeout"),
+                    "detail must carry the cause, got: {detail}"
+                );
+            }
+            other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+        }
+    }
+
     // --- Wire transaction parsing tests ---
 
     #[tokio::test]
@@ -1856,11 +2067,12 @@ mod tests {
 
         let mut tx = create_test_transaction(&pubkey);
         let result = signer.sign_transaction(&mut tx).await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            SignerError::SerializationError(_)
-        ));
+        match result.unwrap_err() {
+            SignerError::BroadcastUnconfirmed { provider_tx_id, .. } => {
+                assert_eq!(provider_tx_id.as_deref(), Some("native-tx-malformed"));
+            }
+            other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+        }
     }
 
     // --- Custom request-signer (FordefiRequestSigner) tests ---
