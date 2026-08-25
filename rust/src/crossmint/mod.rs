@@ -853,6 +853,14 @@ impl SolanaSigner for CrossmintSigner {
         self.sign_and_serialize(tx).await
     }
 
+    async fn sign_and_send_transaction(
+        &self,
+        tx: &mut VersionedTransaction,
+    ) -> Result<Signature, SignerError> {
+        let (_, signature) = self.sign_and_serialize(tx).await?.into_signed_transaction();
+        Ok(signature)
+    }
+
     async fn sign_message(&self, _message: &[u8]) -> Result<Signature, SignerError> {
         Err(SignerError::SigningFailed(
             "Crossmint sign_message is not supported for Solana wallets in this signer".to_string(),

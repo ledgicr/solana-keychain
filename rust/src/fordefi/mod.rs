@@ -68,16 +68,16 @@ pub struct FordefiSignerConfig {
 
 /// Fordefi-based signer using Fordefi's MPC custody API.
 ///
-/// Supports two signing modes, which differ in what `sign_transaction` returns:
+/// Supports two signing modes, which differ in which entry point is available:
 /// - **Black box** (default, `chain` = `None`): Signs raw bytes via `black_box_signature`
-///   and returns nothing else. Fordefi does **not** broadcast; the returned serialized
+///   through `sign_transaction`. Fordefi does **not** broadcast; the returned serialized
 ///   transaction is the locally-assembled signed tx, which the caller submits to an RPC.
+///   `sign_and_send_transaction` is rejected in this mode.
 /// - **Native Solana** (`chain` = `Some(...)`): Uses `solana_transaction` / `solana_message`
-///   API types. Fordefi will modify the transaction (at minimum updating the blockhash,
-///   and optionally adding priority fees) and **auto-broadcasts** it on-chain
-///   (`push_mode: "auto"`). Because the transaction is already submitted, the returned
-///   serialized transaction is **empty** — only the signature, the on-chain
-///   identifier, is returned. The caller's `&mut Transaction` is left untouched.
+///   API types through `sign_and_send_transaction`. Fordefi will modify the transaction
+///   (at minimum updating the blockhash, and optionally adding priority fees),
+///   **auto-broadcasts** it on-chain (`push_mode: "auto"`), and returns the signature,
+///   the on-chain identifier. `sign_transaction` is rejected in this mode.
 pub struct FordefiSigner {
     access_token: String,
     vault_id: String,
@@ -602,18 +602,6 @@ impl FordefiSigner {
             })
     }
 
-    /// Sign a transaction end-to-end, dispatching to black box or native path.
-    async fn sign_and_serialize(
-        &self,
-        transaction: &mut VersionedTransaction,
-    ) -> Result<SignedTransaction, SignerError> {
-        if self.chain.is_some() {
-            self.sign_and_serialize_native(transaction).await
-        } else {
-            self.sign_and_serialize_black_box(transaction).await
-        }
-    }
-
     /// Fetch the configured vault from Fordefi.
     async fn fetch_vault(&self) -> Result<VaultResponse, SignerError> {
         let url = format!("{}/api/v1/vaults/{}", self.api_base_url, self.vault_id);
@@ -706,16 +694,32 @@ impl SolanaSigner for FordefiSigner {
         &self,
         tx: &mut VersionedTransaction,
     ) -> Result<SignTransactionResult, SignerError> {
-        let signed_transaction = self.sign_and_serialize(tx).await?;
         if self.chain.is_some() {
-            // Native mode has already broadcast the transaction, so it is
-            // complete regardless of the caller's untouched signature slots.
-            return Ok(SignTransactionResult::Complete(signed_transaction));
+            return Err(SignerError::SigningFailed(
+                "Fordefi native mode broadcasts through its own API; call \
+                 sign_and_send_transaction instead"
+                    .to_string(),
+            ));
         }
+        let signed_transaction = self.sign_and_serialize_black_box(tx).await?;
         Ok(TransactionUtil::classify_signed_transaction(
             tx,
             signed_transaction,
         ))
+    }
+
+    async fn sign_and_send_transaction(
+        &self,
+        tx: &mut VersionedTransaction,
+    ) -> Result<Signature, SignerError> {
+        if self.chain.is_none() {
+            return Err(SignerError::SigningFailed(
+                "Fordefi black-box mode only signs; sign the transaction and broadcast the result"
+                    .to_string(),
+            ));
+        }
+        let (_, signature) = self.sign_and_serialize_native(tx).await?;
+        Ok(signature)
     }
 
     async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {

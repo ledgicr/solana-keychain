@@ -190,6 +190,10 @@ func (s *Signer) SignMessage(_ context.Context, _ []byte) (solana.Signature, err
 // replaying these exact bytes cannot create a second transaction; a rebuilt
 // transaction derives a different key and executes as a new transfer.
 func (s *Signer) SignTransaction(ctx context.Context, tx *solana.Transaction) (core.SignedTransaction, error) {
+	return s.executeManagedTransaction(ctx, tx)
+}
+
+func (s *Signer) executeManagedTransaction(ctx context.Context, tx *solana.Transaction) (core.SignedTransaction, error) {
 	if s.publicKey.IsZero() {
 		return core.SignedTransaction{}, core.NewNotInitializedError("crossmint")
 	}
@@ -242,6 +246,15 @@ func (s *Signer) finishManagedTransaction(ctx context.Context, tx *solana.Transa
 	return core.AttachSignature(tx, s.publicKey, sig)
 }
 
+// SignAndSendTransaction signs tx and lets Crossmint execute it.
+func (s *Signer) SignAndSendTransaction(ctx context.Context, tx *solana.Transaction) (solana.Signature, error) {
+	signed, err := s.executeManagedTransaction(ctx, tx)
+	if err != nil {
+		return solana.Signature{}, err
+	}
+	return signed.Signature, nil
+}
+
 // IsAvailable reports whether the Crossmint wallet can be fetched within the
 // availability timeout. Errors are swallowed.
 func (s *Signer) IsAvailable(ctx context.Context) bool {
@@ -274,7 +287,7 @@ func (s *Signer) pollTransaction(ctx context.Context, response transactionRespon
 			response = next
 			approvalSubmitted = true
 		default:
-			if err := core.SleepContext(ctx, s.pollInterval); err != nil {
+			if err := core.SleepContextUnconfirmed(ctx, s.pollInterval, response.ID); err != nil {
 				return transactionResponse{}, err
 			}
 			next, err := s.getTransaction(ctx, response.ID)

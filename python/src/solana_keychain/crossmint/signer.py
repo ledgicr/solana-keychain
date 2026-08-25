@@ -592,6 +592,11 @@ class CrossmintSigner(SolanaSigner):
         transaction; a rebuilt transaction derives a different key and executes
         as a new transfer.
         """
+        return await self._execute_managed_transaction(transaction)
+
+    async def _execute_managed_transaction(
+        self, transaction: VersionedTransaction
+    ) -> SignedTransaction:
         public_key = self._initialized_pubkey()
         expected_message = signed_message_bytes(transaction.message)
         transaction_b58 = base58.b58encode(bytes(transaction)).decode("ascii")
@@ -646,6 +651,11 @@ class CrossmintSigner(SolanaSigner):
         return classify_signed_transaction(
             transaction, serialize_transaction(transaction), signature
         )
+
+    async def sign_and_send_transaction(self, transaction: VersionedTransaction) -> Signature:
+        """Sign ``transaction`` and let Crossmint execute it."""
+        signed = await self._execute_managed_transaction(transaction)
+        return signed.signature
 
     async def sign_message(self, message: bytes) -> Signature:
         raise SignerError(

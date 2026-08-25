@@ -35,6 +35,7 @@ pub mod http_client_config;
 #[cfg(feature = "_remote")]
 mod remote_util;
 mod sdk_adapter;
+pub mod send;
 pub mod signature_util;
 #[cfg(test)]
 pub mod test_util;
@@ -84,6 +85,7 @@ pub mod utila;
 // Re-export core types
 pub use error::SignerError;
 pub use http_client_config::HttpClientConfig;
+pub use send::sign_and_send;
 pub use traits::{SignTransactionResult, SolanaSigner};
 
 // Re-export signer types
@@ -454,6 +456,13 @@ impl SolanaSigner for Signer {
         tx: &mut sdk_adapter::VersionedTransaction,
     ) -> Result<SignTransactionResult, SignerError> {
         dispatch_signer!(self, s => s.sign_transaction(tx).await)
+    }
+
+    async fn sign_and_send_transaction(
+        &self,
+        tx: &mut sdk_adapter::VersionedTransaction,
+    ) -> Result<sdk_adapter::Signature, SignerError> {
+        dispatch_signer!(self, s => s.sign_and_send_transaction(tx).await)
     }
 
     async fn sign_message(&self, message: &[u8]) -> Result<sdk_adapter::Signature, SignerError> {

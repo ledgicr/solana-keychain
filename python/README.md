@@ -135,6 +135,38 @@ Errors are always `SignerError` with a stable `code`
 (`SIGNER_INVALID_PRIVATE_KEY`, `SIGNER_SIGNING_FAILED`, …).
 `str()`/`repr()` of a `SignerError` never include key material or raw remote responses.
 
+### Signer capabilities
+
+Backends differ in whether the provider broadcasts the transaction and in whether
+they can sign arbitrary bytes. `broadcasts_transactions` reports the first at
+runtime; the second is fixed per backend:
+
+| Backend | `broadcasts_transactions` | `sign_transaction` | `sign_and_send_transaction` | `sign_message` |
+|---------|---------------------------|--------------------|-----------------------------|----------------|
+| memory, vault, privy, turnkey, aws-kms, fireblocks, gcp-kms, dfns, para, openfort | False | yes | `SIGNING_FAILED` | yes |
+| cdp | False | yes | `SIGNING_FAILED` | UTF-8 payloads only, otherwise `SERIALIZATION_ERROR` |
+| crossmint | True | yes | yes | `SIGNING_FAILED` |
+| utila | False | yes | `SIGNING_FAILED` | `SIGNING_FAILED` |
+| fordefi (black-box mode) | False | yes | `SIGNING_FAILED` | yes |
+| fordefi (native mode) | True | `SIGNING_FAILED` | yes | yes |
+
+Crossmint supports both: it decides per request whether to rewrite and broadcast
+the transaction or to sign the caller's exact bytes, and `sign_transaction`
+exposes that distinction through an empty ``encoded_transaction``.
+
+### Sign and Send
+
+`sign_and_send_transaction` gets a transaction on chain with one call. Signers
+whose `broadcasts_transactions` is True (Crossmint, Fordefi native mode) broadcast
+through their provider and the send function is never called; every other signer
+signs and the send function broadcasts the base64-encoded result:
+
+```python
+from solana_keychain import sign_and_send_transaction
+
+signature = await sign_and_send_transaction(signer, transaction, rpc_send)
+```
+
 ## Development
 
 From the repo root (recipes bootstrap `python/.venv` automatically):

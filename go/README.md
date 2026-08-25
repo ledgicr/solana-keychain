@@ -192,6 +192,40 @@ type Signer interface {
 Completeness }`; use `IsComplete()` to check whether every required signature is
 present.
 
+### Signer capabilities
+
+Backends differ in whether the provider broadcasts the transaction and in whether
+they can sign arbitrary bytes. Managed-broadcast signers implement
+`core.TransactionBroadcaster`, whose `BroadcastsTransactions()` reports the first
+at runtime; the second is fixed per backend:
+
+| Backend | `BroadcastsTransactions()` | `SignTransaction` | `SignAndSendTransaction` | `SignMessage` |
+|---------|----------------------------|-------------------|--------------------------|---------------|
+| memory, vault, privy, turnkey, awskms, fireblocks, gcpkms, dfns, para, openfort | not implemented | yes | not implemented | yes |
+| cdp | not implemented | yes | not implemented | UTF-8 payloads only, otherwise `CodeSerializationError` |
+| crossmint | `true` | yes | yes | `CodeSigningFailed` |
+| utila | not implemented | yes | not implemented | `CodeSigningFailed` |
+| fordefi (black-box mode) | `false` | yes | `CodeSigningFailed` | yes |
+| fordefi (native mode) | `true` | `CodeSigningFailed` | yes | yes |
+
+Crossmint supports both: it decides per request whether to rewrite and broadcast
+the transaction or to sign the caller's exact bytes, and `SignTransaction`
+exposes that distinction through an empty `EncodedTransaction`.
+
+### Sign and Send
+
+`core.SignAndSendTransaction` gets a transaction on chain with one call.
+Managed-broadcast signers (Crossmint, Fordefi native mode) broadcast through their
+provider and ignore the send function; every other signer signs and the send
+function broadcasts the base64-encoded result:
+
+```go
+sig, err := core.SignAndSendTransaction(ctx, signer, tx,
+	func(ctx context.Context, encoded string) (solana.Signature, error) {
+		return rpcClient.SendEncodedTransaction(ctx, encoded)
+	})
+```
+
 ## Packages
 
 | Package | Description |

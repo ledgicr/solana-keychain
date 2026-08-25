@@ -321,12 +321,47 @@ pub trait SolanaSigner: Send + Sync {
 }
 ```
 
+### Signer capabilities
+
+Backends differ in whether the provider broadcasts the transaction and in whether
+they can sign arbitrary bytes. `broadcasts_transactions()` reports the first at
+runtime; the second is fixed per backend:
+
+| Backend | `broadcasts_transactions()` | `sign_transaction` | `sign_and_send_transaction` | `sign_message` |
+|---------|-----------------------------|--------------------|-----------------------------|----------------|
+| memory, vault, privy, turnkey, aws-kms, fireblocks, gcp-kms, dfns, para, openfort | `false` | yes | `SigningFailed` | yes |
+| cdp | `false` | yes | `SigningFailed` | UTF-8 payloads only, otherwise `SerializationError` |
+| crossmint | `true` | yes | yes | `SigningFailed` |
+| utila | `false` | yes | `SigningFailed` | `SigningFailed` |
+| fordefi (black-box mode) | `false` | yes | `SigningFailed` | yes |
+| fordefi (native mode) | `true` | `SigningFailed` | yes | yes |
+
+Crossmint supports both: it decides per request whether to rewrite and broadcast
+the transaction or to sign the caller's exact bytes, and `sign_transaction`
+exposes that distinction through an empty encoded transaction.
+
+### Sign and Send
+
+`sign_and_send` gets a transaction on chain with one call. Signers that report
+`broadcasts_transactions()` (Crossmint, Fordefi native mode) broadcast through
+their provider and the send closure is never called; every other signer signs and
+the closure broadcasts the base64-encoded result:
+
+```rust
+use solana_keychain::sign_and_send;
+
+let signature = sign_and_send(&signer, &mut tx, |encoded| async move {
+    rpc_send(encoded).await
+})
+.await?;
+```
+
 ### Fordefi Signer
 
-Fordefi supports two signing modes, which differ in whether Fordefi broadcasts the transaction and in what `sign_transaction` returns:
+Fordefi supports two signing modes, which differ in whether Fordefi broadcasts the transaction and in which entry point is available:
 
-- **Black box mode** : Signs raw bytes via EdDSA; the wire transaction is assembled locally. Fordefi does **not** broadcast — `sign_transaction` returns the signed serialized transaction, and **you** submit it to an RPC. Use with a Fordefi black box vault.
-- **Native Solana mode** (recommended): Uses Solana-specific API types. Fordefi modifies the transaction (at minimum updating the blockhash, and optionally adding priority fees) and **auto-broadcasts** it on-chain (`push_mode: "auto"`). Because the transaction is already submitted, `sign_transaction` returns an **empty** serialized transaction (only the signature is meaningful) and updates your `&mut VersionedTransaction` to the Fordefi-signed one — do not re-send it. The current auto-broadcast request supports only transactions whose sole required signer is the configured Fordefi vault; additional required signers are rejected before submission. Use with a regular Fordefi Solana vault.
+- **Black box mode** : Signs raw bytes via EdDSA; the wire transaction is assembled locally. Fordefi does **not** broadcast: `sign_transaction` returns the signed serialized transaction, and **you** submit it to an RPC. `sign_and_send_transaction` is rejected in this mode. Use with a Fordefi black box vault.
+- **Native Solana mode** (recommended): Uses Solana-specific API types. Fordefi modifies the transaction (at minimum updating the blockhash, and optionally adding priority fees) and **auto-broadcasts** it on-chain (`push_mode: "auto"`). Call `sign_and_send_transaction`, which returns the signature, the on-chain identifier; do not re-send the transaction. `sign_transaction` is rejected in this mode. The current auto-broadcast request supports only transactions whose sole required signer is the configured Fordefi vault; additional required signers are rejected before submission. Use with a regular Fordefi Solana vault.
 
 Construction is async because it fetches the Fordefi vault and verifies that its
 authoritative address matches the configured `public_key` before returning.
