@@ -7,15 +7,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gagliardetto/solana-go"
+	"github.com/solana-foundation/solana-go/v2"
 
 	"github.com/solana-foundation/solana-keychain/go/core/v2"
-)
-
-// Timeouts for the two bounded probes (vault ownership verification during New
-// and the IsAvailable readiness check).
-const (
-	vaultVerificationTimeout = 10 * time.Second
 )
 
 // Signer signs with a Solana key held in a Fordefi vault. All fields are
@@ -47,11 +41,10 @@ var (
 	_ core.TransactionBroadcaster = (*Signer)(nil)
 )
 
-// New builds a Fordefi signer and verifies that the configured PublicKey
-// actually belongs to the configured VaultID (without this check a
-// valid-but-wrong address would pass configuration and later be returned by
-// Pubkey, creating a funds-routing risk). The returned signer is ready to use.
-func New(ctx context.Context, cfg Config) (*Signer, error) {
+// New builds a Fordefi signer from cfg. Construction is pure: no network I/O.
+// The configured PublicKey is the source of truth for the signer's identity
+// (trusted-provider model); every produced signature is verified against it.
+func New(_ context.Context, cfg Config) (*Signer, error) {
 	if cfg.AccessToken == "" {
 		return nil, core.NewSignerError(core.CodeConfigError, "access_token must not be empty")
 	}
@@ -104,7 +97,7 @@ func New(ctx context.Context, cfg Config) (*Signer, error) {
 		return nil, err
 	}
 
-	s := &Signer{
+	return &Signer{
 		accessToken:     cfg.AccessToken,
 		vaultID:         cfg.VaultID,
 		requestSigner:   requestSigner,
@@ -115,35 +108,10 @@ func New(ctx context.Context, cfg Config) (*Signer, error) {
 		maxPollAttempts: maxPollAttempts,
 		chain:           cfg.Chain,
 		fee:             cfg.Fee,
-	}
-
-	if err := s.verifyVaultOwnership(ctx); err != nil {
-		return nil, err
-	}
-	return s, nil
+	}, nil
 }
 
-// verifyVaultOwnership fetches the vault and checks that its authoritative
-// Solana public key matches the configured one.
-func (s *Signer) verifyVaultOwnership(ctx context.Context) error {
-	vctx, cancel := context.WithTimeout(ctx, vaultVerificationTimeout)
-	defer cancel()
-	vault, err := s.fetchVault(vctx)
-	if err != nil {
-		return err
-	}
-	remote, err := vaultPublicKey(vault)
-	if err != nil {
-		return err
-	}
-	if remote != s.pubkey {
-		return core.NewSignerError(core.CodeConfigError,
-			"configured public_key does not match Fordefi vault "+s.vaultID)
-	}
-	return nil
-}
-
-// Pubkey returns the vault's Solana public key (verified during New).
+// Pubkey returns the vault's Solana public key (as configured).
 func (s *Signer) Pubkey() solana.PublicKey { return s.pubkey }
 
 // BroadcastsTransactions reports whether SignTransaction auto-broadcasts
@@ -243,7 +211,7 @@ func (s *Signer) SignAndSendTransaction(ctx context.Context, tx *solana.Transact
 func (s *Signer) IsAvailable(ctx context.Context) bool {
 	actx, cancel := context.WithTimeout(ctx, core.AvailabilityTimeout)
 	defer cancel()
-	if _, err := s.fetchVault(actx); err != nil {
+	if err := s.probeVault(actx); err != nil {
 		return false
 	}
 	_, err := s.signRequest(actx, "/api/v1/vaults", time.Now().UnixMilli(), "")

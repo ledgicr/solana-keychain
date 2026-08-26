@@ -3,7 +3,7 @@ package core
 import (
 	"context"
 
-	"github.com/gagliardetto/solana-go"
+	"github.com/solana-foundation/solana-go/v2"
 )
 
 // MessageBytes returns the serialized transaction message, the bytes a Solana
@@ -23,6 +23,37 @@ func VerifySignature(pubkey solana.PublicKey, message []byte, sig solana.Signatu
 			"signature verification failed: the returned signature does not match the public key")
 	}
 	return nil
+}
+
+// ExtractAndVerifyReturnedSignature deserializes a signed wire transaction
+// returned by a remote provider, extracts the signature at pubkey's
+// required-signer position, and verifies it against the original
+// locally-computed message bytes — the guarantee that the provider signed
+// exactly what was requested.
+func ExtractAndVerifyReturnedSignature(
+	returnedTxBytes []byte,
+	pubkey solana.PublicKey,
+	originalMessage []byte,
+	provider string,
+) (solana.Signature, error) {
+	returned, err := solana.TransactionFromBytes(returnedTxBytes)
+	if err != nil {
+		return solana.Signature{}, WrapSignerError(CodeSerializationError,
+			"failed to deserialize signed transaction returned by "+provider, err)
+	}
+	pos, err := SigningPosition(returned, pubkey)
+	if err != nil {
+		return solana.Signature{}, err
+	}
+	if pos >= len(returned.Signatures) || returned.Signatures[pos].IsZero() {
+		return solana.Signature{}, NewSignerError(CodeSigningFailed,
+			"signed transaction returned by "+provider+" is missing the signer's signature")
+	}
+	sig := returned.Signatures[pos]
+	if err := VerifySignature(pubkey, originalMessage, sig); err != nil {
+		return solana.Signature{}, err
+	}
+	return sig, nil
 }
 
 // AttachSignature places sig at pubkey's required-signer position and returns the

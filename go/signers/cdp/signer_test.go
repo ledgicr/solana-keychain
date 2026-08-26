@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/gagliardetto/solana-go"
-	"github.com/gagliardetto/solana-go/base58"
+	"github.com/solana-foundation/solana-go/v2"
+	"github.com/solana-foundation/solana-go/v2/base58"
 
 	"github.com/solana-foundation/solana-keychain/go/core/v2"
 	"github.com/solana-foundation/solana-keychain/go/testutils/v2"
@@ -235,11 +235,17 @@ func TestSignMessageSignatureVerificationFailure(t *testing.T) {
 func TestSignMessageAPIError(t *testing.T) {
 	srv := testutils.StartTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("bad\x01credentials"))
 	}))
 
 	s := newTestSigner(t, srv, testPubkeyStr)
 	_, err := s.SignMessage(context.Background(), []byte("test"))
 	testutils.AssertCode(t, err, core.CodeRemoteAPIError)
+	testutils.AssertDetailContains(t, err, "CDP API error 401")
+	testutils.AssertDetailContains(t, err, "bad credentials")
+	if strings.Contains(err.Error(), "credentials") {
+		t.Errorf("Error() must not surface the remote body, got %q", err.Error())
+	}
 }
 
 func TestSignMessageInvalidSignatureLength(t *testing.T) {

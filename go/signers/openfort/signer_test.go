@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/gagliardetto/solana-go"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/solana-foundation/solana-go/v2"
 
 	"github.com/solana-foundation/solana-keychain/go/core/v2"
 	"github.com/solana-foundation/solana-keychain/go/testutils/v2"
@@ -389,6 +389,24 @@ func TestSignUnauthorized(t *testing.T) {
 	}
 	if code, _ := core.CodeOf(err); code != core.CodeRemoteAPIError {
 		t.Errorf("got %s, want REMOTE_API_ERROR", code)
+	}
+}
+
+func TestSignErrorBodySanitizedIntoDetail(t *testing.T) {
+	api := newMockAPI(t, testPubkey, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("policy\x01denied"))
+	})
+	s, err := New(context.Background(), api.config())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignMessage(context.Background(), []byte("test"))
+	testutils.AssertCode(t, err, core.CodeRemoteAPIError)
+	testutils.AssertDetailContains(t, err, "openfort API error 403")
+	testutils.AssertDetailContains(t, err, "policy denied")
+	if strings.Contains(err.Error(), "policy") {
+		t.Errorf("Error() must not surface the remote body, got %q", err.Error())
 	}
 }
 

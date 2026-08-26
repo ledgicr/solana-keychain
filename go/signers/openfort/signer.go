@@ -6,9 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
-	"strconv"
 
-	"github.com/gagliardetto/solana-go"
+	"github.com/solana-foundation/solana-go/v2"
 
 	"github.com/solana-foundation/solana-keychain/go/core/v2"
 )
@@ -193,15 +192,14 @@ func (s *Signer) signBytes(ctx context.Context, message []byte) (solana.Signatur
 
 // do executes an Openfort API request and returns the response body of a 2xx
 // response. Transport failures map to CodeHTTPError and non-2xx statuses to
-// CodeRemoteAPIError with only the status code (the remote body is never
-// included).
+// CodeRemoteAPIError.
 func (s *Signer) do(req *http.Request) ([]byte, error) {
 	status, body, err := core.SendRequest(s.client, req, "openfort")
 	if err != nil {
 		return nil, err
 	}
 	if !core.IsSuccess(status) {
-		return nil, core.NewSignerError(core.CodeRemoteAPIError, "openfort API error "+strconv.Itoa(status))
+		return nil, core.NewRemoteAPIError("openfort API error", status, body)
 	}
 	return body, nil
 }

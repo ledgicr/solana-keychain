@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gagliardetto/solana-go"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/solana-foundation/solana-go/v2"
 
 	"github.com/solana-foundation/solana-keychain/go/core/v2"
 	"github.com/solana-foundation/solana-keychain/go/testutils/v2"
@@ -635,9 +635,7 @@ func TestSignMessagePollingTimeout(t *testing.T) {
 	}
 }
 
-// A hostile remote error body must never reach the error detail: only the
-// status code is surfaced for non-2xx responses.
-func TestRemoteErrorBodyNotLeaked(t *testing.T) {
+func TestRemoteErrorBodySanitizedIntoDetail(t *testing.T) {
 	hostile := "evil\x01<script>alert(1)</script>"
 	s := newTestSigner(t, testutils.TestPublicKey().String(), func(mux *http.ServeMux) {
 		mux.HandleFunc("/v1/transactions", func(w http.ResponseWriter, _ *http.Request) {
@@ -654,11 +652,18 @@ func TestRemoteErrorBodyNotLeaked(t *testing.T) {
 	if !errors.As(err, &se) {
 		t.Fatalf("expected *core.SignerError, got %T", err)
 	}
-	if se.Detail() != "API error 500" {
-		t.Errorf("detail = %q, want %q", se.Detail(), "API error 500")
+	if strings.Contains(err.Error(), "evil") {
+		t.Errorf("Error() must not surface the remote body, got %q", err.Error())
 	}
-	if strings.Contains(se.Detail(), "script") || strings.Contains(se.Detail(), "evil") {
-		t.Error("hostile remote body must not appear in the error detail")
+	detail := se.Detail()
+	if !strings.Contains(detail, "API error 500") {
+		t.Errorf("detail = %q, want the status code", detail)
+	}
+	if !strings.Contains(detail, "evil <script>alert(1)</script>") {
+		t.Errorf("detail = %q, want the sanitized body", detail)
+	}
+	if strings.ContainsRune(detail, '\x01') {
+		t.Errorf("detail contains raw control characters: %q", detail)
 	}
 }
 

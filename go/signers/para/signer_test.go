@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gagliardetto/solana-go"
+	"github.com/solana-foundation/solana-go/v2"
 
 	"github.com/solana-foundation/solana-keychain/go/core/v2"
 	"github.com/solana-foundation/solana-keychain/go/testutils/v2"
@@ -478,8 +478,7 @@ func TestSignMessageVerificationFailure(t *testing.T) {
 	testutils.AssertCode(t, err, core.CodeSigningFailed)
 }
 
-func TestSignMessageErrorStatusCodeOnly(t *testing.T) {
-	// Error output must stay generic and never include API response text.
+func TestSignMessageErrorBodySanitizedIntoDetail(t *testing.T) {
 	pub, _, _ := signFixture(t)
 	srv := testutils.StartTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		testutils.WriteJSON(w, http.StatusForbidden, map[string]any{"message": "Wallet is locked"})
@@ -496,11 +495,11 @@ func TestSignMessageErrorStatusCodeOnly(t *testing.T) {
 	if !errors.As(err, &se) {
 		t.Fatalf("expected *core.SignerError, got %T", err)
 	}
-	if se.Detail() != "API error 403" {
-		t.Errorf("expected detail to carry only the status code, got %q", se.Detail())
+	if !strings.Contains(se.Detail(), "API error 403") {
+		t.Errorf("expected detail to carry the status code, got %q", se.Detail())
 	}
-	if strings.Contains(se.Detail(), "Wallet is locked") {
-		t.Error("detail must not contain the remote response body")
+	if !strings.Contains(se.Detail(), "Wallet is locked") {
+		t.Errorf("expected detail to carry the sanitized response body, got %q", se.Detail())
 	}
 }
 

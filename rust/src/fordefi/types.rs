@@ -145,22 +145,12 @@ pub struct TransactionStatusResponse {
     pub raw_transaction: Option<String>,
 }
 
-/// Response from GET /api/v1/vaults/{id}.
-///
-/// Chain-specific vaults expose `address`, while black-box vaults expose
-/// `public_key_compressed` instead.
+/// Response from GET /api/v1/vaults/{id}. Only used as a readiness probe
+/// (`is_available`); no key material is read from it.
 #[derive(Deserialize)]
 pub struct VaultResponse {
-    /// Solana base58 address bound to a chain-specific vault.
-    pub address: Option<String>,
     #[allow(dead_code)]
     pub id: String,
-    /// Base64-encoded compressed public key exposed by a black-box vault.
-    pub public_key_compressed: Option<String>,
-    /// Vault type, such as `black_box`.
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    pub vault_type: Option<String>,
 }
 
 #[cfg(test)]

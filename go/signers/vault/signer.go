@@ -6,10 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
-	"strconv"
 	"strings"
 
-	"github.com/gagliardetto/solana-go"
+	"github.com/solana-foundation/solana-go/v2"
 
 	"github.com/solana-foundation/solana-keychain/go/core/v2"
 )
@@ -134,8 +133,7 @@ func (s *Signer) signBytes(ctx context.Context, message []byte) (solana.Signatur
 		return solana.Signature{}, err
 	}
 	if !core.IsSuccess(status) {
-		return solana.Signature{}, core.NewSignerError(core.CodeRemoteAPIError,
-			"vault API error "+strconv.Itoa(status)+": "+core.SanitizeRemoteResponse(string(body)))
+		return solana.Signature{}, core.NewRemoteAPIError("vault API error", status, body)
 	}
 
 	var parsed signResponse
