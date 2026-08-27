@@ -14,14 +14,14 @@ We strongly prefer PRs that include the [Rust](#rust), [TypeScript](#typescript)
 
 ### Architecture Overview
 
-The library uses a trait-based architecture where all signers implement the `SolanaSigner` trait defined in [src/traits.rs](../rust/src/traits.rs). The library also provides a unified `Signer` enum that wraps all implementations, allowing runtime selection of signing backends while maintaining a consistent API.
+The library uses a trait-based architecture defined in [src/traits.rs](../rust/src/traits.rs): every signer implements the `SolanaSigner` base trait (`pubkey`, `sign_message`, `is_available`) plus exactly one capability trait matching the provider's shape — `TransactionSigner` (`sign_transaction`, caller broadcasts), `ModifyingSigner` (`modify_and_sign_transaction`, provider rewrites the transaction), or `SendingSigner` (`sign_and_send_transaction`, provider broadcasts). The library also provides a unified `Signer` enum that wraps all implementations, allowing runtime selection of signing backends while maintaining a consistent API.
 
 ### Quick Checklist
 
 - [ ] Create your signer module with implementation
-- [ ] Implement the `SolanaSigner` trait (3 async methods + `pubkey()`)
+- [ ] Implement the `SolanaSigner` base trait plus the capability trait matching your provider's shape (usually `TransactionSigner`)
 - [ ] Add a feature flag in `Cargo.toml`
-- [ ] Update the `Signer` enum in `src/lib.rs` (4 match arms)
+- [ ] Update the `Signer` enum in `src/lib.rs` (variant, `dispatch_signer!` arm, `TransactionSigner` match arm)
 - [ ] Update `src/error.rs` reqwest `From` impl cfg gate (if your signer uses reqwest)
 - [ ] Enforce HTTPS and configure timeouts on HTTP clients
 - [ ] Add comprehensive unit tests (wiremock-based, in your module)
@@ -162,15 +162,15 @@ impl YourServiceSigner {
 }
 ```
 
-### Step 4: Implement the SolanaSigner Trait
+### Step 4: Implement the Signer Traits
 
-The trait has 3 async methods (`sign_transaction`, `sign_message`, `is_available`) plus `pubkey()`. Note that `sign_transaction` returns `SignTransactionResult` — a tagged enum indicating whether the transaction is fully signed or partially signed.
+The `SolanaSigner` base trait has 2 async methods (`sign_message`, `is_available`) plus `pubkey()`; transaction signing goes in the capability trait — `TransactionSigner` for a provider that signs and leaves broadcasting to the caller. Note that `sign_transaction` returns `SignTransactionResult` — a tagged enum indicating whether the transaction is fully signed or partially signed.
 
 Use the shared `TransactionUtil` helpers for signing and serialization instead of implementing your own.
 
 ```rust
 use crate::transaction_util::TransactionUtil;
-use crate::traits::SignTransactionResult;
+use crate::traits::{SignTransactionResult, TransactionSigner};
 
 #[async_trait::async_trait]
 impl SolanaSigner for YourServiceSigner {
@@ -178,6 +178,25 @@ impl SolanaSigner for YourServiceSigner {
         self.public_key
     }
 
+    async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
+        self.sign(message).await
+    }
+
+    async fn is_available(&self) -> bool {
+        // Implement a health check for your service
+        // Example: ping endpoint or check credentials
+        let url = format!("{}/health", self.api_base_url);
+        self.client
+            .get(&url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionSigner for YourServiceSigner {
     async fn sign_transaction(
         &self,
         tx: &mut Transaction,
@@ -198,22 +217,6 @@ impl SolanaSigner for YourServiceSigner {
             tx,
             (serialized, signature),
         ))
-    }
-
-    async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
-        self.sign(message).await
-    }
-
-    async fn is_available(&self) -> bool {
-        // Implement a health check for your service
-        // Example: ping endpoint or check credentials
-        let url = format!("{}/health", self.api_base_url);
-        self.client
-            .get(&url)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
     }
 }
 ```
@@ -258,7 +261,7 @@ all = ["memory", "vault", "privy", "turnkey", "your_service"]  # Update all
 
 ### Step 7: Update the Signer Enum
 
-Add your signer to `src/lib.rs`. You need 4 match arms in the `SolanaSigner` impl: `pubkey`, `sign_transaction`, `sign_message`, and `is_available`.
+Add your signer to `src/lib.rs`. The base `SolanaSigner` impl dispatches through the `dispatch_signer!` macro, so add one arm there; capability access lives in the explicit `as_transaction_signer()` / `as_sending_signer()` matches, so add your arm to each (a `Some(s)` arm in the accessor matching your capability trait, and for `as_transaction_signer` a `None` arm if your backend is sending-only).
 
 ```rust
 // Add feature-gated module
@@ -301,44 +304,25 @@ impl Signer {
     }
 }
 
-// Update trait implementation — 4 match arms
-#[async_trait::async_trait]
-impl SolanaSigner for Signer {
-    fn pubkey(&self) -> sdk_adapter::Pubkey {
-        match self {
+// Update the dispatch macro — the base SolanaSigner impl uses it for
+// pubkey, sign_message and is_available
+macro_rules! dispatch_signer {
+    ($self:ident, $signer:pat => $body:expr) => {
+        match $self {
             // ... existing variants
             #[cfg(feature = "your_service")]
-            Signer::YourService(s) => s.pubkey(),
+            Signer::YourService($signer) => $body,
         }
-    }
+    };
+}
 
-    async fn sign_transaction(
-        &self,
-        tx: &mut sdk_adapter::Transaction,
-    ) -> Result<SignTransactionResult, SignerError> {
+// Add your arm to the capability accessors
+impl Signer {
+    pub fn as_transaction_signer(&self) -> Option<&dyn TransactionSigner> {
         match self {
             // ... existing variants
             #[cfg(feature = "your_service")]
-            Signer::YourService(s) => s.sign_transaction(tx).await,
-        }
-    }
-
-    async fn sign_message(
-        &self,
-        message: &[u8],
-    ) -> Result<sdk_adapter::Signature, SignerError> {
-        match self {
-            // ... existing variants
-            #[cfg(feature = "your_service")]
-            Signer::YourService(s) => s.sign_message(message).await,
-        }
-    }
-
-    async fn is_available(&self) -> bool {
-        match self {
-            // ... existing variants
-            #[cfg(feature = "your_service")]
-            Signer::YourService(s) => s.is_available().await,
+            Signer::YourService(s) => Some(s),
         }
     }
 }
@@ -546,8 +530,8 @@ CI is a two-phase process. Coordinate with maintainers to prepare `main` before 
 ### Quick Checklist
 
 - [ ] Create package `typescript/packages/<name>/`
-- [ ] Implement `SolanaSigner` interface from `@solana/keychain-core`
-- [ ] Export `createXSigner()` factory function returning `SolanaSigner<TAddress>`
+- [ ] Implement the `SolanaTransactionSigner` and `SolanaMessageSigner` interfaces from `@solana/keychain-core`
+- [ ] Export `createXSigner()` factory function returning `SolanaTransactionSigner<TAddress> & SolanaMessageSigner<TAddress>`
 - [ ] Keep the signer class internal — do not export it from `index.ts`
 - [ ] Export config interface (`XSignerConfig`)
 - [ ] Enforce HTTPS on `apiBaseUrl` config fields
@@ -582,12 +566,16 @@ See [`typescript/packages/para/`](../typescript/packages/para/) for a complete r
 
 ### Signer Implementation
 
-Every signer must implement `SolanaSigner<TAddress>` from `@solana/keychain-core`. The interface requires:
+`@solana/keychain-core` defines one capability interface per Kit signer shape, mirroring the Rust capability traits: `SolanaTransactionSigner` (Rust `TransactionSigner`), `SolanaModifyingSigner` (Rust `ModifyingSigner`), `SolanaSendingSigner` (Rust `SendingSigner`), and the orthogonal `SolanaMessageSigner` (Rust's base-trait `sign_message`). `SolanaSigner` is the union of the three transaction shapes.
+
+A typical signer implements `SolanaTransactionSigner<TAddress>` and `SolanaMessageSigner<TAddress>` (a class lists both interfaces; it cannot implement the intersection type). Together they require:
 
 - `readonly address: Address<TAddress>`
 - `signMessages(messages, config?): Promise<readonly SignatureDictionary[]>`
 - `signTransactions(transactions, config?): Promise<readonly SignatureDictionary[]>`
 - `isAvailable(): Promise<boolean>` — health check for the signing backend
+
+If your backend has no message-sign endpoint, skip `SolanaMessageSigner` and expose no `signMessages` method at all (see Utila) — Kit classifies signers by duck-typed method presence, so a present-but-throwing method would misroute.
 
 The `config` parameter is Kit's optional partial-signer config. Every signing method must honor `config?.abortSignal` — see the abort-support rule under [Key rules](#factory-function--class).
 
@@ -614,20 +602,27 @@ export interface YourSignerConfig {
 
 #### Factory Function + Class
 
-The factory function is the only public API. It returns `SolanaSigner<TAddress>` (the interface), not the concrete class — the class itself is never exported from `index.ts`, so it stays reachable only through the factory (mirror `@solana/keychain-crossmint` for this pattern). Place the factory above the class definition, after imports.
+The factory function is the only public API. It returns `SolanaTransactionSigner<TAddress> & SolanaMessageSigner<TAddress>` (the capability interfaces), not the concrete class — the class itself is never exported from `index.ts`, so it stays reachable only through the factory (mirror `@solana/keychain-crossmint` for this pattern). Place the factory above the class definition, after imports.
 
 **Async signer** (fetches public key during init — most common):
 
 ```typescript
-import { SolanaSigner, SignerErrorCode, throwSignerError } from '@solana/keychain-core';
+import {
+    SolanaMessageSigner,
+    SolanaTransactionSigner,
+    SignerErrorCode,
+    throwSignerError,
+} from '@solana/keychain-core';
 
 export async function createYourSigner<TAddress extends string = string>(
     config: YourSignerConfig,
-): Promise<SolanaSigner<TAddress>> {
+): Promise<SolanaMessageSigner<TAddress> & SolanaTransactionSigner<TAddress>> {
     return await YourSigner.create(config);
 }
 
-class YourSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
+class YourSigner<TAddress extends string = string>
+    implements SolanaMessageSigner<TAddress>, SolanaTransactionSigner<TAddress>
+{
     readonly address: Address<TAddress>;
 
     static async create<TAddress extends string = string>(
@@ -656,11 +651,13 @@ class YourSigner<TAddress extends string = string> implements SolanaSigner<TAddr
 ```typescript
 export function createYourSigner<TAddress extends string = string>(
     config: YourSignerConfig,
-): SolanaSigner<TAddress> {
+): SolanaMessageSigner<TAddress> & SolanaTransactionSigner<TAddress> {
     return new YourSigner<TAddress>(config);
 }
 
-class YourSigner<TAddress extends string = string> implements SolanaSigner<TAddress> {
+class YourSigner<TAddress extends string = string>
+    implements SolanaMessageSigner<TAddress>, SolanaTransactionSigner<TAddress>
+{
     readonly address: Address<TAddress>;
 
     constructor(config: YourSignerConfig) {
@@ -856,7 +853,7 @@ export { createYourSigner } from '@solana/keychain-your-signer';
 
 **g) `typescript/scripts/test-treeshake-umbrella.mjs`** — add your package to `SIGNER_MARKERS` (two distinctive strings that appear in your built `dist/` output — verify with grep before picking them) and your factory to the `FACTORIES` list. Without this, your backend leaking into other factories' bundles goes undetected.
 
-**h) Managed-broadcast (sending-signer) backends only** — if your backend rewrites the transaction message and/or broadcasts server-side, its signature cannot be applied to the caller's transaction, so it must be a `SolanaSendingSigner` (see `@solana/keychain-core`) instead of a `SolanaSigner`. That changes the checklist:
+**h) Managed-broadcast (sending-signer) backends only** — if your backend rewrites the transaction message and/or broadcasts server-side, its signature cannot be applied to the caller's transaction, so it must be a `SolanaSendingSigner` (see `@solana/keychain-core`) instead of a `SolanaTransactionSigner`. That changes the checklist:
 
 - The signer class implements `signAndSendTransactions()` and exposes **no** `signTransactions` (nor `signMessages`, unless the backend genuinely signs messages) — Kit classifies signers by duck-typed method presence, so throwing methods are not enough. See Crossmint, or Fordefi's own-property pattern for a package serving both shapes.
 - `signAndSendTransactions(transactions, config?)` takes Kit's sending-signer config and must honor `config?.abortSignal` like every other signing method. A correctly shaped sending signer is picked up automatically by core's `signAndSendTransaction()` helper and reported by `signerCapabilities()` — no extra registration needed.
@@ -957,7 +954,7 @@ Your PR must include:
 ### Quick Checklist
 
 - [ ] Create module `python/src/solana_keychain/<name>/`
-- [ ] Subclass `SolanaSigner` from `solana_keychain.core`
+- [ ] Subclass `SolanaSigner` from `solana_keychain.core` plus the capability class matching your provider's shape (usually `TransactionSigner`)
 - [ ] Export `async create_x_signer()` factory (awaits `init()` when the backend needs it)
 - [ ] Export a config dataclass (`XSignerConfig`) with secrets marked `field(repr=False)`
 - [ ] Enforce HTTPS on base-URL fields with `assert_https_url()`
@@ -987,12 +984,20 @@ for an extras-gated SDK reference.
 
 ### Signer Implementation
 
-Subclass `SolanaSigner` and implement the four contract members:
+Subclass `SolanaSigner` and implement the three base members:
 
 - `pubkey` property returning `solders.pubkey.Pubkey`
-- `async sign_transaction(transaction) -> SignedTransaction`
 - `async sign_message(message: bytes) -> Signature`
 - `async is_available() -> bool`
+
+Transaction handling goes in the capability class you also subclass, and a
+backend subclasses exactly one: `TransactionSigner`
+(`async sign_transaction(transaction) -> SignedTransaction`, the caller
+broadcasts), `ModifyingSigner`
+(`async modify_and_sign_transaction(transaction) -> SignedTransaction`, the
+provider rewrites the transaction) or `SendingSigner`
+(`async sign_and_send_transaction(transaction) -> Signature`, the provider
+broadcasts). A backend never defines an entry point it cannot serve.
 
 Backends that must resolve an address remotely add `async init()` and raise
 `SIGNER_NOT_INITIALIZED` from a private `_initialized_pubkey()` helper when used
@@ -1105,8 +1110,8 @@ guarantees. If your provider makes one impossible, say so in the PR and in
   at your signer's required-signer position, and verify that. A signature that
   does not verify must fail, never be attached.
 - **Declare whether the provider broadcasts.** If it executes server-side,
-  implement the sending shape (`broadcasts_transactions` true,
-  `SolanaSendingSigner` in TypeScript, `core.TransactionBroadcaster` in Go) and
+  implement the sending shape (`SendingSigner` in Rust,
+  `SolanaSendingSigner` in TypeScript, `core.SendingSigner` in Go) and
   return the signature that identifies the landed transaction. If the provider
   has no sign-only endpoint at all, make the backend sending-only: fail the
   sign-only entry point rather than submitting behind the caller's back.
