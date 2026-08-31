@@ -87,10 +87,7 @@ pub trait SolanaSigner: Send + Sync {
     /// # Returns
     ///
     /// The signature over the serialized transaction message
-    async fn sign_transaction_message(
-        &self,
-        message: &[u8],
-    ) -> Result<Signature, SignerError> {
+    async fn sign_transaction_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
         self.sign_message(message).await
     }
 

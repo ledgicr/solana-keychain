@@ -207,10 +207,7 @@ impl SolanaSigner for LedgerSigner {
         Ok(Signature::from(sig_bytes))
     }
 
-    async fn sign_transaction_message(
-        &self,
-        message: &[u8],
-    ) -> Result<Signature, SignerError> {
+    async fn sign_transaction_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
         // A serialized transaction message (legacy or versioned/v0). Route it
         // through the device's transaction-parsing APDU — NOT the off-chain
         // envelope that `sign_message` uses. This is the same device command
