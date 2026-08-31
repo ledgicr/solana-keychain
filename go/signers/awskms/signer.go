@@ -13,7 +13,6 @@ import (
 	"github.com/solana-foundation/solana-keychain/go/core/v2"
 )
 
-// AWS KMS constants for Ed25519 signing keys.
 const (
 	signingAlgorithm = kmstypes.SigningAlgorithmSpecEd25519Sha512
 	requiredKeySpec  = kmstypes.KeySpecEccNistEdwards25519
@@ -29,7 +28,6 @@ type Signer struct {
 	pub    solana.PublicKey
 }
 
-// Ensure Signer satisfies the core contract at compile time.
 var _ core.TransactionSigner = (*Signer)(nil)
 
 // String renders the signer without config detail, so fmt's reflective struct
