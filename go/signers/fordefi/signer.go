@@ -334,16 +334,16 @@ func (s *NativeAutoSigner) SignMessage(ctx context.Context, message []byte) (sol
 // replace the blockhash (and optionally fees), signs, and broadcasts the
 // transaction itself. tx is left untouched and the returned signature is the
 // on-chain identifier. Only transactions whose sole required signer is the
-// configured vault are supported.
+// configured vault, and which carry no signature yet, are supported.
 //
 // Not retry-safe: any failure after Fordefi accepts the submission returns
 // CodeBroadcastUnconfirmed carrying the Fordefi transaction id; check that
 // transaction with Fordefi before retrying. A submission that fails without a
 // usable response returns CodeBroadcastUnconfirmed with no transaction id.
 //
-// Each create carries an x-idempotence-id derived from the message bytes, so
-// replaying these exact bytes cannot create a second Fordefi transaction; a
-// rebuilt transaction derives a different id and is broadcast again.
+// Each create carries an x-idempotence-id derived from the message bytes under
+// the push mode, chain, vault and fee it was submitted with, so replaying these
+// exact bytes on the same terms reuses the Fordefi request.
 func (s *NativeAutoSigner) SignAndSendTransaction(ctx context.Context, tx *solana.Transaction) (solana.Signature, error) {
 	signed, err := s.signTransactionNative(ctx, tx)
 	if err != nil {
@@ -360,11 +360,22 @@ func (s *NativeAutoSigner) IsAvailable(ctx context.Context) bool { return s.core
 // requireSoleRequiredSigner rejects native-mode transactions with additional
 // required signers: native auto-broadcast submits message bytes only, so other
 // signers' partial signatures would be dropped.
+//
+// A signature already present can only be the vault's own over these bytes,
+// which means they may already be on chain. Fordefi replaces the blockhash
+// before broadcasting, so the result would be a second transaction carrying the
+// same transfer, outside the network's replay protection.
 func (s *NativeAutoSigner) requireSoleRequiredSigner(tx *solana.Transaction) error {
 	if tx.Message.Header.NumRequiredSignatures != 1 ||
 		len(tx.Message.AccountKeys) == 0 || tx.Message.AccountKeys[0] != s.core.pubkey {
 		return core.NewSignerError(core.CodeSigningFailed,
 			"Fordefi native auto-broadcast currently supports only transactions whose sole required signer is the configured vault")
+	}
+	for _, signature := range tx.Signatures {
+		if !signature.IsZero() {
+			return core.NewSignerError(core.CodeSigningFailed,
+				"Fordefi native auto-broadcast must run before any transaction signatures are applied")
+		}
 	}
 	return nil
 }
@@ -393,7 +404,7 @@ func (s *NativeAutoSigner) signTransactionNative(ctx context.Context, tx *solana
 			PushMode: PushModeAuto,
 			Fee:      s.fee,
 		},
-	}, core.IdempotencyKeyFromMessage(messageBytes), true)
+	}, nativeIdempotencyKey(PushModeAuto, s.chain, s.core.vaultID, s.fee, messageBytes), true)
 	if err != nil {
 		return core.SignedTransaction{}, err
 	}
@@ -497,13 +508,13 @@ func (s *NativeManualSigner) IsAvailable(ctx context.Context) bool { return s.co
 // The rewrite itself is not diffed: what Keychain validates is the signing hop,
 // by verifying the returned signature at the vault's required-signer position
 // against the message Fordefi returned. Preconditions on the caller's input do
-// apply: the vault must be the fee payer and nothing may be signed yet.
+// apply: the vault must be the fee payer.
 //
-// Each create carries an x-idempotence-id derived from the message bytes under a
-// manual-specific namespace, so a resend of these exact bytes reuses the Fordefi
-// transaction instead of creating a second one.
+// Each create carries an x-idempotence-id derived from the message bytes under
+// the push mode, chain, vault and fee it was submitted with, so a resend on the
+// same terms reuses the Fordefi transaction instead of creating a second one.
 func (s *NativeManualSigner) ModifyAndSignTransaction(ctx context.Context, tx *solana.Transaction) (core.SignedTransaction, error) {
-	if err := s.requireUnsignedVaultPaidTransaction(tx); err != nil {
+	if err := s.requireVaultPaidTransaction(tx); err != nil {
 		return core.SignedTransaction{}, err
 	}
 	messageBytes, err := tx.Message.MarshalBinary()
@@ -543,28 +554,38 @@ func (s *NativeManualSigner) ModifyAndSignTransaction(ctx context.Context, tx *s
 	return core.Classify(tx, encoded, signature), nil
 }
 
-// requireUnsignedVaultPaidTransaction rejects a transaction Fordefi may not
-// rewrite: it only signs one it pays for, and rewriting the message invalidates
-// any signature already collected.
-func (s *NativeManualSigner) requireUnsignedVaultPaidTransaction(tx *solana.Transaction) error {
+// requireVaultPaidTransaction rejects a transaction Fordefi may not rewrite: it
+// only signs one it pays for.
+func (s *NativeManualSigner) requireVaultPaidTransaction(tx *solana.Transaction) error {
 	if len(tx.Message.AccountKeys) == 0 || tx.Message.AccountKeys[0] != s.core.pubkey {
 		return core.NewSignerError(core.CodeSigningFailed,
 			"Fordefi native manual signing requires the configured vault to be the transaction fee payer")
-	}
-	for _, signature := range tx.Signatures {
-		if !signature.IsZero() {
-			return core.NewSignerError(core.CodeSigningFailed,
-				"Fordefi native manual signing must run before any transaction signatures are applied")
-		}
 	}
 	return nil
 }
 
 // idempotencyKey namespaces the manual key so the same message bytes cannot
-// collide with an earlier auto create that did broadcast them.
+// collide with an earlier create carrying other terms.
 func (s *NativeManualSigner) idempotencyKey(messageBytes []byte) string {
-	namespaced := []byte("fordefi:solana:manual:" + string(s.chain) + ":" + s.core.vaultID + ":")
+	return nativeIdempotencyKey(PushModeManual, s.chain, s.core.vaultID, s.fee, messageBytes)
+}
+
+// nativeIdempotencyKey binds a native key to the push mode, chain, vault and fee
+// the create carries, so identical message bytes submitted under different terms
+// are not deduplicated into each other.
+func nativeIdempotencyKey(pushMode PushMode, chain Chain, vaultID string, fee *Fee, messageBytes []byte) string {
+	namespaced := []byte("fordefi:solana:" + string(pushMode) + ":" + string(chain) + ":" +
+		vaultID + ":" + canonicalFee(fee) + ":")
 	return core.IdempotencyKeyFromMessage(append(namespaced, messageBytes...))
+}
+
+// canonicalFee renders a fee as type|priority_level|unit_price|priority_fee. The
+// field order is fixed so a key derived from it stays stable.
+func canonicalFee(fee *Fee) string {
+	if fee == nil {
+		return ""
+	}
+	return fee.Type + "|" + string(fee.PriorityLevel) + "|" + fee.UnitPrice + "|" + fee.PriorityFee
 }
 
 // extractAndVerifyRewritten decodes the wire transaction a native response

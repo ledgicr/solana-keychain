@@ -334,7 +334,7 @@ async fn test_turnkey_sign_unauthorized() {
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
-        SignerError::RemoteApiError(_)
+        SignerError::RemoteApiError { .. }
     ));
 }
 
@@ -562,7 +562,8 @@ async fn test_turnkey_create_stamp() {
     assert!(decoded.is_ok());
 
     let json: serde_json::Value = serde_json::from_slice(&decoded.unwrap()).unwrap();
-    assert!(json.get("public_key").is_some());
+    assert!(json.get("publicKey").is_some());
+    assert!(json.get("public_key").is_none());
     assert!(json.get("signature").is_some());
     assert_eq!(json.get("scheme").unwrap(), "SIGNATURE_SCHEME_TK_API_P256");
 }

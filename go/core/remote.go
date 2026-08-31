@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +51,20 @@ func SendRequest(client *http.Client, req *http.Request, provider string) (int, 
 func NewRemoteAPIError(opContext string, status int, body []byte) *SignerError {
 	return NewSignerError(CodeRemoteAPIError,
 		opContext+" "+strconv.Itoa(status)+": "+SanitizeRemoteResponse(string(body)))
+}
+
+// TransactionIDInBody returns the top-level id of a response body, or "" when
+// there is none. A provider that has already accepted a transaction may still
+// answer with a non-2xx status or an otherwise unusable body, and that id is
+// the caller's only handle for reconciling it.
+func TransactionIDInBody(body []byte) string {
+	var parsed struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.ID)
 }
 
 // EncodeURIComponent percent-encodes every byte except the JavaScript
@@ -120,8 +135,12 @@ func ResolvePollBounds(interval, defaultInterval time.Duration, attempts, defaul
 
 // PollTimeoutError reports that a transaction never reached a terminal state
 // within the attempt budget; the signing request may still complete remotely.
-func PollTimeoutError(provider string, attempts int) error {
-	return NewSignerError(CodeRemoteAPIError,
+// providerTxID names the request left pending, so the caller can reconcile it,
+// and is "" when no id is known.
+func PollTimeoutError(provider string, attempts int, providerTxID string) error {
+	err := NewSignerError(CodeRemoteAPIError,
 		provider+" transaction polling timed out after "+strconv.Itoa(attempts)+
 			" attempts; the signing request may still complete")
+	err.ProviderTxID = providerTxID
+	return err
 }

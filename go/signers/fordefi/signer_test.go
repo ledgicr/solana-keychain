@@ -398,6 +398,9 @@ func TestSignMessagePollingTimeout(t *testing.T) {
 	if errors.As(err, &se) && !strings.Contains(se.Detail(), "polling timed out") {
 		t.Errorf("detail = %q, want polling timeout message", se.Detail())
 	}
+	if errors.As(err, &se) && se.ProviderTxID != "tx-123" {
+		t.Errorf("ProviderTxID = %q, want tx-123", se.ProviderTxID)
+	}
 }
 
 func TestSignMessageAPIErrorSanitizesBodyIntoDetail(t *testing.T) {
@@ -594,11 +597,10 @@ func TestSignTransactionNativeSuccess(t *testing.T) {
 			if decodeErr != nil {
 				t.Errorf("decode submitted message: %v", decodeErr)
 			}
-			digest := sha256.Sum256(submittedMessage)
-			id := digest[:16]
-			id[6] = (id[6] & 0x0f) | 0x40
-			id[8] = (id[8] & 0x3f) | 0x80
-			want := fmt.Sprintf("%x-%x-%x-%x-%x", id[0:4], id[4:6], id[6:8], id[8:10], id[10:16])
+			namespaced := append(
+				[]byte("fordefi:solana:auto:solana_devnet:"+testVaultID+":priority|medium||:"),
+				submittedMessage...)
+			want := core.IdempotencyKeyFromMessage(namespaced)
 			if got := r.Header.Get("x-idempotence-id"); got != want {
 				t.Errorf("x-idempotence-id = %q, want %q", got, want)
 			}
@@ -683,6 +685,25 @@ func TestSignTransactionNativeSubmitServerErrorIsUnconfirmedWithoutID(t *testing
 	assertBroadcastUnconfirmedWithoutID(t, err, http.StatusBadGateway)
 }
 
+func TestSignTransactionNativeSubmitServerErrorKeepsIDFromBody(t *testing.T) {
+	pub := testutils.TestPublicKey()
+	s := newNativeTestSigner(t, nativeConfig(t), pub.String(), func(mux *http.ServeMux) {
+		mux.HandleFunc(transactionsPath, func(w http.ResponseWriter, _ *http.Request) {
+			testutils.WriteJSON(w, http.StatusBadGateway, map[string]any{"id": "tx-accepted"})
+		})
+	})
+
+	tx, err := testutils.CreateTestTransaction(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignAndSendTransaction(context.Background(), tx)
+	if err == nil {
+		t.Fatal("expected a failed submit to be reported")
+	}
+	assertBroadcastUnconfirmed(t, err, "tx-accepted")
+}
+
 func TestSignTransactionNativeSubmitWithoutIDIsUnconfirmed(t *testing.T) {
 	pub := testutils.TestPublicKey()
 	s := newNativeTestSigner(t, nativeConfig(t), pub.String(), func(mux *http.ServeMux) {
@@ -700,6 +721,49 @@ func TestSignTransactionNativeSubmitWithoutIDIsUnconfirmed(t *testing.T) {
 		t.Fatal("expected an accepted submit without an id to be reported")
 	}
 	assertBroadcastUnconfirmedWithoutID(t, err, 0)
+}
+
+func TestSignTransactionNativeSubmitWhitespaceIDIsUnconfirmed(t *testing.T) {
+	pub := testutils.TestPublicKey()
+	calls := 0
+	s := newNativeTestSigner(t, nativeConfig(t), pub.String(), func(mux *http.ServeMux) {
+		mux.HandleFunc(transactionsPath, func(w http.ResponseWriter, _ *http.Request) {
+			calls++
+			testutils.WriteJSON(w, http.StatusOK, map[string]any{"id": " \t"})
+		})
+	})
+
+	tx, err := testutils.CreateTestTransaction(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignAndSendTransaction(context.Background(), tx)
+	if err == nil {
+		t.Fatal("expected an accepted submit with a whitespace id to be reported")
+	}
+	assertBroadcastUnconfirmedWithoutID(t, err, 0)
+	if calls != 1 {
+		t.Fatalf("expected 1 create call, got %d", calls)
+	}
+}
+
+func TestSignTransactionNativeSubmitProcessingTimeoutIsUnconfirmed(t *testing.T) {
+	pub := testutils.TestPublicKey()
+	s := newNativeTestSigner(t, nativeConfig(t), pub.String(), func(mux *http.ServeMux) {
+		mux.HandleFunc(transactionsPath, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusRequestTimeout)
+		})
+	})
+
+	tx, err := testutils.CreateTestTransaction(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignAndSendTransaction(context.Background(), tx)
+	if err == nil {
+		t.Fatal("expected a timed-out submit to be reported")
+	}
+	assertBroadcastUnconfirmedWithoutID(t, err, http.StatusRequestTimeout)
 }
 
 func TestSignTransactionNativeSubmitRejectionStaysPlainFailure(t *testing.T) {
@@ -936,5 +1000,32 @@ func TestStringDoesNotLeakSecrets(t *testing.T) {
 		if !strings.Contains(rendered, "fordefi.BlackBoxSigner") {
 			t.Errorf("rendered signer should identify the type: %s", rendered)
 		}
+	}
+}
+
+func TestSignAndSendTransactionRejectsAnAlreadySignedTransaction(t *testing.T) {
+	pub := testutils.TestPublicKey()
+	var requests atomic.Int64
+	s := newNativeTestSigner(t, nativeConfig(t), pub.String(), func(mux *http.ServeMux) {
+		mux.HandleFunc(transactionsPath, func(w http.ResponseWriter, _ *http.Request) {
+			requests.Add(1)
+			testutils.WriteJSON(w, http.StatusOK, map[string]any{"id": "tx-1"})
+		})
+	})
+
+	tx, err := testutils.CreateTestTransaction(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := tx.Message.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Signatures = []solana.Signature{testutils.SignWith(testutils.TestPrivateKey(), message)}
+
+	_, err = s.SignAndSendTransaction(context.Background(), tx)
+	testutils.AssertCode(t, err, core.CodeSigningFailed)
+	if got := requests.Load(); got != 0 {
+		t.Errorf("rejection must happen before any signing request, server saw %d", got)
 	}
 }

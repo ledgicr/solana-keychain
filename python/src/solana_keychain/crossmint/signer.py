@@ -10,7 +10,6 @@ from urllib.parse import quote
 import base58
 import httpx
 from solders.keypair import Keypair
-from solders.message import Message, MessageV0
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
@@ -23,9 +22,11 @@ from solana_keychain.core.http import (
     probe_availability,
     provider_may_have_accepted,
 )
+from solana_keychain.core.signature_util import verify_returned_signature
 from solana_keychain.core.signer import SendingSigner, require_initialized
 from solana_keychain.core.transaction_util import (
     ED25519_SIGNATURE_LENGTH,
+    PendingTransactionId,
     idempotency_key_from_message,
     signed_message_bytes,
 )
@@ -74,6 +75,7 @@ class CrossmintSignerConfig:
     poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS
     max_poll_attempts: int = DEFAULT_MAX_POLL_ATTEMPTS
     http_client: httpx.AsyncClient | None = field(default=None, repr=False)
+    pending_transaction_id: PendingTransactionId | None = None
 
 
 class CrossmintSigner(SendingSigner):
@@ -109,6 +111,7 @@ class CrossmintSigner(SendingSigner):
         self._poll_interval_ms = config.poll_interval_ms
         self._max_poll_attempts = config.max_poll_attempts
         self._http_client = config.http_client
+        self._pending_transaction_id = config.pending_transaction_id
         self._public_key: Pubkey | None = None
 
         self._signing_key: Keypair | None = None
@@ -166,7 +169,11 @@ class CrossmintSigner(SendingSigner):
             json_body=json_body,
             client=self._http_client,
         )
-        if not isinstance(response, dict) or response.get(required_field) is None:
+        if (
+            not isinstance(response, dict)
+            or (value := response.get(required_field)) is None
+            or (isinstance(value, str) and not value.strip())
+        ):
             message = self._extract_error_message(response)
             if message is not None:
                 raise SignerError(SignerErrorCode.REMOTE_API_ERROR, f"{context}: {message}")
@@ -244,7 +251,9 @@ class CrossmintSigner(SendingSigner):
             raise SignerError(
                 SignerErrorCode.BROADCAST_UNCONFIRMED,
                 error._detail,
+                provider_transaction_id=error.provider_transaction_id,
                 status_code=error.status_code,
+                idempotency_key=idempotency_key,
             ) from None
 
     async def _get_transaction(self, transaction_id: str) -> dict[str, Any]:
@@ -362,16 +371,16 @@ class CrossmintSigner(SendingSigner):
             ) from None
 
         message = transaction.message
-        if not isinstance(message, (Message, MessageV0)):
-            raise SignerError(
-                SignerErrorCode.SIGNING_FAILED,
-                "Crossmint returned a transaction with an unsupported message version",
-            )
         num_required = message.header.num_required_signatures
         account_keys = list(message.account_keys)
         if len(account_keys) < num_required:
             raise SignerError(
                 SignerErrorCode.SIGNING_FAILED, "Invalid account index: not enough account keys"
+            )
+        if not account_keys:
+            raise SignerError(
+                SignerErrorCode.SIGNING_FAILED,
+                "Crossmint transaction carries no account keys",
             )
         signatures = list(transaction.signatures)
         if not signatures or signatures[0] == Signature.default():
@@ -379,17 +388,8 @@ class CrossmintSigner(SendingSigner):
                 SignerErrorCode.SIGNING_FAILED,
                 "Crossmint transaction carries no signer signature",
             )
+        verify_returned_signature(signatures[0], account_keys[0], signed_message_bytes(message))
         return signatures[0], transaction
-
-    @staticmethod
-    def _executed_message_bytes(transaction: VersionedTransaction) -> bytes:
-        message = transaction.message
-        if not isinstance(message, (Message, MessageV0)):
-            raise SignerError(
-                SignerErrorCode.SIGNING_FAILED,
-                "Crossmint returned a transaction with an unsupported message version",
-            )
-        return signed_message_bytes(message)
 
     @staticmethod
     def _broadcast_transaction_id(transaction: VersionedTransaction) -> Signature:
@@ -430,7 +430,7 @@ class CrossmintSigner(SendingSigner):
                     if not isinstance(on_chain.get("txId"), str):
                         raise
                 else:
-                    if self._executed_message_bytes(returned) == expected_message:
+                    if signed_message_bytes(returned.message) == expected_message:
                         return signature
                     return self._broadcast_transaction_id(returned)
 
@@ -453,22 +453,26 @@ class CrossmintSigner(SendingSigner):
             "Unable to extract signature from Crossmint transaction response",
         )
 
+    def _namespaced_key_input(self, message_bytes: bytes) -> bytes:
+        """Bind the idempotency key to the signer locator as well as the message."""
+        locator = (self._signer or "").encode()
+        return b"crossmint:solana:%d:%s:" % (len(locator), locator) + message_bytes
+
     async def _execute_managed_transaction(self, transaction: VersionedTransaction) -> Signature:
         self._initialized_pubkey()
         expected_message = signed_message_bytes(transaction.message)
         transaction_b58 = base58.b58encode(bytes(transaction)).decode("ascii")
 
-        create_response = await self._create_transaction(
-            transaction_b58, idempotency_key_from_message(expected_message)
-        )
+        idempotency_key = idempotency_key_from_message(self._namespaced_key_input(expected_message))
+        create_response = await self._create_transaction(transaction_b58, idempotency_key)
         provider_transaction_id = str(create_response["id"])
         # Post-create failures leave an outcome Crossmint may still execute, so
         # they surface as BROADCAST_UNCONFIRMED with the transaction id.
+        if self._pending_transaction_id is not None:
+            self._pending_transaction_id.set(provider_transaction_id)
         try:
-            return await self._finish_managed_transaction(create_response, expected_message)
+            signature = await self._finish_managed_transaction(create_response, expected_message)
         except asyncio.CancelledError as error:
-            # Awaiting a cancelled task strips the raised instance, so the id is
-            # also logged; the re-raise must stay a CancelledError for asyncio.
             _logger.warning(
                 "Crossmint may have executed cancelled transaction %s; check it before retrying",
                 provider_transaction_id,
@@ -478,11 +482,19 @@ class CrossmintSigner(SendingSigner):
                 f"not be confirmed (provider transaction id: {provider_transaction_id})"
             ) from error
         except SignerError as error:
+            self._clear_pending_transaction_id()
             raise SignerError(
                 SignerErrorCode.BROADCAST_UNCONFIRMED,
                 error._detail,
                 provider_transaction_id=provider_transaction_id,
+                idempotency_key=idempotency_key,
             ) from None
+        self._clear_pending_transaction_id()
+        return signature
+
+    def _clear_pending_transaction_id(self) -> None:
+        if self._pending_transaction_id is not None:
+            self._pending_transaction_id.clear()
 
     async def _finish_managed_transaction(
         self, create_response: dict[str, Any], expected_message: bytes
@@ -505,9 +517,15 @@ class CrossmintSigner(SendingSigner):
         ``provider_transaction_id``.
 
         Each create carries an ``x-idempotency-key`` derived from the message
-        bytes, so replaying these exact bytes cannot create a second
-        transaction; a rebuilt transaction derives a different key and executes
-        as a new transfer.
+        bytes and the signer locator, so replaying these exact bytes cannot
+        create a second transaction; a rebuilt transaction derives a different
+        key and executes as a new transfer.
+
+        A cancellation cannot carry a structured error: it must be re-raised as
+        ``asyncio.CancelledError``, and awaiting a cancelled task hands the
+        awaiter a fresh instance without the raised message. Pass a
+        ``PendingTransactionId`` as ``pending_transaction_id`` in the config and
+        read it after a cancellation to recover the accepted transaction id.
         """
         return await self._execute_managed_transaction(transaction)
 

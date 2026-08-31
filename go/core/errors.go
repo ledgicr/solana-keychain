@@ -4,8 +4,11 @@ package core
 
 import (
 	"errors"
+	"net/http"
 	"regexp"
 	"strings"
+
+	"github.com/solana-foundation/solana-go/v2"
 )
 
 // Code identifies a category of signer error. The string values are stable
@@ -74,8 +77,13 @@ type SignerError struct {
 	// ProviderStatus is the provider's HTTP status when its response was the
 	// failure, and 0 otherwise. Exported for the same reason as ProviderTxID.
 	ProviderStatus int
-	detail         string
-	cause          error
+	// IdempotencyKey is the key used to submit an ambiguous create, when available.
+	IdempotencyKey string
+	// TransactionSignature identifies a completed transaction passed to a
+	// caller-managed broadcast whose outcome could not be confirmed.
+	TransactionSignature solana.Signature
+	detail               string
+	cause                error
 }
 
 // NewSignerError builds a SignerError with a (private) detail string.
@@ -127,10 +135,15 @@ func NewBroadcastUnconfirmedError(providerTxID, detail string) *SignerError {
 }
 
 // UnconfirmedUnlessRejected reports a failed create as CodeBroadcastUnconfirmed
-// with no transaction id unless a 4xx rules the transaction out. status is 0 when
-// no response arrived, and is passed on only when the response was the failure.
-func UnconfirmedUnlessRejected(status int, err error) error {
-	if status >= 400 && status < 500 {
+// unless a 4xx other than 408 rules the transaction out. A 408 is a timeout
+// reached while the request was being processed, so it does not rule the
+// transaction out. status is 0 when no response arrived,
+// and is passed on only when the response was the failure. providerTxID is the id
+// read out of the response body when one was readable there, and "" when the
+// failure came before any id was known. idempotencyKey is the key the create was
+// submitted under, and "" for a backend that sends none.
+func UnconfirmedUnlessRejected(status int, providerTxID, idempotencyKey string, err error) error {
+	if status >= 400 && status < 500 && status != http.StatusRequestTimeout {
 		return err
 	}
 	detail := err.Error()
@@ -138,7 +151,8 @@ func UnconfirmedUnlessRejected(status int, err error) error {
 	if errors.As(err, &se) {
 		detail = se.Detail()
 	}
-	out := NewBroadcastUnconfirmedError("", detail)
+	out := NewBroadcastUnconfirmedError(providerTxID, detail)
+	out.IdempotencyKey = idempotencyKey
 	if status >= 400 {
 		out.ProviderStatus = status
 	}

@@ -244,9 +244,32 @@ func TestManualIdempotencyKeyIsNamespacedAwayFromAuto(t *testing.T) {
 		t.Error("the manual key must not equal the auto key for the same message bytes")
 	}
 
-	namespaced := append([]byte("fordefi:solana:manual:solana_devnet:"+testVaultID+":"), message...)
+	namespaced := append([]byte("fordefi:solana:manual:solana_devnet:"+testVaultID+"::"), message...)
 	if got, want := s.idempotencyKey(message), core.IdempotencyKeyFromMessage(namespaced); got != want {
 		t.Errorf("manual key = %q, want the key over the namespaced bytes %q", got, want)
+	}
+}
+
+func TestNativeIdempotencyKeyBindsChainAndFee(t *testing.T) {
+	message := []byte("serialized message bytes")
+	base := nativeIdempotencyKey(PushModeAuto, ChainSolanaMainnet, testVaultID, nil, message)
+
+	variants := map[string]string{
+		"another chain": nativeIdempotencyKey(PushModeAuto, ChainSolanaDevnet, testVaultID, nil, message),
+		"another vault": nativeIdempotencyKey(PushModeAuto, ChainSolanaMainnet, "other-vault", nil, message),
+		"a custom fee": nativeIdempotencyKey(PushModeAuto, ChainSolanaMainnet, testVaultID,
+			&Fee{Type: FeeTypeCustom, UnitPrice: "10"}, message),
+		"a high priority fee": nativeIdempotencyKey(PushModeAuto, ChainSolanaMainnet, testVaultID,
+			&Fee{Type: FeeTypePriority, PriorityLevel: PriorityHigh}, message),
+		"a low priority fee": nativeIdempotencyKey(PushModeAuto, ChainSolanaMainnet, testVaultID,
+			&Fee{Type: FeeTypePriority, PriorityLevel: PriorityLow}, message),
+	}
+	seen := map[string]string{base: "no fee"}
+	for name, key := range variants {
+		if previous, collided := seen[key]; collided {
+			t.Errorf("%s produced the same key as %s", name, previous)
+		}
+		seen[key] = name
 	}
 }
 
@@ -274,32 +297,30 @@ func TestModifyAndSignTransactionRejectsATransactionItDoesNotPayFor(t *testing.T
 	}
 }
 
-// Rewriting the message invalidates every signature already on the transaction,
-// so manual signing has to run before any of them are collected.
-func TestModifyAndSignTransactionRejectsAnAlreadySignedTransaction(t *testing.T) {
+func TestModifyAndSignTransactionAcceptsAnAlreadySignedTransaction(t *testing.T) {
 	pub := testutils.TestPublicKey()
-	var requests atomic.Int64
-	s := newManualTestSigner(t, manualConfig(t), pub.String(), func(mux *http.ServeMux) {
-		mux.HandleFunc(transactionsPath, func(w http.ResponseWriter, _ *http.Request) {
-			requests.Add(1)
-			testutils.WriteJSON(w, http.StatusOK, map[string]any{"id": "manual-tx-1"})
-		})
-	})
+	returned, _, signature := rewrittenTransaction(t, pub)
+	s := newManualTestSigner(t, manualConfig(t), pub.String(),
+		respondManual(t, "signed", wireBase64(t, returned), make(chan submittedRequest, 1)))
 
 	tx, err := testutils.CreateTestTransaction(pub)
 	if err != nil {
 		t.Fatal(err)
 	}
-	message, err := tx.Message.MarshalBinary()
+	stale := testutils.SignWith(testutils.TestPrivateKey(), []byte("some earlier message"))
+	tx.Signatures = []solana.Signature{stale}
+
+	res, err := s.ModifyAndSignTransaction(context.Background(), tx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx.Signatures = []solana.Signature{testutils.SignWith(testutils.TestPrivateKey(), message)}
-
-	_, err = s.ModifyAndSignTransaction(context.Background(), tx)
-	testutils.AssertCode(t, err, core.CodeSigningFailed)
-	if got := requests.Load(); got != 0 {
-		t.Errorf("rejection must happen before any signing request, server saw %d", got)
+	if res.Signature != signature {
+		t.Errorf("signature = %s, want %s", res.Signature, signature)
+	}
+	for _, got := range tx.Signatures {
+		if got == stale {
+			t.Error("the void signature must not survive the rewrite")
+		}
 	}
 }
 

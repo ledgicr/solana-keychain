@@ -43,6 +43,7 @@ from solana_keychain.core.signer import (
 )
 from solana_keychain.core.transaction_util import (
     ED25519_SIGNATURE_LENGTH,
+    PendingTransactionId,
     add_signature_to_transaction,
     classify_signed_transaction,
     get_signing_keypair_position,
@@ -100,6 +101,10 @@ class FordefiSignerConfig:
     ``fee`` is the native-mode fee configuration passed through verbatim,
     e.g. ``{"type": "priority", "priority_level": "medium"}`` or
     ``{"type": "custom", "priority_fee": "1000"}``. Requires ``chain``.
+
+    ``pending_transaction_id`` is native-auto only: it is the recovery handle for
+    a send whose outcome could not be confirmed, and only the broadcasting mode
+    can leave one behind. The other two signers reject it.
     """
 
     access_token: str = field(repr=False)
@@ -114,6 +119,7 @@ class FordefiSignerConfig:
     fee: dict[str, Any] | None = None
     push_mode: FordefiPushMode | None = None
     http_client: httpx.AsyncClient | None = field(default=None, repr=False)
+    pending_transaction_id: PendingTransactionId | None = None
 
 
 class _FordefiSignerBase(SolanaSigner):
@@ -162,6 +168,7 @@ class _FordefiSignerBase(SolanaSigner):
         self._poll_interval_ms = config.poll_interval_ms
         self._max_poll_attempts = config.max_poll_attempts
         self._http_client = config.http_client
+        self._pending_transaction_id = config.pending_transaction_id
         try:
             self._public_key = Pubkey.from_string(config.public_key)
         except Exception:
@@ -214,7 +221,7 @@ class _FordefiSignerBase(SolanaSigner):
             client=self._http_client,
         )
         transaction_id = response.get("id") if isinstance(response, dict) else None
-        if not isinstance(transaction_id, str):
+        if not isinstance(transaction_id, str) or not transaction_id.strip():
             raise SignerError(SignerErrorCode.SERIALIZATION_ERROR, "Failed to parse response")
         return transaction_id
 
@@ -237,6 +244,7 @@ class _FordefiSignerBase(SolanaSigner):
         raise SignerError(
             SignerErrorCode.REMOTE_API_ERROR,
             f"Polling timeout after {self._max_poll_attempts} attempts",
+            provider_transaction_id=transaction_id,
         )
 
     @staticmethod
@@ -290,7 +298,8 @@ class FordefiBlackBoxSigner(_FordefiSignerBase, TransactionSigner):
     does not broadcast, so the caller submits the returned encoded transaction
     to an RPC. ``config.chain``, ``config.fee``, ``config.push_mode`` and
     ``config.max_priority_fee_lamports`` must be unset; they select a native
-    Solana signer.
+    Solana signer. ``config.pending_transaction_id`` must be unset too: nothing
+    is broadcast here, so there is no unconfirmed send to recover.
     """
 
     def __init__(self, config: FordefiSignerConfig) -> None:
@@ -300,6 +309,7 @@ class FordefiBlackBoxSigner(_FordefiSignerBase, TransactionSigner):
                 "chain, fee and push_mode select native Solana mode; use "
                 "FordefiNativeAutoSigner or FordefiNativeManualSigner",
             )
+        _reject_pending_transaction_id(config)
         super().__init__(config)
 
     def _black_box_request(self, data: bytes) -> dict[str, Any]:
@@ -339,6 +349,40 @@ class FordefiBlackBoxSigner(_FordefiSignerBase, TransactionSigner):
         return signature
 
 
+def _reject_pending_transaction_id(config: FordefiSignerConfig) -> None:
+    """Reject a recovery slot on a signer that never broadcasts.
+
+    Args:
+        config: The configuration handed to a non-broadcasting signer.
+
+    Raises:
+        SignerError: ``CONFIG_ERROR`` when ``pending_transaction_id`` is set.
+    """
+    if config.pending_transaction_id is not None:
+        raise SignerError(
+            SignerErrorCode.CONFIG_ERROR,
+            "pending_transaction_id is only used by FordefiNativeAutoSigner, "
+            "the mode that broadcasts",
+        )
+
+
+def _canonical_fee(fee: dict[str, Any] | None) -> str:
+    """Render a fee as ``type|priority_level|unit_price|priority_fee``.
+
+    The field order is fixed so an idempotency key derived from it stays stable.
+
+    Args:
+        fee: Native-mode fee configuration, or ``None``.
+
+    Returns:
+        The canonical rendering, empty when no fee is configured.
+    """
+    if fee is None:
+        return ""
+    fields = ("type", "priority_level", "unit_price", "priority_fee")
+    return "|".join(str(fee.get(field, "")) for field in fields)
+
+
 class _FordefiNativeSignerBase(_FordefiSignerBase):
     """Shared native-mode plumbing: chain validation and the native request bodies."""
 
@@ -375,6 +419,13 @@ class _FordefiNativeSignerBase(_FordefiSignerBase):
             "type": "solana_transaction",
             "details": details,
         }
+
+    def _native_idempotence_id(self, message_data: bytes) -> str:
+        namespace = (
+            f"fordefi:solana:{self._push_mode}:{self._chain}:"
+            f"{self._vault_id}:{_canonical_fee(self._fee)}:"
+        ).encode()
+        return idempotency_key_from_message(namespace + message_data)
 
     def _solana_message_request(self, data: bytes) -> dict[str, Any]:
         return {
@@ -423,19 +474,27 @@ class FordefiNativeAutoSigner(_FordefiNativeSignerBase, SendingSigner):
         replaces the blockhash (and optionally fees), signs, and broadcasts the
         transaction itself, so ``transaction`` is left unmodified and the
         returned signature identifies the on-chain transaction. Only legacy
-        transactions whose sole required signer is the configured vault are
-        supported.
+        transactions whose sole required signer is the configured vault, and
+        which carry no signature yet, are supported.
 
         Not retry-safe: any failure after Fordefi accepts the submission raises
         ``BROADCAST_UNCONFIRMED`` carrying ``provider_transaction_id``; check
         that transaction with Fordefi before retrying. A submission that fails
-        without a usable response raises ``BROADCAST_UNCONFIRMED`` with no
-        ``provider_transaction_id``.
+        without a usable response raises ``BROADCAST_UNCONFIRMED`` carrying any
+        transaction id the failed response named, and none when no response
+        reached the client at all.
 
         Each create carries an ``x-idempotence-id`` derived from the message
-        bytes, so replaying these exact bytes cannot create a second
-        transaction; a rebuilt transaction derives a different id and is
-        broadcast again.
+        bytes under the push mode, chain, vault and fee it was submitted with, so
+        replaying these exact bytes on the same terms cannot create a second
+        transaction; a rebuilt transaction, or a different fee, derives a
+        different id and is broadcast again.
+
+        A cancellation cannot carry a structured error: it must be re-raised as
+        ``asyncio.CancelledError``, and awaiting a cancelled task hands the
+        awaiter a fresh instance without the raised message. Pass a
+        ``PendingTransactionId`` as ``pending_transaction_id`` in the config and
+        read it after a cancellation to recover the accepted transaction id.
         """
         signed = await self._sign_transaction_native(transaction)
         return signed.signature
@@ -450,16 +509,23 @@ class FordefiNativeAutoSigner(_FordefiNativeSignerBase, SendingSigner):
                 "Fordefi native auto-broadcast currently supports only transactions "
                 "whose sole required signer is the configured vault",
             )
+        if any(signature != Signature.default() for signature in transaction.signatures):
+            raise SignerError(
+                SignerErrorCode.SIGNING_FAILED,
+                "Fordefi native auto-broadcast must run before any transaction "
+                "signatures are applied",
+            )
 
     async def _sign_transaction_native(
         self, transaction: VersionedTransaction
     ) -> SignedTransaction:
         self._require_sole_required_signer(transaction)
         message_data = signed_message_bytes(transaction.message)
+        idempotency_key = self._native_idempotence_id(message_data)
         try:
             transaction_id = await self._post_transaction(
                 self._solana_transaction_request(message_data),
-                idempotence_id=idempotency_key_from_message(message_data),
+                idempotence_id=idempotency_key,
             )
         except asyncio.CancelledError as error:
             # The re-raise must stay a CancelledError for asyncio, so the warning
@@ -478,13 +544,15 @@ class FordefiNativeAutoSigner(_FordefiNativeSignerBase, SendingSigner):
             raise SignerError(
                 SignerErrorCode.BROADCAST_UNCONFIRMED,
                 error._detail,
+                provider_transaction_id=error.provider_transaction_id,
                 status_code=error.status_code,
+                idempotency_key=idempotency_key,
             ) from None
+        if self._pending_transaction_id is not None:
+            self._pending_transaction_id.set(transaction_id)
         try:
-            return await self._finish_native_broadcast(transaction_id)
+            signed = await self._finish_native_broadcast(transaction_id)
         except asyncio.CancelledError as error:
-            # Awaiting a cancelled task strips the raised instance, so the id is
-            # also logged; the re-raise must stay a CancelledError for asyncio.
             _logger.warning(
                 "Fordefi may have executed cancelled transaction %s; check it before retrying",
                 transaction_id,
@@ -494,11 +562,19 @@ class FordefiNativeAutoSigner(_FordefiNativeSignerBase, SendingSigner):
                 f"not be confirmed (provider transaction id: {transaction_id})"
             ) from error
         except SignerError as error:
+            self._clear_pending_transaction_id()
             raise SignerError(
                 SignerErrorCode.BROADCAST_UNCONFIRMED,
                 error._detail,
                 provider_transaction_id=transaction_id,
+                idempotency_key=idempotency_key,
             ) from None
+        self._clear_pending_transaction_id()
+        return signed
+
+    def _clear_pending_transaction_id(self) -> None:
+        if self._pending_transaction_id is not None:
+            self._pending_transaction_id.clear()
 
     async def _finish_native_broadcast(self, transaction_id: str) -> SignedTransaction:
         result = await self._poll_for_result(transaction_id, pushable=True)
@@ -542,7 +618,9 @@ class FordefiNativeManualSigner(_FordefiNativeSignerBase, ModifyingSigner):
     with ``push_mode: manual``: Fordefi rewrites the blockhash and the Compute
     Budget fee instructions and signs without broadcasting, so the caller
     broadcasts the transaction Fordefi returned. ``config.chain`` must be set and
-    ``config.push_mode`` must be ``manual``.
+    ``config.push_mode`` must be ``manual``. ``config.pending_transaction_id``
+    must be unset: nothing is broadcast here, so there is no unconfirmed send to
+    recover.
     """
 
     _push_mode: FordefiPushMode = "manual"
@@ -553,6 +631,7 @@ class FordefiNativeManualSigner(_FordefiNativeSignerBase, ModifyingSigner):
                 SignerErrorCode.CONFIG_ERROR,
                 'push_mode must be "manual" here; use FordefiNativeAutoSigner for auto',
             )
+        _reject_pending_transaction_id(config)
         super().__init__(config)
 
     async def modify_and_sign_transaction(
@@ -567,19 +646,22 @@ class FordefiNativeManualSigner(_FordefiNativeSignerBase, ModifyingSigner):
         caller's ``transaction`` is left untouched and its bytes are not the ones
         the returned signature covers.
 
-        Fordefi must be the transaction fee payer and must sign before every
-        downstream signer, so a transaction that is not vault-paid or already
-        carries a signature is rejected before submitting.
+        Fordefi must be the transaction fee payer, so a transaction that is not
+        vault-paid is rejected before submitting, and it must sign before every
+        downstream signer: a transaction that already carries signatures is
+        accepted, but the rewrite voids them and the returned transaction carries
+        only Fordefi's.
 
         The create carries an ``x-idempotence-id`` derived from the message bytes
-        under a manual-specific namespace, so it can never reuse the id of an
-        auto create that did broadcast those same bytes.
+        under the push mode, chain, vault and fee it was submitted with, so it can
+        never reuse the id of a create made on other terms, such as an auto create
+        that did broadcast those same bytes.
         """
-        self._require_unsigned_vault_paid_transaction(transaction)
+        self._require_vault_paid_transaction(transaction)
         message_data = signed_message_bytes(transaction.message)
         transaction_id = await self._post_transaction(
             self._solana_transaction_request(message_data),
-            idempotence_id=self._manual_idempotence_id(message_data),
+            idempotence_id=self._native_idempotence_id(message_data),
         )
         result = await self._poll_for_result(transaction_id, pushable=False)
         returned, signature = extract_and_verify_rewritten_transaction(
@@ -587,23 +669,13 @@ class FordefiNativeManualSigner(_FordefiNativeSignerBase, ModifyingSigner):
         )
         return classify_signed_transaction(returned, serialize_transaction(returned), signature)
 
-    def _manual_idempotence_id(self, message_data: bytes) -> str:
-        namespace = f"fordefi:solana:manual:{self._chain}:{self._vault_id}:".encode()
-        return idempotency_key_from_message(namespace + message_data)
-
-    def _require_unsigned_vault_paid_transaction(self, transaction: VersionedTransaction) -> None:
+    def _require_vault_paid_transaction(self, transaction: VersionedTransaction) -> None:
         account_keys = transaction.message.account_keys
         if not account_keys or account_keys[0] != self._public_key:
             raise SignerError(
                 SignerErrorCode.SIGNING_FAILED,
                 "Fordefi native manual signing requires the configured vault to be "
                 "the transaction fee payer",
-            )
-        if any(signature != Signature.default() for signature in transaction.signatures):
-            raise SignerError(
-                SignerErrorCode.SIGNING_FAILED,
-                "Fordefi native manual signing must run before any transaction "
-                "signatures are applied",
             )
 
     @staticmethod

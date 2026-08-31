@@ -17,6 +17,7 @@ from solders.signature import Signature
 
 from solana_keychain import SignerError, SignerErrorCode
 from solana_keychain.core import serialize_transaction, signed_message_bytes
+from solana_keychain.core.transaction_util import idempotency_key_from_message
 from solana_keychain.fireblocks import (
     FireblocksSigner,
     FireblocksSignerConfig,
@@ -150,6 +151,52 @@ async def test_program_call_requests_sign_only_and_uses_signed_messages() -> Non
 
 
 @respx.mock
+async def test_program_call_create_carries_a_message_derived_external_tx_id() -> None:
+    """The id has to be derived from the submitted bytes and the vault they go to:
+    it is both what stops a resend from signing twice and what makes an accepted
+    create findable when its response was lost."""
+    keypair = Keypair()
+    signer = await initialized_signer(keypair, use_program_call=True)
+    transaction = create_test_transaction(keypair.pubkey())
+    message = signed_message_bytes(transaction.message)
+    signature = keypair.sign_message(message)
+    mock_program_call_flow(
+        {
+            "id": "tx-1",
+            "status": "SIGNED",
+            "signedMessages": [{"signature": {"fullSig": bytes(signature).hex()}}],
+        }
+    )
+
+    await signer.sign_transaction(transaction)
+
+    namespace = f"fireblocks:solana:program_call:SOL:{VAULT_ACCOUNT_ID}:".encode()
+    request_body = json.loads(respx.calls[1].request.content)
+    assert request_body["externalTxId"] == idempotency_key_from_message(namespace + message)
+
+
+@respx.mock
+async def test_raw_create_carries_no_external_tx_id() -> None:
+    """RAW signs nothing on its own, and the same message may legitimately be
+    signed again, so it must not carry a uniqueness constraint."""
+    keypair = Keypair()
+    signer = await initialized_signer(keypair)
+    message = b"hello"
+    signature = keypair.sign_message(message)
+    mock_program_call_flow(
+        {
+            "id": "tx-1",
+            "status": "COMPLETED",
+            "signedMessages": [{"signature": {"fullSig": bytes(signature).hex()}}],
+        }
+    )
+
+    await signer.sign_message(message)
+
+    assert "externalTxId" not in json.loads(respx.calls[1].request.content)
+
+
+@respx.mock
 async def test_program_call_accepts_signature_carried_as_tx_hash() -> None:
     keypair = Keypair()
     signer = await initialized_signer(keypair, use_program_call=True)
@@ -191,6 +238,104 @@ async def test_program_call_broadcast_despite_sign_only_is_unconfirmed() -> None
 
     assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
     assert excinfo.value.provider_transaction_id == "tx-1"
+
+
+@respx.mock
+async def test_program_call_polling_timeout_keeps_the_transaction_id() -> None:
+    keypair = Keypair()
+    signer = await initialized_signer(keypair, use_program_call=True, max_poll_attempts=3)
+    transaction = create_test_transaction(keypair.pubkey())
+    mock_program_call_flow({"id": "tx-1", "status": "SUBMITTED"})
+
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_transaction(transaction)
+
+    assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
+    assert excinfo.value.provider_transaction_id == "tx-1"
+
+
+@respx.mock
+async def test_program_call_poll_failure_keeps_the_transaction_id() -> None:
+    keypair = Keypair()
+    signer = await initialized_signer(keypair, use_program_call=True)
+    transaction = create_test_transaction(keypair.pubkey())
+    respx.post(TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(200, json={"id": "tx-1", "status": "SUBMITTED"})
+    )
+    respx.get(f"{TRANSACTIONS_URL}/tx-1").mock(return_value=httpx.Response(503, text="unavailable"))
+
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_transaction(transaction)
+
+    assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
+    assert excinfo.value.provider_transaction_id == "tx-1"
+
+
+@respx.mock
+async def test_program_call_create_5xx_is_unconfirmed() -> None:
+    keypair = Keypair()
+    signer = await initialized_signer(keypair, use_program_call=True)
+    transaction = create_test_transaction(keypair.pubkey())
+    respx.post(TRANSACTIONS_URL).mock(return_value=httpx.Response(503, text="unavailable"))
+
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_transaction(transaction)
+
+    assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
+
+
+@respx.mock
+async def test_program_call_create_5xx_keeps_a_transaction_id_from_the_body() -> None:
+    keypair = Keypair()
+    signer = await initialized_signer(keypair, use_program_call=True)
+    transaction = create_test_transaction(keypair.pubkey())
+    respx.post(TRANSACTIONS_URL).mock(return_value=httpx.Response(503, json={"id": "tx-accepted"}))
+
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_transaction(transaction)
+
+    assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
+    assert excinfo.value.provider_transaction_id == "tx-accepted"
+
+
+@respx.mock
+async def test_program_call_create_4xx_stays_a_rejection() -> None:
+    keypair = Keypair()
+    signer = await initialized_signer(keypair, use_program_call=True)
+    transaction = create_test_transaction(keypair.pubkey())
+    respx.post(TRANSACTIONS_URL).mock(return_value=httpx.Response(400, text="bad request"))
+
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_transaction(transaction)
+
+    assert excinfo.value.code == SignerErrorCode.REMOTE_API_ERROR
+
+
+@respx.mock
+async def test_program_call_accepted_create_without_an_id_is_unconfirmed() -> None:
+    keypair = Keypair()
+    signer = await initialized_signer(keypair, use_program_call=True)
+    transaction = create_test_transaction(keypair.pubkey())
+    respx.post(TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(200, json={"status": "SUBMITTED"})
+    )
+
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_transaction(transaction)
+
+    assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
+
+
+@respx.mock
+async def test_raw_create_5xx_stays_a_plain_failure() -> None:
+    keypair = Keypair()
+    signer = await initialized_signer(keypair)
+    respx.post(TRANSACTIONS_URL).mock(return_value=httpx.Response(503, text="unavailable"))
+
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_message(b"hello")
+
+    assert excinfo.value.code == SignerErrorCode.REMOTE_API_ERROR
 
 
 @respx.mock

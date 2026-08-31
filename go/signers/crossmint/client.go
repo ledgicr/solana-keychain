@@ -95,11 +95,13 @@ func (s *Signer) createTransaction(ctx context.Context, transaction, idempotency
 	}}
 	status, body, err := s.doRequest(ctx, http.MethodPost, u, req, idempotencyKey)
 	if err != nil {
-		return transactionResponse{}, core.UnconfirmedUnlessRejected(status, err)
+		return transactionResponse{}, core.UnconfirmedUnlessRejected(status, "", idempotencyKey, err)
 	}
 	created, err := parseResponseWithRequiredField[transactionResponse](status, body, "id", "create_transaction")
 	if err != nil {
-		return transactionResponse{}, core.UnconfirmedUnlessRejected(status, err)
+		// The create may have been accepted even when the body is otherwise
+		// unusable, so an id present there is the caller's recovery handle.
+		return transactionResponse{}, core.UnconfirmedUnlessRejected(status, core.TransactionIDInBody(body), idempotencyKey, err)
 	}
 	return created, nil
 }
@@ -183,6 +185,18 @@ func (s *Signer) doRequest(ctx context.Context, method, u string, body any, idem
 	return core.SendRequest(s.client, req, "crossmint")
 }
 
+func hasUsableField(value map[string]json.RawMessage, requiredField string) bool {
+	raw, ok := value[requiredField]
+	if !ok {
+		return false
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.TrimSpace(s) != ""
+	}
+	return true
+}
+
 // parseResponseWithRequiredField turns non-2xx statuses into RemoteApiError
 // with any extractable API message; a 2xx body missing the required field
 // becomes RemoteApiError (if the body carries an error message) or
@@ -201,7 +215,7 @@ func parseResponseWithRequiredField[T any](status int, body []byte, requiredFiel
 		return zero, core.NewSignerError(core.CodeRemoteAPIError, opContext+": "+core.SanitizeRemoteResponse(message))
 	}
 
-	if _, ok := value[requiredField]; !ok {
+	if !hasUsableField(value, requiredField) {
 		if message, ok := extractErrorMessage(value); ok {
 			return zero, core.NewSignerError(core.CodeRemoteAPIError, opContext+": "+core.SanitizeRemoteResponse(message))
 		}

@@ -138,7 +138,7 @@ impl YourServiceSigner {
         // 3. Check for errors — use generic messages, never expose raw API response text
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            return Err(SignerError::RemoteApiError(format!(
+            return Err(SignerError::remote_api(format!(
                 "YourService API returned status {status}"
             )));
         }
@@ -692,7 +692,7 @@ class YourSigner<TAddress extends string = string>
   ```
   Validate provider-specific response shape (with optional chaining) after the call.
 - **Batch staggering**: support the `requestDelayMs` config field for rate-limited APIs. Validate it with `validateRequestDelayMs()` and implement `signMessages`/`signTransactions` with `signBatchStaggered()` from `@solana/keychain-core` (see any existing signer).
-- **Abort support**: thread `config?.abortSignal` from every signing method into `fetchSignerJson({ abortSignal, ... })` and `signBatchStaggered(items, fn, delayMs, config?.abortSignal)`. `fetchSignerJson` composes the signal with its timeout and rethrows the caller's abort reason unwrapped, so cancellation stays distinguishable from failure — never catch and rewrap it as a signer error.
+- **Abort support**: thread `config?.abortSignal` from every signing method into `fetchSignerJson({ abortSignal, ... })` and `signBatchStaggered(items, fn, delayMs, config?.abortSignal)`. `fetchSignerJson` composes the signal with its timeout and rethrows the caller's abort reason unwrapped, so cancellation stays distinguishable from failure: never catch and rewrap it as a signer error. The one exception is a backend whose provider has already accepted the work, where cancelling cannot mean nothing happened: past that point an abort belongs in `BROADCAST_UNCONFIRMED` carrying the provider transaction id, with the abort reason kept as `cause`. Crossmint's managed send and Fordefi's native auto mode do this for every post-create failure; Fireblocks instead rethrows the abort and reports the ambiguity only for non-abort failures.
 - **One-time crypto at construction**: import/validate static key material (PEM parsing, `importPKCS8`, point decompression) once in `create()`/`init()` and store the imported key — only genuinely request-bound work (e.g. minting a per-request JWT) belongs in the request path.
 - Add `cause` to catch blocks to preserve stack traces
 - Add `@throws` JSDoc to factory functions listing the error codes they can throw
@@ -1082,7 +1082,7 @@ Always use the existing error types. Both `Display` and `Debug` on `SignerError`
 
 ```rust
 // Good — generic message, no raw API data
-return Err(SignerError::RemoteApiError(format!(
+return Err(SignerError::remote_api(format!(
     "YourService API returned status {status}"
 )));
 
@@ -1094,7 +1094,7 @@ let bytes = base64::decode(data)
 let decoded = STANDARD.decode(&api_response.signature).expect("decode failed");
 
 // BAD — never include raw API error text
-return Err(SignerError::RemoteApiError(format!("API error: {error_body}")));
+return Err(SignerError::remote_api(format!("API error: {error_body}")));
 ```
 
 ### Security Requirements

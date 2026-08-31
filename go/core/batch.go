@@ -47,11 +47,18 @@ func SignMessages(ctx context.Context, s SolanaSigner, messages [][]byte, opts B
 	return out, nil
 }
 
-// SignTransactions signs each transaction with s concurrently, preserving order.
-// See SignMessages for error and concurrency semantics. Only a TransactionSigner
-// can be batched: for a SendingSigner the single nil, err result would hide which
-// transactions the provider already executed.
+// BatchServerSideEffects marks signers whose transaction calls have provider-side effects.
+type BatchServerSideEffects interface {
+	// HasServerSideEffects reports whether each transaction call creates provider-side work.
+	HasServerSideEffects() bool
+}
+
+// SignTransactions signs transactions concurrently unless the signer reports provider-side effects.
 func SignTransactions(ctx context.Context, s TransactionSigner, txs []*solana.Transaction, opts BatchOptions) ([]SignedTransaction, error) {
+	if effectful, ok := s.(BatchServerSideEffects); ok && effectful.HasServerSideEffects() {
+		return signTransactionsSequential(ctx, s, txs, opts)
+	}
+
 	out := make([]SignedTransaction, len(txs))
 	g, ctx := errgroup.WithContext(ctx)
 	if opts.MaxConcurrency > 0 {
@@ -73,6 +80,22 @@ func SignTransactions(ctx context.Context, s TransactionSigner, txs []*solana.Tr
 	}
 	if err := g.Wait(); err != nil {
 		return nil, err
+	}
+	return out, nil
+}
+
+func signTransactionsSequential(ctx context.Context, s TransactionSigner, txs []*solana.Transaction, opts BatchOptions) ([]SignedTransaction, error) {
+	out := make([]SignedTransaction, 0, len(txs))
+	start := time.Now()
+	for i := range txs {
+		if err := stagger(ctx, start, i, opts.RequestDelay); err != nil {
+			return out, err
+		}
+		signed, err := s.SignTransaction(ctx, txs[i])
+		if err != nil {
+			return out, err
+		}
+		out = append(out, signed)
 	}
 	return out, nil
 }

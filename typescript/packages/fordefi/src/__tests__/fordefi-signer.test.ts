@@ -10,9 +10,27 @@ import {
     isSolanaSendingSigner,
     isSolanaSigner,
     isSolanaTransactionSigner,
-    type SignerError,
+    SignerError,
+    SignerErrorCode,
 } from '@solana/keychain-core';
 import { createCosignedWireTransaction, createSignedWireTransaction } from '@solana/keychain-test-utils';
+import {
+    AccountRole,
+    type Address,
+    appendTransactionMessageInstruction,
+    blockhash,
+    compileTransaction,
+    createTransactionMessage,
+    generateKeyPairSigner,
+    getBase64EncodedWireTransaction,
+    type Nonce,
+    type ReadonlyUint8Array,
+    partiallySignTransaction,
+    pipe,
+    setTransactionMessageFeePayer,
+    setTransactionMessageLifetimeUsingBlockhash,
+    setTransactionMessageLifetimeUsingDurableNonce,
+} from '@solana/kit';
 import { isTransactionModifyingSigner, isTransactionPartialSigner, isTransactionSendingSigner } from '@solana/signers';
 
 vi.mock('@solana/keychain-core', async importOriginal => {
@@ -32,14 +50,18 @@ vi.mock('@solana/keychain-core', async importOriginal => {
 });
 
 import { createFordefiSigner, type FordefiSignerConfig } from '../fordefi-signer.js';
-import type { SolanaChainUniqueId } from '../types.js';
+import type { FordefiSolanaFee, SolanaChainUniqueId } from '../types.js';
 
 global.fetch = vi.fn();
 
 const MOCK_ADDRESS = '11111111111111111111111111111111';
+const COMPUTE_BUDGET_PROGRAM_ADDRESS = 'ComputeBudget111111111111111111111111111111' as Address;
+const RENT_SYSVAR_ADDRESS = 'SysvarRent111111111111111111111111111111111';
 
 const { privateKey: testPrivateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
 const TEST_PEM = testPrivateKey.export({ type: 'sec1', format: 'pem' }) as string;
+
+const NONCE_VALUE = '11111111111111111111111111111111' as Nonce;
 
 const MOCK_SIGNATURE_BYTES = new Uint8Array(64).fill(0xab);
 const MOCK_SIGNATURE_BASE64 = Buffer.from(MOCK_SIGNATURE_BYTES).toString('base64');
@@ -96,8 +118,68 @@ async function setupNativeManual(version: 0 | 1) {
     return { config, fixture };
 }
 
-function unsignedManualTransaction(feePayer: string, messageBytes = new Uint8Array(32)) {
+// A durable-nonce wire transaction whose nonce account is generated, so a
+async function createNonceWireTransaction() {
+    const feePayerSigner = await generateKeyPairSigner();
+    const nonceAccount = await generateKeyPairSigner();
+    const message = pipe(
+        createTransactionMessage({ version: 0 }),
+        tx => setTransactionMessageFeePayer(feePayerSigner.address, tx),
+        tx =>
+            setTransactionMessageLifetimeUsingDurableNonce(
+                {
+                    nonce: NONCE_VALUE,
+                    nonceAccountAddress: nonceAccount.address,
+                    nonceAuthorityAddress: feePayerSigner.address,
+                },
+                tx,
+            ),
+    );
+    const signed = await partiallySignTransaction([feePayerSigner.keyPair], compileTransaction(message));
+    return {
+        feePayer: feePayerSigner.address,
+        messageBytes: signed.messageBytes,
+        nonceAccountAddress: nonceAccount.address,
+        wireTransaction: getBase64EncodedWireTransaction(signed),
+    };
+}
+
+function compiledMessageBytes(feePayer: string, extraSigner?: string) {
+    return compileTransaction(
+        pipe(
+            createTransactionMessage({ version: 0 }),
+            tx => setTransactionMessageFeePayer(feePayer as Address, tx),
+            tx =>
+                setTransactionMessageLifetimeUsingBlockhash(
+                    { blockhash: blockhash(MOCK_ADDRESS), lastValidBlockHeight: 100n },
+                    tx,
+                ),
+            tx =>
+                extraSigner === undefined
+                    ? tx
+                    : appendTransactionMessageInstruction(
+                          {
+                              accounts: [{ address: extraSigner as Address, role: AccountRole.READONLY_SIGNER }],
+                              programAddress: COMPUTE_BUDGET_PROGRAM_ADDRESS,
+                          },
+                          tx,
+                      ),
+        ),
+    ).messageBytes;
+}
+
+function unsignedManualTransaction(
+    feePayer: string,
+    messageBytes: Uint8Array<ArrayBufferLike> | ReadonlyUint8Array = compiledMessageBytes(feePayer),
+) {
     return { messageBytes, signatures: { [feePayer]: null } } as never;
+}
+
+// The base64 codec mis-slices a SharedArrayBuffer-backed view at a non-zero
+function sharedOffsetView(bytes: Uint8Array) {
+    const shared = new Uint8Array(new SharedArrayBuffer(bytes.length + 8));
+    shared.set(bytes, 8);
+    return shared.subarray(8);
 }
 
 function idempotencyKeyOf(input: Uint8Array) {
@@ -301,10 +383,14 @@ describe('createFordefiSigner', () => {
 
             vi.mocked(fetch)
                 .mockResolvedValueOnce(mockCreateTxResponse())
-                .mockResolvedValue(mockPollResponse('pending_signature'));
+                // A Response body is single-use, so every poll needs a fresh one.
+                .mockImplementation(() => Promise.resolve(mockPollResponse('pending_signature')));
 
             const mockTx = { messageBytes: new Uint8Array(32) } as never;
-            await expect(signer.signTransactions([mockTx])).rejects.toThrow();
+            await expect(signer.signTransactions([mockTx])).rejects.toMatchObject({
+                code: 'SIGNER_REMOTE_API_ERROR',
+                context: expect.objectContaining({ providerTransactionId: 'tx-123' }) as object,
+            });
         });
 
         it('should handle submit API error', async () => {
@@ -438,7 +524,7 @@ describe('createFordefiSigner', () => {
                 ).toBe(true);
 
                 const mockTx = {
-                    messageBytes: new Uint8Array(32),
+                    messageBytes: fixture.messageBytes,
                     signatures: { [fixture.feePayer]: null },
                 } as never;
                 const results = await signer.signAndSendTransactions([mockTx]);
@@ -464,15 +550,29 @@ describe('createFordefiSigner', () => {
             },
         );
 
-        it('sends a deterministic x-idempotence-id on the native create', async () => {
-            const messageBytes = new Uint8Array(32).fill(0xab);
-            const digest = createHash('sha256').update(messageBytes).digest().subarray(0, 16);
-            digest[6] = (digest[6]! & 0x0f) | 0x40;
-            digest[8] = (digest[8]! & 0x3f) | 0x80;
-            const hex = digest.toString('hex');
-            const expectedId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+        it('submits the whole caller message when messageBytes is an offset view', async () => {
+            const { config, fixture } = await setupNativeBroadcast(0);
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockCreateTxResponse('tx-native'))
+                .mockResolvedValueOnce(mockPollResponse('completed', MOCK_SIGNATURE_BASE64, fixture.wireTransaction));
 
+            const messageBytes = new Uint8Array(fixture.messageBytes);
+            const signer = await createFordefiSigner(config);
+            await signer.signAndSendTransactions([
+                { messageBytes: sharedOffsetView(messageBytes), signatures: { [fixture.feePayer]: null } } as never,
+            ]);
+
+            const postOpts = vi.mocked(fetch).mock.calls[0]![1] as RequestInit;
+            const body = JSON.parse(postOpts.body as string);
+            expect(new Uint8Array(Buffer.from(body.details.data as string, 'base64'))).toStrictEqual(messageBytes);
+        });
+
+        it('sends a deterministic x-idempotence-id on the native create', async () => {
             const { config, fixture } = await setupNativeBroadcast(1);
+            const messageBytes = new Uint8Array(fixture.messageBytes);
+            const namespace = Buffer.from(`fordefi:solana:auto:solana_mainnet:${config.vaultId}::`, 'utf8');
+            const expectedId = idempotencyKeyOf(Buffer.concat([namespace, Buffer.from(messageBytes)]));
+
             vi.mocked(fetch)
                 .mockResolvedValueOnce(mockCreateTxResponse('tx-native'))
                 .mockResolvedValueOnce(mockPollResponse('completed', MOCK_SIGNATURE_BASE64, fixture.wireTransaction));
@@ -483,6 +583,36 @@ describe('createFordefiSigner', () => {
 
             const postOpts = vi.mocked(fetch).mock.calls[0]![1] as RequestInit;
             expect(postOpts.headers).toHaveProperty('x-idempotence-id', expectedId);
+        });
+
+        it('binds the x-idempotence-id to the fee the create carries', async () => {
+            const { config, fixture } = await setupNativeBroadcast(1);
+            const messageBytes = new Uint8Array(fixture.messageBytes);
+            const fees: (FordefiSolanaFee | undefined)[] = [
+                undefined,
+                { priority_level: 'low', type: 'priority' },
+                { priority_level: 'high', type: 'priority' },
+                { type: 'custom', unit_price: '10' },
+                { priority_fee: '10', type: 'custom' },
+            ];
+            const observed = new Set<string>();
+
+            for (const fee of fees) {
+                vi.mocked(fetch)
+                    .mockResolvedValueOnce(mockCreateTxResponse('tx-native'))
+                    .mockResolvedValueOnce(
+                        mockPollResponse('completed', MOCK_SIGNATURE_BASE64, fixture.wireTransaction),
+                    );
+                const signer = await createFordefiSigner({ ...config, ...(fee ? { fee } : {}) });
+                await signer.signAndSendTransactions([
+                    { messageBytes, signatures: { [fixture.feePayer]: null } } as never,
+                ]);
+                const { calls } = vi.mocked(fetch).mock;
+                const postOpts = calls[calls.length - 2]![1] as RequestInit;
+                observed.add((postOpts.headers as Record<string, string>)['x-idempotence-id']!);
+            }
+
+            expect(observed.size).toBe(fees.length);
         });
 
         it('does not expose the partial-signer method in native mode', async () => {
@@ -503,11 +633,37 @@ describe('createFordefiSigner', () => {
         it('should reject native multi-signer auto-broadcast before submitting remote work', async () => {
             const signer = await createFordefiSigner(nativeConfig);
             const mockTx = {
-                messageBytes: new Uint8Array(32),
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS, RENT_SYSVAR_ADDRESS),
                 signatures: {
                     [MOCK_ADDRESS]: null,
                     '22222222222222222222222222222222': null,
                 },
+            } as never;
+
+            await expect(signer.signAndSendTransactions([mockTx])).rejects.toMatchObject({
+                code: 'SIGNER_SIGNING_FAILED',
+            });
+            expect(fetch).not.toHaveBeenCalled();
+        });
+
+        it('reads the required signers from the message, not from the signature map', async () => {
+            const signer = await createFordefiSigner(nativeConfig);
+            const mockTx = {
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS, RENT_SYSVAR_ADDRESS),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+
+            await expect(signer.signAndSendTransactions([mockTx])).rejects.toMatchObject({
+                code: 'SIGNER_SIGNING_FAILED',
+            });
+            expect(fetch).not.toHaveBeenCalled();
+        });
+
+        it('rejects an already-signed transaction before submitting remote work', async () => {
+            const signer = await createFordefiSigner(nativeConfig);
+            const mockTx = {
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
+                signatures: { [MOCK_ADDRESS]: MOCK_SIGNATURE_BYTES },
             } as never;
 
             await expect(signer.signAndSendTransactions([mockTx])).rejects.toMatchObject({
@@ -538,7 +694,7 @@ describe('createFordefiSigner', () => {
 
             const signer = await createFordefiSigner({ ...config, pollIntervalMs: 1 });
             const mockTx = {
-                messageBytes: new Uint8Array(32),
+                messageBytes: fixture.messageBytes,
                 signatures: { [fixture.feePayer]: null },
             } as never;
             const results = await signer.signAndSendTransactions([mockTx]);
@@ -561,7 +717,7 @@ describe('createFordefiSigner', () => {
 
             const signer = await createFordefiSigner(config);
             const mockTx = {
-                messageBytes: new Uint8Array(32),
+                messageBytes: compiledMessageBytes(fixture.cosigner),
                 signatures: { [fixture.cosigner]: null },
             } as never;
 
@@ -584,7 +740,7 @@ describe('createFordefiSigner', () => {
             vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ message: 'boom' }), { status: 502 }));
 
             const mockTx = {
-                messageBytes: new Uint8Array(32),
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
                 signatures: { [MOCK_ADDRESS]: null },
             } as never;
             const error = await signer.signAndSendTransactions([mockTx]).then(
@@ -598,12 +754,42 @@ describe('createFordefiSigner', () => {
             expect(error.context?.status).toBe(502);
         });
 
+        it('treats a status-bearing caller abort during submit as unconfirmed', async () => {
+            const signer = await createFordefiSigner(nativeConfig);
+            const controller = new AbortController();
+            const reason = new SignerError(SignerErrorCode.REMOTE_API_ERROR, { status: 400 });
+            vi.mocked(fetch).mockImplementationOnce(async (_input, init) => {
+                controller.abort(reason);
+                expect(init?.signal?.aborted).toBe(true);
+                throw new Error('aborted');
+            });
+            const mockTx = {
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+
+            const error = await signer.signAndSendTransactions([mockTx], { abortSignal: controller.signal }).then(
+                () => {
+                    throw new Error('expected the submit failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+
+            const postOpts = vi.mocked(fetch).mock.calls[0]![1] as RequestInit;
+            expect(error.code).toBe(SignerErrorCode.BROADCAST_UNCONFIRMED);
+            expect(error.context?.cause).toBe(reason);
+            expect(error.context?.status).toBeUndefined();
+            expect(error.context?.idempotencyKey).toBe(
+                (postOpts.headers as Record<string, string>)['x-idempotence-id'],
+            );
+        });
+
         it('reports an accepted submit with no id as unconfirmed', async () => {
             const signer = await createFordefiSigner(nativeConfig);
             vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ state: 'pending' }), { status: 200 }));
 
             const mockTx = {
-                messageBytes: new Uint8Array(32),
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
                 signatures: { [MOCK_ADDRESS]: null },
             } as never;
             const error = await signer.signAndSendTransactions([mockTx]).then(
@@ -617,6 +803,65 @@ describe('createFordefiSigner', () => {
             expect(error.context?.status).toBeUndefined();
         });
 
+        it('reports an accepted submit with an empty id as unconfirmed', async () => {
+            const signer = await createFordefiSigner(nativeConfig);
+            vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ id: '' }), { status: 200 }));
+
+            const mockTx = {
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+            const error = await signer.signAndSendTransactions([mockTx]).then(
+                () => {
+                    throw new Error('expected the submit failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.providerTransactionId).toBeUndefined();
+        });
+
+        it('reports an accepted submit with a whitespace-only id as unconfirmed', async () => {
+            const signer = await createFordefiSigner(nativeConfig);
+            vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ id: ' \t' }), { status: 200 }));
+
+            const mockTx = {
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+            const error = await signer.signAndSendTransactions([mockTx]).then(
+                () => {
+                    throw new Error('expected the submit failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.providerTransactionId).toBeUndefined();
+            expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+        });
+
+        it('reports a submit that timed out while processing as unconfirmed', async () => {
+            const signer = await createFordefiSigner(nativeConfig);
+            vi.mocked(fetch).mockResolvedValueOnce(
+                new Response(JSON.stringify({ detail: 'Reached time out while processing the request' }), {
+                    status: 408,
+                }),
+            );
+
+            const mockTx = {
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+            const error = await signer.signAndSendTransactions([mockTx]).then(
+                () => {
+                    throw new Error('expected the submit failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.status).toBe(408);
+        });
+
         it('keeps a 4xx on submit a plain failure', async () => {
             const signer = await createFordefiSigner(nativeConfig);
             vi.mocked(fetch).mockResolvedValueOnce(
@@ -624,7 +869,7 @@ describe('createFordefiSigner', () => {
             );
 
             const mockTx = {
-                messageBytes: new Uint8Array(32),
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
                 signatures: { [MOCK_ADDRESS]: null },
             } as never;
             const error = await signer.signAndSendTransactions([mockTx]).then(
@@ -643,13 +888,61 @@ describe('createFordefiSigner', () => {
 
             const signer = await createFordefiSigner(nativeConfig);
             const mockTx = {
-                messageBytes: new Uint8Array(32),
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
                 signatures: { [MOCK_ADDRESS]: null },
             } as never;
             await expect(signer.signAndSendTransactions([mockTx])).rejects.toMatchObject({
                 code: 'SIGNER_BROADCAST_UNCONFIRMED',
                 context: expect.objectContaining({ providerTransactionId: 'tx-no-raw' }) as object,
                 message: expect.stringContaining('tx-no-raw') as string,
+            });
+        });
+
+        it('stops a batch at the first failure and reports the sibling that landed', async () => {
+            const { config, fixture } = await setupNativeBroadcast(0);
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockCreateTxResponse('tx-first'))
+                .mockResolvedValueOnce(mockPollResponse('completed', MOCK_SIGNATURE_BASE64, fixture.wireTransaction))
+                .mockResolvedValueOnce({
+                    ok: false,
+                    status: 503,
+                    text: async () => 'unavailable',
+                } as Response);
+
+            const signer = await createFordefiSigner(config);
+            const mockTx = {
+                messageBytes: fixture.messageBytes,
+                signatures: { [fixture.feePayer]: null },
+            } as never;
+
+            const error = await signer.signAndSendTransactions([mockTx, mockTx, mockTx]).then(
+                () => {
+                    throw new Error('expected the failing submit to reject');
+                },
+                (thrown: SignerError) => thrown,
+            );
+
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.failedIndex).toBe(1);
+            expect(error.context?.completedSignatures).toStrictEqual([fixture.signature]);
+            expect(vi.mocked(fetch).mock.calls).toHaveLength(3);
+        });
+
+        it('keeps a transaction id named in a failed submit body', async () => {
+            vi.mocked(fetch).mockResolvedValueOnce({
+                ok: false,
+                status: 502,
+                text: async () => JSON.stringify({ id: 'tx-accepted' }),
+            } as Response);
+
+            const signer = await createFordefiSigner(nativeConfig);
+            const failedSubmitTx = {
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
+                signatures: { [MOCK_ADDRESS]: null },
+            } as never;
+            await expect(signer.signAndSendTransactions([failedSubmitTx])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: expect.objectContaining({ providerTransactionId: 'tx-accepted' }) as object,
             });
         });
 
@@ -660,7 +953,7 @@ describe('createFordefiSigner', () => {
 
             const signer = await createFordefiSigner(nativeConfig);
             const mockTx = {
-                messageBytes: new Uint8Array(32),
+                messageBytes: compiledMessageBytes(MOCK_ADDRESS),
                 signatures: { [MOCK_ADDRESS]: null },
             } as never;
             await expect(signer.signAndSendTransactions([mockTx])).rejects.toMatchObject({
@@ -715,9 +1008,26 @@ describe('createFordefiSigner', () => {
             expect(body.details.push_mode).toBe('manual');
         });
 
-        it('namespaces the x-idempotence-id so the same bytes cannot reuse an auto create', async () => {
-            const messageBytes = new Uint8Array(32).fill(0xab);
+        it('submits the whole caller message when messageBytes is an offset view', async () => {
             const { config, fixture } = await setupNativeManual(0);
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockCreateTxResponse('tx-manual'))
+                .mockResolvedValueOnce(mockPollResponse('signed', undefined, fixture.wireTransaction));
+
+            const messageBytes = new Uint8Array(fixture.messageBytes);
+            const signer = await createFordefiSigner(config);
+            await signer.modifyAndSignTransactions([
+                unsignedManualTransaction(fixture.feePayer, sharedOffsetView(messageBytes)),
+            ]);
+
+            const postOpts = vi.mocked(fetch).mock.calls[0]![1] as RequestInit;
+            const body = JSON.parse(postOpts.body as string);
+            expect(new Uint8Array(Buffer.from(body.details.data as string, 'base64'))).toStrictEqual(messageBytes);
+        });
+
+        it('namespaces the x-idempotence-id so the same bytes cannot reuse an auto create', async () => {
+            const { config, fixture } = await setupNativeManual(0);
+            const messageBytes = new Uint8Array(fixture.messageBytes);
             vi.mocked(fetch)
                 .mockResolvedValueOnce(mockCreateTxResponse('tx-manual'))
                 .mockResolvedValueOnce(mockPollResponse('signed', undefined, fixture.wireTransaction));
@@ -725,7 +1035,7 @@ describe('createFordefiSigner', () => {
             const signer = await createFordefiSigner(config);
             await signer.modifyAndSignTransactions([unsignedManualTransaction(fixture.feePayer, messageBytes)]);
 
-            const namespace = Buffer.from(`fordefi:solana:manual:solana_mainnet:${config.vaultId}:`, 'utf8');
+            const namespace = Buffer.from(`fordefi:solana:manual:solana_mainnet:${config.vaultId}::`, 'utf8');
             const postOpts = vi.mocked(fetch).mock.calls[0]![1] as RequestInit;
             expect(postOpts.headers).toHaveProperty(
                 'x-idempotence-id',
@@ -755,7 +1065,7 @@ describe('createFordefiSigner', () => {
             const { config, fixture } = await setupNativeManual(0);
             const signer = await createFordefiSigner(config);
             const mockTx = {
-                messageBytes: new Uint8Array(32),
+                messageBytes: compiledMessageBytes(RENT_SYSVAR_ADDRESS),
                 signatures: { '22222222222222222222222222222222': null, [fixture.feePayer]: null },
             } as never;
 
@@ -765,18 +1075,36 @@ describe('createFordefiSigner', () => {
             expect(fetch).not.toHaveBeenCalled();
         });
 
-        it('rejects an already-signed transaction, whose signatures the rewrite would invalidate', async () => {
+        it('reads the fee payer from the message, not from the signature map', async () => {
             const { config, fixture } = await setupNativeManual(0);
             const signer = await createFordefiSigner(config);
             const mockTx = {
-                messageBytes: new Uint8Array(32),
-                signatures: { [fixture.feePayer]: MOCK_SIGNATURE_BYTES },
+                messageBytes: compiledMessageBytes(RENT_SYSVAR_ADDRESS),
+                signatures: { [fixture.feePayer]: null },
             } as never;
 
             await expect(signer.modifyAndSignTransactions([mockTx])).rejects.toMatchObject({
                 code: 'SIGNER_SIGNING_FAILED',
             });
             expect(fetch).not.toHaveBeenCalled();
+        });
+
+        it('accepts an already-signed transaction and returns only what Fordefi signed', async () => {
+            const { config, fixture } = await setupNativeManual(0);
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockCreateTxResponse('tx-manual'))
+                .mockResolvedValueOnce(mockPollResponse('signed', undefined, fixture.wireTransaction));
+
+            const signer = await createFordefiSigner(config);
+            const [signed] = await signer.modifyAndSignTransactions([
+                {
+                    messageBytes: fixture.messageBytes,
+                    signatures: { [fixture.feePayer]: MOCK_SIGNATURE_BYTES },
+                } as never,
+            ]);
+
+            expect(signed!.signatures[fixture.feePayer]).toStrictEqual(fixture.signature);
+            expect(signed!.signatures[fixture.feePayer]).not.toStrictEqual(MOCK_SIGNATURE_BYTES);
         });
 
         it('rejects a response without raw_transaction, having nothing to continue from', async () => {
@@ -858,12 +1186,39 @@ describe('createFordefiSigner', () => {
             const results = await signer.modifyAndSignTransactions([
                 {
                     lifetimeConstraint,
-                    messageBytes: new Uint8Array(32),
+                    messageBytes: fixture.messageBytes,
                     signatures: { [fixture.feePayer]: null },
                 } as never,
             ]);
 
             expect(results[0]!.lifetimeConstraint).toStrictEqual(lifetimeConstraint);
+        });
+
+        it('takes the nonce account from the returned transaction, not the caller constraint', async () => {
+            const nonceFixture = await createNonceWireTransaction();
+            vi.mocked(fetch)
+                .mockResolvedValueOnce(mockCreateTxResponse('tx-manual'))
+                .mockResolvedValueOnce(mockPollResponse('signed', undefined, nonceFixture.wireTransaction));
+
+            const signer = await createFordefiSigner({
+                ...mockConfig,
+                chain: 'solana_mainnet',
+                publicKey: nonceFixture.feePayer,
+                pushMode: 'manual',
+            } satisfies FordefiSignerConfig & { chain: SolanaChainUniqueId; pushMode: 'manual' });
+            const staleNonceAccount = (await generateKeyPairSigner()).address;
+            const results = await signer.modifyAndSignTransactions([
+                {
+                    lifetimeConstraint: { nonce: NONCE_VALUE, nonceAccountAddress: staleNonceAccount },
+                    messageBytes: nonceFixture.messageBytes,
+                    signatures: { [nonceFixture.feePayer]: null },
+                } as never,
+            ]);
+
+            expect(results[0]!.lifetimeConstraint).toStrictEqual({
+                nonce: NONCE_VALUE,
+                nonceAccountAddress: nonceFixture.nonceAccountAddress,
+            });
         });
 
         it('should reject pushMode manual without chain', async () => {

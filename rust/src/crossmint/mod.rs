@@ -2,16 +2,15 @@
 
 mod types;
 
-use crate::remote_util::{read_body_capped, validate_https_url};
+use crate::remote_util::{encode_uri_component, read_body_capped, validate_https_url};
 use crate::sdk_adapter::{Pubkey, Signature, VersionedTransaction};
-use crate::signature_util::signature_from_base58;
+use crate::signature_util::{signature_from_base58, verify_or_reject};
 use crate::traits::SendingSigner;
 use crate::transaction_util::{
     deserialize_wire_transaction, idempotency_key_from_message, serialize_wire_transaction,
-    unconfirmed_unless_rejected,
+    unconfirmed_unless_rejected, PendingTransactionId,
 };
 use crate::{error::SignerError, http_client_config::HttpClientConfig, traits::SolanaSigner};
-use std::fmt::Write;
 use std::str::FromStr;
 use types::{
     CreateTransactionParams, CreateTransactionRequest, TransactionResponse, WalletResponse,
@@ -56,6 +55,7 @@ pub struct CrossmintSigner {
     poll_interval_ms: u64,
     max_poll_attempts: u32,
     signing_key: Option<ed25519_dalek::SigningKey>,
+    pending_transaction_id: Option<PendingTransactionId>,
 }
 
 impl std::fmt::Debug for CrossmintSigner {
@@ -135,7 +135,14 @@ impl CrossmintSigner {
             poll_interval_ms,
             max_poll_attempts,
             signing_key,
+            pending_transaction_id: None,
         })
+    }
+
+    /// Registers a slot for the provider id when cancellation prevents returning it.
+    pub fn with_pending_transaction_id(mut self, pending: PendingTransactionId) -> Self {
+        self.pending_transaction_id = Some(pending);
+        self
     }
 
     fn initialized_pubkey(&self) -> Result<Pubkey, SignerError> {
@@ -211,12 +218,24 @@ impl CrossmintSigner {
             .json(&request)
             .send()
             .await
-            .map_err(|error| unconfirmed_unless_rejected(None, error.into()))?;
+            .map_err(|error| {
+                unconfirmed_unless_rejected(None, None, Some(idempotency_key), error.into())
+            })?;
 
         let status = response.status().as_u16();
-        Self::parse_response_with_required_field(response, "id", "create_transaction")
-            .await
-            .map_err(|error| unconfirmed_unless_rejected(Some(status), error))
+        let value = Self::read_json_value(response).await.map_err(|error| {
+            unconfirmed_unless_rejected(Some(status), None, Some(idempotency_key), error)
+        })?;
+        // The create may have been accepted even when the body is otherwise
+        // unusable, so an id present there is the caller's recovery handle.
+        let provider_tx_id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string);
+        Self::value_to_typed(status, value, "id", "create_transaction").map_err(|error| {
+            unconfirmed_unless_rejected(Some(status), provider_tx_id, Some(idempotency_key), error)
+        })
     }
 
     async fn get_transaction(
@@ -246,39 +265,13 @@ impl CrossmintSigner {
 
         let mut url = base.as_str().trim_end_matches('/').to_string();
         url.push_str("/2025-06-09/wallets/");
-        url.push_str(&Self::encode_uri_component(&self.wallet_locator));
+        url.push_str(&encode_uri_component(&self.wallet_locator));
         for segment in segments {
             url.push('/');
-            url.push_str(&Self::encode_uri_component(segment));
+            url.push_str(&encode_uri_component(segment));
         }
 
         Ok(url)
-    }
-
-    fn encode_uri_component(input: &str) -> String {
-        let mut encoded = String::with_capacity(input.len());
-        for byte in input.bytes() {
-            if matches!(
-                byte,
-                b'A'..=b'Z'
-                    | b'a'..=b'z'
-                    | b'0'..=b'9'
-                    | b'-'
-                    | b'_'
-                    | b'.'
-                    | b'!'
-                    | b'~'
-                    | b'*'
-                    | b'\''
-                    | b'('
-                    | b')'
-            ) {
-                encoded.push(byte as char);
-            } else {
-                let _ = write!(encoded, "%{byte:02X}");
-            }
-        }
-        encoded
     }
 
     async fn parse_response_with_required_field<T>(
@@ -290,19 +283,42 @@ impl CrossmintSigner {
         T: serde::de::DeserializeOwned,
     {
         let status = response.status().as_u16();
-        let body = read_body_capped(response).await?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let value = Self::read_json_value(response).await?;
+        Self::value_to_typed(status, value, required_field, context)
+    }
 
+    async fn read_json_value(
+        response: reqwest::Response,
+    ) -> Result<serde_json::Value, SignerError> {
+        let body = read_body_capped(response).await?;
+        Ok(serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    fn value_to_typed<T>(
+        status: u16,
+        value: serde_json::Value,
+        required_field: &str,
+        context: &str,
+    ) -> Result<T, SignerError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
         if status >= 400 {
             let message = Self::extract_error_message(&value)
                 .unwrap_or_else(|| format!("Crossmint API error {status}"));
-            return Err(SignerError::RemoteApiError(format!("{context}: {message}")));
+            return Err(SignerError::remote_api(format!("{context}: {message}")));
         }
 
-        if value.get(required_field).is_none() {
+        // A blank string is as unusable as an absent field: it would be spliced
+        // into a request path or handed back as a recovery handle.
+        let field = value.get(required_field);
+        if field.is_none()
+            || field
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.trim().is_empty())
+        {
             if let Some(message) = Self::extract_error_message(&value) {
-                return Err(SignerError::RemoteApiError(format!("{context}: {message}")));
+                return Err(SignerError::remote_api(format!("{context}: {message}")));
             }
 
             return Err(SignerError::SerializationError(format!(
@@ -377,7 +393,7 @@ impl CrossmintSigner {
                 "Crossmint transaction is awaiting approval; additional signer approvals are required"
                     .to_string(),
             )),
-            _ => Err(SignerError::RemoteApiError(format!(
+            _ => Err(SignerError::remote_api(format!(
                 "Crossmint transaction polling timed out after {} attempts",
                 self.max_poll_attempts
             ))),
@@ -550,6 +566,13 @@ impl CrossmintSigner {
         Ok(signature)
     }
 
+    fn namespaced_key_input(&self, message_bytes: &[u8]) -> Vec<u8> {
+        let locator = self.signer.as_deref().unwrap_or("");
+        let mut input = format!("crossmint:solana:{}:{}:", locator.len(), locator).into_bytes();
+        input.extend_from_slice(message_bytes);
+        input
+    }
+
     fn extract_signature_from_serialized_transaction(
         &self,
         serialized_transaction: &str,
@@ -576,6 +599,9 @@ impl CrossmintSigner {
                 "Invalid account index: not enough account keys".to_string(),
             ));
         }
+        let fee_payer = *signer_keys.first().ok_or_else(|| {
+            SignerError::SigningFailed("Crossmint transaction carries no account keys".to_string())
+        })?;
 
         let signature = transaction
             .signatures
@@ -587,6 +613,7 @@ impl CrossmintSigner {
                     "Crossmint transaction carries no signer signature".to_string(),
                 )
             })?;
+        verify_or_reject(&signature, &fee_payer, &transaction.message.serialize())?;
         Ok((signature, transaction))
     }
 
@@ -642,13 +669,19 @@ impl CrossmintSigner {
     ///
     /// Not retry-safe: any failure after the create is accepted returns
     /// [`SignerError::BroadcastUnconfirmed`] carrying the Crossmint transaction id;
-    /// check that transaction with Crossmint before retrying. A create that fails
-    /// without a usable response returns `BroadcastUnconfirmed` with no id.
+    /// check that transaction with Crossmint before retrying. A create whose
+    /// response carries no readable transaction id returns `BroadcastUnconfirmed`
+    /// with no id.
     ///
-    /// Each create carries an `x-idempotency-key` derived from the message bytes,
+    /// Each create carries an `x-idempotency-key` derived from the message bytes
+    /// and the signer locator,
     /// so replaying these exact bytes cannot create a second transaction; a
     /// rebuilt transaction derives a different key and executes as a new
     /// transfer.
+    ///
+    /// Cancelling this future returns nothing at all, so an accepted transaction
+    /// id reaches the caller only through
+    /// [`with_pending_transaction_id`](Self::with_pending_transaction_id).
     async fn execute_managed_transaction(
         &self,
         transaction: &VersionedTransaction,
@@ -658,21 +691,34 @@ impl CrossmintSigner {
         let expected_message = transaction.message.serialize();
         let serialized = serialize_wire_transaction(transaction)?;
         let transaction_b58 = bs58::encode(serialized).into_string();
-        let idempotency_key = idempotency_key_from_message(&expected_message);
+        let idempotency_key =
+            idempotency_key_from_message(&self.namespaced_key_input(&expected_message));
 
         let create_response = self
             .create_transaction(transaction_b58, &idempotency_key)
             .await?;
         let provider_tx_id = create_response.id.clone();
+        // Cancelling this future runs no further code, so the registered slot is
+        // the only way the accepted id reaches the caller in that case.
+        if let Some(pending) = &self.pending_transaction_id {
+            pending.set(&provider_tx_id);
+        }
         // Post-create failures leave an outcome Crossmint may still execute, so
         // they surface as BroadcastUnconfirmed with the transaction id.
-        self.finish_managed_transaction(create_response, &expected_message)
+        let result = self
+            .finish_managed_transaction(create_response, &expected_message)
             .await
             .map_err(|error| SignerError::BroadcastUnconfirmed {
                 provider_tx_id: Some(provider_tx_id),
                 provider_status: None,
+                idempotency_key: Some(idempotency_key),
+                transaction_signature: None,
                 detail: error.detail_string(),
-            })
+            });
+        if let Some(pending) = &self.pending_transaction_id {
+            pending.clear();
+        }
+        result
     }
 
     async fn finish_managed_transaction(

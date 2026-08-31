@@ -14,6 +14,12 @@ fn assert_caller_transaction_untouched(tx: &VersionedTransaction) {
     );
 }
 
+fn expected_idempotency_key(locator: &str, message_bytes: &[u8]) -> String {
+    let mut input = format!("crossmint:solana:{}:{}:", locator.len(), locator).into_bytes();
+    input.extend_from_slice(message_bytes);
+    idempotency_key_from_message(&input)
+}
+
 fn wallet_response(address: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "chainType": "solana",
@@ -42,6 +48,7 @@ fn create_test_signer(
         poll_interval_ms,
         max_poll_attempts,
         signing_key: None,
+        pending_transaction_id: None,
     }
 }
 
@@ -170,6 +177,22 @@ fn test_new_rejects_insecure_api_base_url() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(matches!(err, SignerError::ConfigError(_)));
+}
+
+#[test]
+fn test_the_idempotency_key_input_is_namespaced_by_the_signer_locator() {
+    let mut signer = create_test_signer("https://api.crossmint.com", 1, 1);
+
+    assert_eq!(
+        signer.namespaced_key_input(b"MSG"),
+        b"crossmint:solana:0::MSG".to_vec()
+    );
+
+    signer.signer = Some("server:abc".to_string());
+    assert_eq!(
+        signer.namespaced_key_input(b"MSG"),
+        b"crossmint:solana:10:server:abc:MSG".to_vec()
+    );
 }
 
 #[tokio::test]
@@ -304,7 +327,7 @@ async fn test_sign_and_send_transaction_success() {
     let on_chain_transaction =
         bs58::encode(bincode::serialize(&signed_remote_tx).unwrap()).into_string();
 
-    let expected_idempotency_key = idempotency_key_from_message(&local_tx.message.serialize());
+    let expected_idempotency_key = expected_idempotency_key("", &local_tx.message.serialize());
     Mock::given(method("POST"))
         .and(path("/2025-06-09/wallets/test-wallet/transactions"))
         .and(header("x-api-key", "test-api-key"))
@@ -328,6 +351,101 @@ async fn test_sign_and_send_transaction_success() {
 
     assert_eq!(signature, expected_signature);
     assert_caller_transaction_untouched(&local_tx);
+}
+
+#[tokio::test]
+async fn test_a_cancelled_send_leaves_the_transaction_id_in_the_pending_slot() {
+    let server = MockServer::start().await;
+    let keypair = Keypair::new();
+    let signer_pubkey = keypair_pubkey(&keypair);
+
+    Mock::given(method("GET"))
+        .and(path("/2025-06-09/wallets/test-wallet"))
+        .respond_with(wallet_response(&signer_pubkey.to_string()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2025-06-09/wallets/test-wallet/transactions"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "tx-accepted",
+            "status": "pending",
+            "chainType": "solana",
+            "walletType": "smart"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/2025-06-09/wallets/test-wallet/transactions/tx-accepted",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(30))
+                .set_body_json(serde_json::json!({ "id": "tx-accepted", "status": "pending" })),
+        )
+        .mount(&server)
+        .await;
+
+    let mut signer = create_test_signer(&server.uri(), 1, 100);
+    signer.init().await.unwrap();
+    let pending = PendingTransactionId::new();
+    let signer = signer.with_pending_transaction_id(pending.clone());
+
+    let local_tx = create_test_transaction(&signer_pubkey);
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        signer.sign_and_send_transaction(&local_tx),
+    )
+    .await;
+
+    assert!(cancelled.is_err(), "the poll should still be in flight");
+    assert_eq!(pending.get(), Some("tx-accepted".to_string()));
+}
+
+#[tokio::test]
+async fn test_a_completed_send_clears_the_pending_slot() {
+    let server = MockServer::start().await;
+    let keypair = Keypair::new();
+    let signer_pubkey = keypair_pubkey(&keypair);
+
+    Mock::given(method("GET"))
+        .and(path("/2025-06-09/wallets/test-wallet"))
+        .respond_with(wallet_response(&signer_pubkey.to_string()))
+        .mount(&server)
+        .await;
+
+    let local_tx = create_test_transaction(&signer_pubkey);
+    let mut signed_remote_tx = local_tx.clone();
+    let expected_signature = keypair_sign_message(&keypair, &signed_remote_tx.message.serialize());
+    TransactionUtil::add_signature_to_transaction(
+        &mut signed_remote_tx,
+        &signer_pubkey,
+        expected_signature,
+    )
+    .unwrap();
+    let on_chain_transaction =
+        bs58::encode(bincode::serialize(&signed_remote_tx).unwrap()).into_string();
+
+    Mock::given(method("POST"))
+        .and(path("/2025-06-09/wallets/test-wallet/transactions"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "tx-123",
+            "status": "success",
+            "chainType": "solana",
+            "walletType": "smart",
+            "onChain": { "transaction": on_chain_transaction }
+        })))
+        .mount(&server)
+        .await;
+
+    let mut signer = create_test_signer(&server.uri(), 1, 2);
+    signer.init().await.unwrap();
+    let pending = PendingTransactionId::new();
+    let signer = signer.with_pending_transaction_id(pending.clone());
+
+    signer.sign_and_send_transaction(&local_tx).await.unwrap();
+
+    assert_eq!(pending.get(), None);
 }
 
 /// A smart wallet is signed by its delegated signer, not by the wallet address
@@ -421,6 +539,51 @@ async fn test_sign_and_send_transaction_accepts_unrelated_signer_key() {
     let result = signer.sign_and_send_transaction(&local_tx).await.unwrap();
     assert_eq!(result, signature);
     assert_caller_transaction_untouched(&local_tx);
+}
+
+#[tokio::test]
+async fn test_sign_and_send_transaction_rejects_a_signature_not_covering_the_returned_message() {
+    let server = MockServer::start().await;
+    let wallet_keypair = Keypair::new();
+    let wallet_pubkey = keypair_pubkey(&wallet_keypair);
+
+    Mock::given(method("GET"))
+        .and(path("/2025-06-09/wallets/test-wallet"))
+        .respond_with(wallet_response(&wallet_pubkey.to_string()))
+        .mount(&server)
+        .await;
+
+    let mut signer = create_test_signer(&server.uri(), 1, 2);
+    signer.init().await.unwrap();
+
+    let local_tx = create_test_transaction(&wallet_pubkey);
+    let mut returned_tx = create_test_transaction(&wallet_pubkey);
+    let signature = keypair_sign_message(&wallet_keypair, b"unrelated bytes");
+    returned_tx.signatures[0] = signature;
+
+    Mock::given(method("POST"))
+        .and(path("/2025-06-09/wallets/test-wallet/transactions"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "tx-unverifiable",
+            "status": "success",
+            "onChain": {
+                "transaction": bs58::encode(bincode::serialize(&returned_tx).unwrap())
+                    .into_string()
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    match signer
+        .sign_and_send_transaction(&local_tx)
+        .await
+        .unwrap_err()
+    {
+        SignerError::BroadcastUnconfirmed { provider_tx_id, .. } => {
+            assert_eq!(provider_tx_id.as_deref(), Some("tx-unverifiable"));
+        }
+        other => panic!("Expected BroadcastUnconfirmed error, got: {:?}", other),
+    }
 }
 
 /// Crossmint sponsors gas, so it is the fee payer and the message it signs
@@ -677,10 +840,24 @@ async fn test_create_server_error_is_unconfirmed_without_a_transaction_id() {
         SignerError::BroadcastUnconfirmed {
             provider_tx_id,
             provider_status,
+            idempotency_key,
             ..
         } => {
             assert_eq!(provider_tx_id, None);
             assert_eq!(provider_status, Some(503));
+            let sent = server
+                .received_requests()
+                .await
+                .expect("requests are recorded")
+                .into_iter()
+                .find(|request| request.method == wiremock::http::Method::POST)
+                .expect("the create was sent");
+            let sent_key = sent.headers["x-idempotency-key"].to_str().unwrap();
+            assert_eq!(
+                idempotency_key.as_deref(),
+                Some(sent_key),
+                "with no transaction id to check, the key the bytes went out under is the only handle on a resend"
+            );
         }
         other => panic!("Expected BroadcastUnconfirmed error, got: {:?}", other),
     }
@@ -723,6 +900,74 @@ async fn test_create_accepted_without_an_id_is_unconfirmed() {
 }
 
 #[tokio::test]
+async fn test_create_accepted_with_a_blank_id_is_unconfirmed_without_one() {
+    let server = MockServer::start().await;
+    let wallet_keypair = Keypair::new();
+    let signer_address = keypair_pubkey(&wallet_keypair).to_string();
+
+    Mock::given(method("GET"))
+        .and(path("/2025-06-09/wallets/test-wallet"))
+        .respond_with(wallet_response(&signer_address))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2025-06-09/wallets/test-wallet/transactions"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(serde_json::json!({ "id": "   ", "status": "pending" })),
+        )
+        .mount(&server)
+        .await;
+
+    let mut signer = create_test_signer(&server.uri(), 1, 1);
+    signer.init().await.unwrap();
+    let tx = create_test_transaction(&signer.pubkey());
+
+    match signer.sign_and_send_transaction(&tx).await.unwrap_err() {
+        SignerError::BroadcastUnconfirmed { provider_tx_id, .. } => {
+            assert_eq!(provider_tx_id, None);
+        }
+        other => panic!("Expected BroadcastUnconfirmed error, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_create_accepted_with_an_unusable_body_keeps_the_transaction_id() {
+    let server = MockServer::start().await;
+    let wallet_keypair = Keypair::new();
+    let signer_address = keypair_pubkey(&wallet_keypair).to_string();
+
+    Mock::given(method("GET"))
+        .and(path("/2025-06-09/wallets/test-wallet"))
+        .respond_with(wallet_response(&signer_address))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/2025-06-09/wallets/test-wallet/transactions"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(serde_json::json!({ "id": "tx-accepted" })),
+        )
+        .mount(&server)
+        .await;
+
+    let mut signer = create_test_signer(&server.uri(), 1, 1);
+    signer.init().await.unwrap();
+    let tx = create_test_transaction(&signer.pubkey());
+
+    match signer.sign_and_send_transaction(&tx).await.unwrap_err() {
+        SignerError::BroadcastUnconfirmed {
+            provider_tx_id,
+            provider_status,
+            ..
+        } => {
+            assert_eq!(provider_tx_id.as_deref(), Some("tx-accepted"));
+            assert_eq!(provider_status, None);
+        }
+        other => panic!("Expected BroadcastUnconfirmed error, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_create_rejected_by_crossmint_stays_a_plain_failure() {
     let server = MockServer::start().await;
     let wallet_keypair = Keypair::new();
@@ -746,7 +991,7 @@ async fn test_create_rejected_by_crossmint_stays_a_plain_failure() {
     let tx = create_test_transaction(&signer.pubkey());
 
     match signer.sign_and_send_transaction(&tx).await.unwrap_err() {
-        SignerError::RemoteApiError(_) => {}
+        SignerError::RemoteApiError { .. } => {}
         other => panic!("Expected RemoteApiError, got: {:?}", other),
     }
 }

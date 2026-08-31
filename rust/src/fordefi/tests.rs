@@ -98,6 +98,7 @@ fn create_native_test_signer(base_url: &str, pubkey: Pubkey) -> FordefiNativeAut
         core: create_test_core(base_url, pubkey, test_request_signer()),
         chain: SolanaChainUniqueId::SolanaMainnet,
         fee: None,
+        pending_transaction_id: None,
     }
 }
 
@@ -554,11 +555,16 @@ async fn test_fordefi_sign_transaction_poll_timeout() {
 
     let mut tx = create_test_transaction(&pubkey);
     let result = signer.sign_transaction(&mut tx).await;
-    assert!(result.is_err());
-    assert!(matches!(
-        result.unwrap_err(),
-        SignerError::RemoteApiError(_)
-    ));
+    match result.unwrap_err() {
+        SignerError::RemoteApiError { provider_tx_id, .. } => {
+            assert_eq!(
+                provider_tx_id.as_deref(),
+                Some("tx-pending"),
+                "giving up waiting still leaves a request Fordefi may sign later"
+            );
+        }
+        other => panic!("Expected RemoteApiError, got: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -581,7 +587,7 @@ async fn test_fordefi_submit_unauthorized() {
     let result = signer.sign_transaction(&mut tx).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(matches!(err, SignerError::RemoteApiError(_)));
+    assert!(matches!(err, SignerError::RemoteApiError { .. }));
     assert_eq!(err.to_string(), "Remote API error");
 }
 
@@ -775,7 +781,13 @@ async fn test_fordefi_native_sign_transaction_success() {
     let wire_bytes = build_mock_wire_transaction(&keypair, &message_data);
     let wire_b64 = STANDARD.encode(&wire_bytes);
 
-    let expected_idempotence_id = idempotency_key_from_message(&message_data);
+    let mut namespaced = format!(
+        "fordefi:solana:auto:{}:test-vault-id::",
+        SolanaChainUniqueId::SolanaMainnet.as_str()
+    )
+    .into_bytes();
+    namespaced.extend_from_slice(&message_data);
+    let expected_idempotence_id = idempotency_key_from_message(&namespaced);
     Mock::given(method("POST"))
         .and(path("/api/v1/transactions"))
         .and(header("Authorization", "Bearer test-token"))
@@ -854,6 +866,44 @@ async fn test_fordefi_native_sign_transaction_missing_raw_transaction() {
 }
 
 #[tokio::test]
+async fn test_a_cancelled_native_send_leaves_the_transaction_id_in_the_pending_slot() {
+    let mock_server = MockServer::start().await;
+    let keypair = create_test_keypair();
+    let pubkey = keypair_pubkey(&keypair);
+    let pending = PendingTransactionId::new();
+    let signer = create_native_test_signer(&mock_server.uri(), pubkey)
+        .with_pending_transaction_id(pending.clone());
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/transactions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "id": "native-tx-accepted" })),
+        )
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/transactions/native-tx-accepted"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(30))
+                .set_body_json(serde_json::json!({ "state": "pending" })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let tx = create_test_transaction(&pubkey);
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        signer.sign_and_send_transaction(&tx),
+    )
+    .await;
+
+    assert!(cancelled.is_err(), "the poll should still be in flight");
+    assert_eq!(pending.get(), Some("native-tx-accepted".to_string()));
+}
+
+#[tokio::test]
 async fn test_native_submit_server_error_is_unconfirmed_without_a_transaction_id() {
     let mock_server = MockServer::start().await;
     let pubkey = keypair_pubkey(&create_test_keypair());
@@ -874,6 +924,29 @@ async fn test_native_submit_server_error_is_unconfirmed_without_a_transaction_id
         } => {
             assert_eq!(provider_tx_id, None);
             assert_eq!(provider_status, Some(502));
+        }
+        other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_native_submit_server_error_keeps_a_transaction_id_from_the_body() {
+    let mock_server = MockServer::start().await;
+    let pubkey = keypair_pubkey(&create_test_keypair());
+    let signer = create_native_test_signer(&mock_server.uri(), pubkey);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/transactions"))
+        .respond_with(
+            ResponseTemplate::new(502).set_body_json(serde_json::json!({ "id": "tx-accepted" })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let tx = create_test_transaction(&pubkey);
+    match signer.sign_and_send_transaction(&tx).await.unwrap_err() {
+        SignerError::BroadcastUnconfirmed { provider_tx_id, .. } => {
+            assert_eq!(provider_tx_id.as_deref(), Some("tx-accepted"));
         }
         other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
     }
@@ -903,6 +976,75 @@ async fn test_native_submit_accepted_without_an_id_is_unconfirmed() {
 }
 
 #[tokio::test]
+async fn test_native_submit_accepted_with_an_empty_id_is_unconfirmed() {
+    let mock_server = MockServer::start().await;
+    let pubkey = keypair_pubkey(&create_test_keypair());
+    let signer = create_native_test_signer(&mock_server.uri(), pubkey);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": "" })))
+        .mount(&mock_server)
+        .await;
+
+    let tx = create_test_transaction(&pubkey);
+    match signer.sign_and_send_transaction(&tx).await.unwrap_err() {
+        SignerError::BroadcastUnconfirmed { provider_tx_id, .. } => {
+            assert_eq!(provider_tx_id, None);
+        }
+        other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_native_submit_accepted_with_a_whitespace_id_is_unconfirmed() {
+    let mock_server = MockServer::start().await;
+    let pubkey = keypair_pubkey(&create_test_keypair());
+    let signer = create_native_test_signer(&mock_server.uri(), pubkey);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": " \t" })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let tx = create_test_transaction(&pubkey);
+    match signer.sign_and_send_transaction(&tx).await.unwrap_err() {
+        SignerError::BroadcastUnconfirmed { provider_tx_id, .. } => {
+            assert_eq!(provider_tx_id, None);
+        }
+        other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_native_submit_timed_out_while_processing_is_unconfirmed() {
+    let mock_server = MockServer::start().await;
+    let pubkey = keypair_pubkey(&create_test_keypair());
+    let signer = create_native_test_signer(&mock_server.uri(), pubkey);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/transactions"))
+        .respond_with(ResponseTemplate::new(408))
+        .mount(&mock_server)
+        .await;
+
+    let tx = create_test_transaction(&pubkey);
+    match signer.sign_and_send_transaction(&tx).await.unwrap_err() {
+        SignerError::BroadcastUnconfirmed {
+            provider_tx_id,
+            provider_status,
+            ..
+        } => {
+            assert_eq!(provider_tx_id, None);
+            assert_eq!(provider_status, Some(408));
+        }
+        other => panic!("Expected BroadcastUnconfirmed, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_native_submit_rejected_by_fordefi_stays_a_plain_failure() {
     let mock_server = MockServer::start().await;
     let pubkey = keypair_pubkey(&create_test_keypair());
@@ -916,7 +1058,7 @@ async fn test_native_submit_rejected_by_fordefi_stays_a_plain_failure() {
 
     let tx = create_test_transaction(&pubkey);
     match signer.sign_and_send_transaction(&tx).await.unwrap_err() {
-        SignerError::RemoteApiError(_) => {}
+        SignerError::RemoteApiError { .. } => {}
         other => panic!("Expected RemoteApiError, got: {other:?}"),
     }
 }
@@ -936,7 +1078,7 @@ async fn test_black_box_submit_server_error_is_not_reported_as_unconfirmed() {
 
     let mut tx = create_test_transaction(&pubkey);
     match signer.sign_transaction(&mut tx).await.unwrap_err() {
-        SignerError::RemoteApiError(_) => {}
+        SignerError::RemoteApiError { .. } => {}
         other => panic!("Expected RemoteApiError, got: {other:?}"),
     }
 }
@@ -1327,8 +1469,80 @@ async fn test_fordefi_manual_replaces_the_callers_transaction() {
     );
 }
 
+#[test]
+fn test_canonical_fee_separates_every_fee_shape() {
+    let rendered = [
+        canonical_fee(None),
+        canonical_fee(Some(&FordefiSolanaFee::Priority {
+            priority_level: FordefiPriorityLevel::Low,
+        })),
+        canonical_fee(Some(&FordefiSolanaFee::Priority {
+            priority_level: FordefiPriorityLevel::Medium,
+        })),
+        canonical_fee(Some(&FordefiSolanaFee::Priority {
+            priority_level: FordefiPriorityLevel::High,
+        })),
+        canonical_fee(Some(&FordefiSolanaFee::Custom {
+            unit_price: Some("10".to_string()),
+            priority_fee: None,
+        })),
+        canonical_fee(Some(&FordefiSolanaFee::Custom {
+            unit_price: None,
+            priority_fee: Some("10".to_string()),
+        })),
+    ];
+    let unique: std::collections::HashSet<&String> = rendered.iter().collect();
+    assert_eq!(
+        unique.len(),
+        rendered.len(),
+        "every fee shape must render distinctly: {rendered:?}"
+    );
+}
+
 /// The idempotency key is namespaced so the same bytes cannot collide with an
 /// auto create that did broadcast them.
+#[tokio::test]
+async fn test_fordefi_manual_poll_timeout_carries_the_transaction_id() {
+    let mock_server = MockServer::start().await;
+    let keypair = create_test_keypair();
+    let pubkey = keypair_pubkey(&keypair);
+    let signer = create_manual_test_signer(&mock_server.uri(), pubkey);
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "manual-tx-slow"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/transactions/manual-tx-slow"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "pending_signature"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut tx = create_test_transaction(&pubkey);
+    match signer
+        .modify_and_sign_transaction(&mut tx)
+        .await
+        .unwrap_err()
+    {
+        SignerError::RemoteApiError { provider_tx_id, .. } => {
+            assert_eq!(
+                provider_tx_id.as_deref(),
+                Some("manual-tx-slow"),
+                "manual mode broadcasts nothing, so the id is the only handle on \
+                 a request that may still be signed"
+            );
+        }
+        other => panic!("Expected RemoteApiError, got: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_fordefi_manual_namespaces_the_idempotency_key() {
     let mock_server = MockServer::start().await;
@@ -1340,7 +1554,7 @@ async fn test_fordefi_manual_namespaces_the_idempotency_key() {
     let message_data = tx.message.serialize();
     let auto_key = idempotency_key_from_message(&message_data);
     let mut namespaced = format!(
-        "fordefi:solana:manual:{}:test-vault-id:",
+        "fordefi:solana:manual:{}:test-vault-id::",
         SolanaChainUniqueId::SolanaMainnet.as_str()
     )
     .into_bytes();
@@ -1388,25 +1602,65 @@ async fn test_fordefi_manual_rejects_a_transaction_it_does_not_pay_for() {
     assert!(matches!(error, SignerError::SigningFailed(_)));
 }
 
-/// Fordefi may only rewrite a message nobody has signed yet.
 #[tokio::test]
-async fn test_fordefi_manual_rejects_an_already_signed_transaction() {
+async fn test_fordefi_auto_rejects_an_already_signed_transaction() {
     let keypair = create_test_keypair();
     let pubkey = keypair_pubkey(&keypair);
-    let signer = create_manual_test_signer("https://api.test.fordefi.com", pubkey);
+    let signer = create_native_test_signer("https://api.test.fordefi.com", pubkey);
     let mut tx = create_test_transaction(&pubkey);
-    add_required_signer(&mut tx, Pubkey::new_unique());
-    tx.signatures = vec![
-        keypair.sign_message(&tx.message.serialize()),
-        Signature::default(),
-    ];
+    tx.signatures = vec![keypair.sign_message(&tx.message.serialize())];
 
     let error = signer
-        .modify_and_sign_transaction(&mut tx)
+        .sign_and_send_transaction(&tx)
         .await
-        .expect_err("manual signing must run first");
+        .expect_err("auto-broadcast must not re-sign bytes the vault already signed");
 
     assert!(matches!(error, SignerError::SigningFailed(_)));
+}
+
+#[tokio::test]
+async fn test_fordefi_manual_accepts_an_already_signed_transaction() {
+    let mock_server = MockServer::start().await;
+    let keypair = create_test_keypair();
+    let pubkey = keypair_pubkey(&keypair);
+    let signer = create_manual_test_signer(&mock_server.uri(), pubkey);
+
+    let mut tx = create_test_transaction(&pubkey);
+    let stale_signature = keypair.sign_message(&tx.message.serialize());
+    tx.signatures = vec![stale_signature];
+    let rewritten = create_test_transaction(&pubkey);
+    let rewritten_message = rewritten.message.serialize();
+    let wire_b64 = STANDARD.encode(build_mock_wire_transaction(&keypair, &rewritten_message));
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "manual-tx-signed"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/transactions/manual-tx-signed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "signed",
+            "raw_transaction": wire_b64
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    signer
+        .modify_and_sign_transaction(&mut tx)
+        .await
+        .expect("manual signing should accept a transaction others have signed");
+
+    assert_eq!(tx.message.serialize(), rewritten_message);
+    assert!(
+        !tx.signatures.contains(&stale_signature),
+        "the void signature must not survive the rewrite"
+    );
 }
 
 /// The one thing manual mode does check: the signature has to cover the message

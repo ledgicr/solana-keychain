@@ -64,8 +64,6 @@ By default the signer uses Fireblocks **RAW signing**: it signs the message byte
 
 With `useProgramCall: true`, transactions are signed with the **PROGRAM_CALL** operation instead, sent with `signOnly: true` and `useDurableNonce: false` so Fireblocks signs the submitted transaction without broadcasting it and without rewriting the message. The returned signature is verified against the vault address over the local message bytes before it is used, and you still broadcast yourself. `signMessages()` always uses RAW, since PROGRAM_CALL only accepts serialized transactions.
 
-PROGRAM_CALL accepts legacy and v0 messages only, requires a hot wallet, and must be enabled for your workspace by Fireblocks. If Fireblocks broadcasts anyway (a workspace that ignores `signOnly`), signing rejects with `BROADCAST_UNCONFIRMED` carrying the provider transaction id rather than reporting a plain failure.
-
 ### With Devnet
 
 ```typescript
@@ -90,7 +88,7 @@ const signer = await createFireblocksSigner({
 | `assetId`         | `string`  | No       | `SOL`                       | Asset ID (`SOL` for mainnet, `SOL_TEST` for devnet)                                                                                                                                                        |
 | `pollIntervalMs`  | `number`  | No       | `1000`                      | Polling interval in ms when waiting for transaction completion                                                                                                                                             |
 | `maxPollAttempts` | `number`  | No       | `60`                        | Maximum polling attempts before timeout                                                                                                                                                                    |
-| `requestDelayMs`  | `number`  | No       | `0`                         | Delay in ms between concurrent signing requests                                                                                                                                                            |
+| `requestDelayMs`  | `number`  | No       | `0`                         | Delay in ms between signing requests (a gap between items in `useProgramCall` mode, which batches sequentially)                                                                                                                                                            |
 | `useProgramCall`  | `boolean` | No       | `false`                     | Sign transactions with PROGRAM_CALL (`signOnly`) instead of RAW — see [Signing Mode](#signing-mode)                                                                                                        |
 
 ## How It Works

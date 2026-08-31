@@ -148,7 +148,7 @@ class UtilaSigner<TAddress extends string = string> implements SolanaTransaction
         }
 
         const vaultId = trimResourcePrefix(config.vaultId, 'vaults/');
-        const walletId = trimWalletId(config.walletId);
+        const walletId = trimWalletId(config.walletId, vaultId);
         const designatedSigners = config.designatedSigners ?? [`users/${config.serviceAccountEmail}`];
         const wallet = await fetchWallet({
             apiBaseUrl,
@@ -452,8 +452,18 @@ function trimResourcePrefix(value: string, prefix: string): string {
     return value.startsWith(prefix) ? value.slice(prefix.length) : value;
 }
 
-function trimWalletId(value: string): string {
+/** Extracts a wallet id and rejects resources from another vault. */
+function trimWalletId(value: string, vaultId: string): string {
     const marker = '/wallets/';
     const markerIndex = value.lastIndexOf(marker);
-    return markerIndex === -1 ? value : value.slice(markerIndex + marker.length);
+    if (markerIndex === -1) {
+        return value;
+    }
+    const walletId = value.slice(markerIndex + marker.length);
+    if (value.slice(0, markerIndex) !== `vaults/${vaultId}` || walletId.includes('/')) {
+        throwSignerError(SignerErrorCode.CONFIG_ERROR, {
+            message: 'walletId resource name must belong to the configured vaultId',
+        });
+    }
+    return walletId;
 }

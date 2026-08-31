@@ -1,4 +1,4 @@
-import { getBase58Decoder } from '@solana/codecs-strings';
+import { getBase58Decoder, getUtf8Encoder } from '@solana/codecs-strings';
 import {
     address,
     appendTransactionMessageInstruction,
@@ -12,7 +12,13 @@ import {
 } from '@solana/kit';
 import { generateKeyPairSigner } from '@solana/signers';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { assertIsSolanaTransactionSigner, assertSignatureValid } from '@solana/keychain-core';
+import {
+    assertIsSolanaTransactionSigner,
+    assertSignatureValid,
+    idempotencyKeyFromMessage,
+    SignerError,
+    SignerErrorCode,
+} from '@solana/keychain-core';
 
 import { createFireblocksSigner } from '../fireblocks-signer.js';
 import { TEST_API_KEY, TEST_RSA_PRIVATE_KEY, TEST_VAULT_ACCOUNT_ID } from './setup.js';
@@ -675,6 +681,25 @@ describe('createFireblocksSigner', () => {
             expect(result[0]).toHaveProperty(signer.address);
         });
 
+        it('carries a message-derived externalTxId on the create', async () => {
+            const { signer, transaction } = await createProgramCallSigner();
+            mockCreateAndPoll({
+                id: 'tx-789',
+                signedMessages: [{ signature: { fullSig: '42'.repeat(64) } }],
+                status: 'SIGNED',
+            });
+
+            await signer.signTransactions([transaction]);
+
+            const namespace = getUtf8Encoder().encode(`fireblocks:solana:program_call:SOL:${TEST_VAULT_ACCOUNT_ID}:`);
+            const messageBytes = new Uint8Array(transaction.messageBytes);
+            const namespaced = new Uint8Array(namespace.length + messageBytes.length);
+            namespaced.set(namespace);
+            namespaced.set(messageBytes, namespace.length);
+            const createBody = JSON.parse(mockFetch.mock.calls[1]![1].body as string);
+            expect(createBody.externalTxId).toBe(await idempotencyKeyFromMessage(namespaced));
+        });
+
         it('accepts the signature carried as txHash', async () => {
             const { signer, transaction } = await createProgramCallSigner();
             const signatureBytes = new Uint8Array(64).fill(7);
@@ -718,6 +743,151 @@ describe('createFireblocksSigner', () => {
             await expect(signer.signTransactions([transaction])).rejects.toMatchObject({
                 code: 'SIGNER_BROADCAST_UNCONFIRMED',
             });
+        });
+
+        it('keeps the transaction id when the poll itself fails', async () => {
+            const { signer, transaction } = await createProgramCallSigner();
+            mockFetch.mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({ id: 'tx-789', status: 'SUBMITTED' }),
+            });
+            mockFetch.mockResolvedValueOnce({
+                ok: false,
+                status: 503,
+                text: async () => 'upstream unavailable',
+            });
+
+            await expect(signer.signTransactions([transaction])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: { providerTransactionId: 'tx-789' },
+            });
+        });
+
+        it('keeps the transaction id when the attempt budget runs out', async () => {
+            const keyPair = await generateKeyPairSigner();
+            mockFetch.mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({ addresses: [{ address: keyPair.address }] }),
+            });
+            const signer = await createFireblocksSigner({
+                apiKey: TEST_API_KEY,
+                maxPollAttempts: 2,
+                pollIntervalMs: 1,
+                privateKeyPem: TEST_RSA_PRIVATE_KEY,
+                useProgramCall: true,
+                vaultAccountId: TEST_VAULT_ACCOUNT_ID,
+            });
+            const { transaction } = await createProgramCallSigner();
+            mockFetch.mockImplementation(() =>
+                Promise.resolve({ json: async () => ({ id: 'tx-789', status: 'SUBMITTED' }), ok: true }),
+            );
+
+            await expect(signer.signTransactions([transaction])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: { providerTransactionId: 'tx-789' },
+            });
+        });
+
+        it('reports a 5xx create as BROADCAST_UNCONFIRMED', async () => {
+            const { signer, transaction } = await createProgramCallSigner();
+            mockFetch.mockResolvedValueOnce({
+                ok: false,
+                status: 503,
+                text: async () => 'upstream unavailable',
+            });
+
+            await expect(signer.signTransactions([transaction])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+            });
+        });
+
+        it('treats a status-bearing caller abort during create as unconfirmed', async () => {
+            const { signer, transaction } = await createProgramCallSigner();
+            const controller = new AbortController();
+            const reason = new SignerError(SignerErrorCode.REMOTE_API_ERROR, { status: 400 });
+            mockFetch.mockImplementationOnce(async (_input, init) => {
+                controller.abort(reason);
+                expect(init?.signal?.aborted).toBe(true);
+                throw new Error('aborted');
+            });
+
+            const error = await signer.signTransactions([transaction], { abortSignal: controller.signal }).then(
+                () => {
+                    throw new Error('expected the create failure to be reported');
+                },
+                (thrown: SignerError) => thrown,
+            );
+
+            const createBody = JSON.parse(mockFetch.mock.calls[1]![1].body as string);
+            expect(error.code).toBe(SignerErrorCode.BROADCAST_UNCONFIRMED);
+            expect(error.context?.cause).toBe(reason);
+            expect(error.context?.status).toBeUndefined();
+            expect(error.context?.idempotencyKey).toBe(createBody.externalTxId);
+        });
+
+        it('keeps a transaction id named in a failed create body', async () => {
+            const { signer, transaction } = await createProgramCallSigner();
+            mockFetch.mockResolvedValueOnce({
+                ok: false,
+                status: 503,
+                text: async () => JSON.stringify({ id: 'tx-accepted' }),
+            });
+
+            await expect(signer.signTransactions([transaction])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+                context: { providerTransactionId: 'tx-accepted' },
+            });
+        });
+
+        it('keeps a 4xx create a plain rejection', async () => {
+            const { signer, transaction } = await createProgramCallSigner();
+            mockFetch.mockResolvedValueOnce({
+                ok: false,
+                status: 400,
+                text: async () => 'bad request',
+            });
+
+            await expect(signer.signTransactions([transaction])).rejects.toMatchObject({
+                code: 'SIGNER_REMOTE_API_ERROR',
+            });
+        });
+
+        it('reports an accepted create with no transaction id as BROADCAST_UNCONFIRMED', async () => {
+            const { signer, transaction } = await createProgramCallSigner();
+            mockFetch.mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({ status: 'SUBMITTED' }),
+            });
+
+            await expect(signer.signTransactions([transaction])).rejects.toMatchObject({
+                code: 'SIGNER_BROADCAST_UNCONFIRMED',
+            });
+        });
+
+        it('stops a PROGRAM_CALL batch at the first failure and reports what completed', async () => {
+            const { signer, transaction } = await createProgramCallSigner();
+            mockCreateAndPoll({
+                id: 'tx-789',
+                signedMessages: [{ signature: { fullSig: '42'.repeat(64) } }],
+                status: 'SIGNED',
+            });
+            mockFetch.mockResolvedValueOnce({
+                ok: false,
+                status: 503,
+                text: async () => 'unavailable',
+            });
+
+            const error = await signer.signTransactions([transaction, transaction, transaction]).then(
+                () => {
+                    throw new Error('expected the failing create to reject');
+                },
+                (thrown: SignerError) => thrown,
+            );
+
+            expect(error.code).toBe('SIGNER_BROADCAST_UNCONFIRMED');
+            expect(error.context?.failedIndex).toBe(1);
+            expect(error.context?.completedSignatures).toHaveLength(1);
+            expect(mockFetch.mock.calls).toHaveLength(4);
         });
 
         it('rejects a v1 message before any PROGRAM_CALL is created', async () => {

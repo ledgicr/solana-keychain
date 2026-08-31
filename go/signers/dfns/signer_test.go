@@ -218,6 +218,31 @@ func TestNewSuccess(t *testing.T) {
 	}
 }
 
+func TestNewKeepsWalletIDInOnePathSegment(t *testing.T) {
+	for _, tc := range []struct{ walletID, wantPath string }{
+		{"wa-scope/../wa-target", "/wallets/wa-scope%2F..%2Fwa-target"},
+		{"wa-scope?draft#frag", "/wallets/wa-scope%3Fdraft%23frag"},
+	} {
+		t.Run(tc.walletID, func(t *testing.T) {
+			var gotPath string
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.EscapedPath()
+				walletHandler(testPubkeyHex)(w, r)
+			}))
+			defer srv.Close()
+
+			config := testConfig(srv)
+			config.WalletID = tc.walletID
+			if _, err := New(context.Background(), config); err != nil {
+				t.Fatal(err)
+			}
+			if gotPath != tc.wantPath {
+				t.Errorf("path = %s, want %s", gotPath, tc.wantPath)
+			}
+		})
+	}
+}
+
 // TestNewAPIError checks that a non-2xx wallet response fails New with a
 // REMOTE_API_ERROR.
 func TestNewAPIError(t *testing.T) {

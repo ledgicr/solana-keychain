@@ -15,7 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::SignerError;
 use crate::http_client_config::HttpClientConfig;
 use crate::remote_util::{
-    extract_api_error, parse_json_response, poll_until, read_body_capped, PollOutcome,
+    extract_api_error_with_transaction_id, parse_json_response, poll_until, read_body_capped,
+    transaction_id_in_body, PollOutcome,
 };
 use crate::sdk_adapter::{Pubkey, Signature, VersionedTransaction};
 use crate::signature_util::{extract_and_verify_rewritten_transaction, signature_from_base64};
@@ -24,7 +25,8 @@ use crate::traits::{
     TransactionSigner,
 };
 use crate::transaction_util::{
-    idempotency_key_from_message, unconfirmed_unless_rejected, TransactionUtil,
+    idempotency_key_from_message, unconfirmed_unless_rejected, PendingTransactionId,
+    TransactionUtil,
 };
 pub use request_signer::{FordefiRequestSigner, PemRequestSigner};
 use types::{
@@ -38,6 +40,28 @@ const DEFAULT_BASE_URL: &str = "https://api.fordefi.com";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
 const DEFAULT_MAX_POLL_ATTEMPTS: u32 = 50;
 const AVAILABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn canonical_fee(fee: Option<&FordefiSolanaFee>) -> String {
+    match fee {
+        None => String::new(),
+        Some(FordefiSolanaFee::Custom {
+            unit_price,
+            priority_fee,
+        }) => format!(
+            "custom||{}|{}",
+            unit_price.as_deref().unwrap_or_default(),
+            priority_fee.as_deref().unwrap_or_default()
+        ),
+        Some(FordefiSolanaFee::Priority { priority_level }) => {
+            let level = match priority_level {
+                FordefiPriorityLevel::Low => "low",
+                FordefiPriorityLevel::Medium => "medium",
+                FordefiPriorityLevel::High => "high",
+            };
+            format!("priority|{level}||")
+        }
+    }
+}
 
 /// Configuration for creating a Fordefi signer.
 ///
@@ -244,9 +268,9 @@ impl FordefiCore {
         if let Some(id) = idempotence_id {
             builder = builder.header("x-idempotence-id", id);
         }
-        let classify = |status: Option<u16>, error: SignerError| {
+        let classify = |status: Option<u16>, provider_tx_id: Option<String>, error: SignerError| {
             if broadcast_managed {
-                unconfirmed_unless_rejected(status, error)
+                unconfirmed_unless_rejected(status, provider_tx_id, idempotence_id, error)
             } else {
                 error
             }
@@ -256,19 +280,32 @@ impl FordefiCore {
             .body(body)
             .send()
             .await
-            .map_err(|error| classify(None, error.into()))?;
+            .map_err(|error| classify(None, None, error.into()))?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
-            let error = extract_api_error(response, "Fordefi API submit_request").await;
-            return Err(classify(Some(status), error));
+            let (error, provider_tx_id) =
+                extract_api_error_with_transaction_id(response, "Fordefi API submit_request").await;
+            return Err(classify(Some(status), provider_tx_id, error));
         }
 
         let body = read_body_capped(response)
             .await
-            .map_err(|error| classify(Some(status), error))?;
-        let create_response: CreateTransactionResponse =
-            serde_json::from_slice(&body).map_err(|error| classify(Some(status), error.into()))?;
+            .map_err(|error| classify(Some(status), None, error))?;
+        // The submit may have been accepted even when the body is otherwise
+        // unusable, so an id present there is the caller's recovery handle.
+        let provider_tx_id = transaction_id_in_body(&body);
+        let create_response: CreateTransactionResponse = serde_json::from_slice(&body)
+            .map_err(|error| classify(Some(status), provider_tx_id.clone(), error.into()))?;
+        if create_response.id.trim().is_empty() {
+            return Err(classify(
+                Some(status),
+                provider_tx_id,
+                SignerError::SerializationError(
+                    "Fordefi API submit_request returned no transaction id".to_string(),
+                ),
+            ));
+        }
         Ok(create_response.id)
     }
 
@@ -306,11 +343,9 @@ impl FordefiCore {
         poll_until(
             self.max_poll_attempts,
             self.poll_interval_ms,
-            || {
-                SignerError::RemoteApiError(format!(
-                    "Polling timeout after {} attempts",
-                    self.max_poll_attempts
-                ))
+            || SignerError::RemoteApiError {
+                detail: format!("Polling timeout after {} attempts", self.max_poll_attempts),
+                provider_tx_id: Some(tx_id.to_string()),
             },
             || async {
                 let response = self
@@ -385,9 +420,9 @@ impl FordefiCore {
     ///
     /// The create carries an `x-idempotence-id` derived from the message bytes,
     /// so replaying these exact bytes cannot create a second transaction; a
-    /// rebuilt transaction derives a different id. The manual-mode key is
-    /// namespaced so the same bytes submitted for signing cannot collide with an
-    /// earlier auto create that did broadcast them.
+    /// rebuilt transaction derives a different id. The key is namespaced by push
+    /// mode, chain, vault and fee, so the same bytes submitted under any of them
+    /// cannot collide with a create that carried different terms.
     async fn submit_solana_transaction(
         &self,
         chain: &SolanaChainUniqueId,
@@ -409,19 +444,20 @@ impl FordefiCore {
             },
         };
 
-        let idempotency_key = match push_mode {
-            FordefiPushMode::Auto => idempotency_key_from_message(data_bytes),
-            FordefiPushMode::Manual => {
-                let mut namespaced = format!(
-                    "fordefi:solana:manual:{}:{}:",
-                    chain.as_str(),
-                    self.vault_id
-                )
-                .into_bytes();
-                namespaced.extend_from_slice(data_bytes);
-                idempotency_key_from_message(&namespaced)
-            }
+        let mode = match push_mode {
+            FordefiPushMode::Auto => "auto",
+            FordefiPushMode::Manual => "manual",
         };
+        let mut namespaced = format!(
+            "fordefi:solana:{}:{}:{}:{}:",
+            mode,
+            chain.as_str(),
+            self.vault_id,
+            canonical_fee(fee)
+        )
+        .into_bytes();
+        namespaced.extend_from_slice(data_bytes);
+        let idempotency_key = idempotency_key_from_message(&namespaced);
 
         self.submit_request(
             &request,
@@ -608,6 +644,7 @@ pub struct FordefiNativeAutoSigner {
     core: FordefiCore,
     chain: SolanaChainUniqueId,
     fee: Option<FordefiSolanaFee>,
+    pending_transaction_id: Option<PendingTransactionId>,
 }
 
 impl std::fmt::Debug for FordefiNativeAutoSigner {
@@ -645,7 +682,14 @@ impl FordefiNativeAutoSigner {
             core: FordefiCore::build(&config)?,
             chain,
             fee: config.fee,
+            pending_transaction_id: None,
         })
+    }
+
+    /// Registers a slot for the provider id when cancellation prevents returning it.
+    pub fn with_pending_transaction_id(mut self, pending: PendingTransactionId) -> Self {
+        self.pending_transaction_id = Some(pending);
+        self
     }
 
     /// Sign and broadcast via the native Solana path: submit → poll → parse wire tx.
@@ -661,6 +705,10 @@ impl FordefiNativeAutoSigner {
     /// Each native create carries an `x-idempotence-id` derived from the message
     /// bytes, so replaying these exact bytes cannot create a second transaction; a
     /// rebuilt transaction derives a different id and is broadcast again.
+    ///
+    /// Cancelling this future returns nothing at all, so an accepted transaction
+    /// id reaches the caller only through
+    /// [`with_pending_transaction_id`](Self::with_pending_transaction_id).
     async fn sign_and_broadcast(
         &self,
         transaction: &VersionedTransaction,
@@ -681,13 +729,24 @@ impl FordefiNativeAutoSigner {
         // this client cannot rule out. Report those as BroadcastUnconfirmed
         // carrying the Fordefi transaction id instead of a generic error a
         // caller might blindly retry into a duplicate spend.
-        self.finish_broadcast(&tx_id)
-            .await
-            .map_err(|error| SignerError::BroadcastUnconfirmed {
+        // Cancelling this future runs no further code, so the registered slot is
+        // the only way the accepted id reaches the caller in that case.
+        if let Some(pending) = &self.pending_transaction_id {
+            pending.set(&tx_id);
+        }
+        let result = self.finish_broadcast(&tx_id).await.map_err(|error| {
+            SignerError::BroadcastUnconfirmed {
                 provider_tx_id: Some(tx_id),
                 provider_status: None,
+                idempotency_key: None,
+                transaction_signature: None,
                 detail: error.detail_string(),
-            })
+            }
+        });
+        if let Some(pending) = &self.pending_transaction_id {
+            pending.clear();
+        }
+        result
     }
 
     async fn finish_broadcast(&self, tx_id: &str) -> Result<Signature, SignerError> {
@@ -701,6 +760,7 @@ impl FordefiNativeAutoSigner {
     /// Native auto-broadcast currently submits message bytes only. Transactions
     /// with additional required signers would also need their partial signatures
     /// forwarded through Fordefi's `details.signatures` request field.
+    ///
     fn validate_transaction(&self, transaction: &VersionedTransaction) -> Result<(), SignerError> {
         let required_signatures = transaction.message.header().num_required_signatures as usize;
         if required_signatures != 1
@@ -708,6 +768,16 @@ impl FordefiNativeAutoSigner {
         {
             return Err(SignerError::SigningFailed(
                 "Fordefi native auto-broadcast currently supports only transactions whose sole required signer is the configured vault"
+                    .to_string(),
+            ));
+        }
+        if transaction
+            .signatures
+            .iter()
+            .any(|signature| *signature != Signature::default())
+        {
+            return Err(SignerError::SigningFailed(
+                "Fordefi native auto-broadcast must run before any transaction signatures are applied"
                     .to_string(),
             ));
         }
@@ -755,7 +825,9 @@ impl SendingSigner for FordefiNativeAutoSigner {
 /// with the one the returned signature covers; the rewrite itself is not diffed,
 /// so inspect the result before broadcasting.
 ///
-/// Fordefi must be the fee payer and must sign before every downstream signer.
+/// Fordefi must be the fee payer, and it must sign before every downstream
+/// signer: a transaction that already carries signatures is accepted, but the
+/// rewrite voids them and the returned transaction carries only Fordefi's.
 pub struct FordefiNativeManualSigner {
     core: FordefiCore,
     chain: SolanaChainUniqueId,
@@ -829,22 +901,11 @@ impl FordefiNativeManualSigner {
         Ok((encoded, signature))
     }
 
-    /// Fordefi may only rewrite a message no one has signed yet, and it only
-    /// rewrites one it pays for.
+    /// Fordefi only rewrites a message it pays for.
     fn validate_transaction(&self, transaction: &VersionedTransaction) -> Result<(), SignerError> {
         if transaction.message.static_account_keys().first() != Some(&self.core.public_key) {
             return Err(SignerError::SigningFailed(
                 "Fordefi native manual signing requires the configured vault to be the transaction fee payer"
-                    .to_string(),
-            ));
-        }
-        if transaction
-            .signatures
-            .iter()
-            .any(|signature| *signature != Signature::default())
-        {
-            return Err(SignerError::SigningFailed(
-                "Fordefi native manual signing must run before any transaction signatures are applied"
                     .to_string(),
             ));
         }

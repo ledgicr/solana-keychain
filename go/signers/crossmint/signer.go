@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -139,10 +140,11 @@ func (s *Signer) SignMessage(_ context.Context, _ []byte) (solana.Signature, err
 //
 // Not retry-safe: any failure after the create is accepted returns
 // CodeBroadcastUnconfirmed carrying the Crossmint transaction id; check that
-// transaction with Crossmint before retrying. A create that fails without a
-// usable response returns CodeBroadcastUnconfirmed with no transaction id.
+// transaction with Crossmint before retrying. A create whose response carries no
+// readable transaction id returns CodeBroadcastUnconfirmed with no transaction id.
 //
-// Each create carries an x-idempotency-key derived from the message bytes, so
+// Each create carries an x-idempotency-key derived from the message bytes and
+// the signer locator, so
 // replaying these exact bytes cannot create a second transaction; a rebuilt
 // transaction derives a different key and executes as a new transfer.
 func (s *Signer) SignAndSendTransaction(ctx context.Context, tx *solana.Transaction) (solana.Signature, error) {
@@ -159,7 +161,8 @@ func (s *Signer) SignAndSendTransaction(ctx context.Context, tx *solana.Transact
 		return solana.Signature{}, core.WrapSignerError(core.CodeSerializationError, "failed to serialize transaction", err)
 	}
 
-	createResponse, err := s.createTransaction(ctx, base58.Encode(serialized), core.IdempotencyKeyFromMessage(expectedMessage))
+	idempotencyKey := core.IdempotencyKeyFromMessage(s.namespacedKeyInput(expectedMessage))
+	createResponse, err := s.createTransaction(ctx, base58.Encode(serialized), idempotencyKey)
 	if err != nil {
 		return solana.Signature{}, err
 	}
@@ -172,9 +175,16 @@ func (s *Signer) SignAndSendTransaction(ctx context.Context, tx *solana.Transact
 		if errors.As(err, &se) {
 			detail = se.Detail()
 		}
-		return solana.Signature{}, core.NewBroadcastUnconfirmedError(createResponse.ID, detail)
+		unconfirmed := core.NewBroadcastUnconfirmedError(createResponse.ID, detail)
+		unconfirmed.IdempotencyKey = idempotencyKey
+		return solana.Signature{}, unconfirmed
 	}
 	return sig, nil
+}
+
+func (s *Signer) namespacedKeyInput(messageBytes []byte) []byte {
+	prefix := "crossmint:solana:" + strconv.Itoa(len(s.signerLocator)) + ":" + s.signerLocator + ":"
+	return append([]byte(prefix), messageBytes...)
 }
 
 // finishManagedTransaction polls a created transaction to a terminal status and
@@ -238,7 +248,7 @@ func (s *Signer) pollTransaction(ctx context.Context, response transactionRespon
 	case response.Status == "awaiting-approval" && !approvalSubmitted:
 		return transactionResponse{}, core.NewSignerError(core.CodeSigningFailed, awaitingApprovalDetail)
 	default:
-		return transactionResponse{}, core.PollTimeoutError("crossmint", s.maxPollAttempts)
+		return transactionResponse{}, core.PollTimeoutError("crossmint", s.maxPollAttempts, "")
 	}
 }
 
@@ -359,10 +369,6 @@ func (s *Signer) extractSignatureFromResponse(response transactionResponse, expe
 		"unable to extract signature from Crossmint transaction response")
 }
 
-// extractSignatureFromSerializedTransaction decodes the base58 onChain.transaction,
-// locates this wallet's required-signer position, and verifies the signature
-// against that transaction's own message bytes.
-//
 // Crossmint sponsors gas, so when it rewrites it becomes the fee payer and the
 // message it signs differs from the caller's. The decoded transaction is returned
 // with the signature so the caller is never handed it over its own message.
@@ -385,9 +391,23 @@ func (s *Signer) extractSignatureFromSerializedTransaction(serializedTransaction
 			"invalid account index: not enough account keys")
 	}
 
+	if len(signerKeys) == 0 {
+		return solana.Signature{}, nil, core.NewSignerError(core.CodeSigningFailed,
+			"Crossmint transaction carries no account keys")
+	}
 	if len(tx.Signatures) == 0 || tx.Signatures[0].IsZero() {
 		return solana.Signature{}, nil, core.NewSignerError(core.CodeSigningFailed,
 			"Crossmint transaction carries no signer signature")
+	}
+
+	returnedMessage, err := tx.Message.MarshalBinary()
+	if err != nil {
+		return solana.Signature{}, nil, core.WrapSignerError(core.CodeSerializationError,
+			"failed to serialize Crossmint returned message", err)
+	}
+	if !core.VerifyEd25519(signerKeys[0], returnedMessage, tx.Signatures[0]) {
+		return solana.Signature{}, nil, core.NewSignerError(core.CodeSigningFailed,
+			"Crossmint fee-payer signature does not verify against the returned message")
 	}
 	return tx.Signatures[0], tx, nil
 }

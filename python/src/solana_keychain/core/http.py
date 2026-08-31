@@ -85,10 +85,12 @@ async def probe_availability(probe: Callable[[], Awaitable[bool]]) -> bool:
 
 
 def provider_may_have_accepted(status_code: int | None) -> bool:
-    """A 4xx is the only create outcome that rules out a transaction; anything else
-    (no response, timeout, 5xx, unusable success body) may already be executing.
+    """A 4xx other than 408 is the only create outcome that rules out a transaction;
+    anything else (no response, timeout, 5xx, unusable success body) may already be
+    executing. A 408 is a timeout reached while the request was being processed, so it
+    does not rule the transaction out either.
     """
-    return status_code is None or not 400 <= status_code < 500
+    return status_code is None or status_code == 408 or not 400 <= status_code < 500
 
 
 async def fetch_signer_json(
@@ -179,14 +181,28 @@ async def _request_json(
                 SignerErrorCode.HTTP_ERROR, f"{provider_name} response was a redirect"
             )
         body = await _read_bounded_body(response, provider_name)
-    finally:
+    except BaseException:
+        try:
+            await response.aclose()
+        except BaseException:
+            pass
+        raise
+    try:
         await response.aclose()
+    except Exception as error:
+        raise SignerError(
+            SignerErrorCode.HTTP_ERROR,
+            f"{provider_name} response cleanup failed: {error}",
+            provider_transaction_id=_transaction_id_in_body(body),
+            status_code=response.status_code,
+        ) from None
     if not response.is_success:
         error_text = body.decode(response.encoding or "utf-8", errors="replace")
         raise SignerError(
             SignerErrorCode.REMOTE_API_ERROR,
             f"{provider_name} API error: {response.status_code}: "
             f"{sanitize_remote_error_response(error_text)}",
+            provider_transaction_id=_transaction_id_in_body(body),
             status_code=response.status_code,
         )
     try:
@@ -195,6 +211,23 @@ async def _request_json(
         raise SignerError(
             SignerErrorCode.PARSING_ERROR, f"Failed to parse {provider_name} response"
         ) from None
+
+
+def _transaction_id_in_body(body: bytes) -> str | None:
+    """The top-level ``id`` of a failed response body, when there is one.
+
+    A provider that has already accepted a transaction may still answer with a
+    non-2xx status, and that id is the caller's only handle for reconciling it.
+    """
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    if isinstance(parsed, dict):
+        transaction_id = parsed.get("id")
+        if isinstance(transaction_id, str) and transaction_id.strip():
+            return transaction_id
+    return None
 
 
 async def _read_bounded_body(response: httpx.Response, provider_name: str) -> bytes:
@@ -212,8 +245,13 @@ async def _read_bounded_body(response: httpx.Response, provider_name: str) -> by
                     SignerErrorCode.PARSING_ERROR,
                     f"{provider_name} response exceeded maximum size",
                 )
-    except httpx.HTTPError as error:
+    except SignerError:
+        raise
+    except Exception as error:
         raise SignerError(
-            SignerErrorCode.HTTP_ERROR, f"{provider_name} network request failed: {error}"
+            SignerErrorCode.HTTP_ERROR,
+            f"{provider_name} response stream failed: {error}",
+            provider_transaction_id=_transaction_id_in_body(bytes(body)),
+            status_code=response.status_code,
         ) from None
     return bytes(body)

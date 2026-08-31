@@ -68,11 +68,10 @@ await rpc.sendTransaction(getBase64EncodedWireTransaction(signedTransaction), { 
 
 Requirements and caveats:
 
-- The Fordefi vault must be the transaction fee payer, and manual signing must run before any signature is applied. Both are checked before anything is submitted.
 - Fordefi may rewrite the message: at minimum the recent blockhash, and it manages the Compute Budget fee instructions, so a compute-unit limit or price you set yourself may not survive. What changed is **not** diffed, so inspect the result before broadcasting if its contents matter to you.
 - The returned signature is verified with ed25519 against the message Fordefi returned, at the vault's required-signer position. A mismatch fails and is never handed back.
 - Fordefi refreshes the blockhash but does not report its `lastValidBlockHeight`, so a refreshed lifetime carries Kit's `U64_MAX` placeholder; broadcast promptly rather than relying on local expiry detection.
-- The create carries an `x-idempotence-id` derived from the message bytes under a manual-specific namespace, so resending the same bytes reuses the Fordefi transaction instead of creating a second one, and cannot collide with an auto create that did broadcast them.
+- The create carries an `x-idempotence-id` derived from the message bytes under the push mode, chain, vault and fee it was submitted with, so resending the same bytes on the same terms reuses the Fordefi transaction instead of creating a second one, and cannot collide with a create made on other terms, such as an auto create that did broadcast them.
 
 ### Black box mode
 
@@ -102,7 +101,7 @@ const signer = await createFordefiSigner({
 | `apiBaseUrl` | No | API base URL (default: `https://api.fordefi.com`) |
 | `pollIntervalMs` | No | Polling interval in ms (default: 2000) |
 | `maxPollAttempts` | No | Positive integer max polling attempts (default: 50) |
-| `requestDelayMs` | No | Delay between concurrent requests in ms (default: 0) |
+| `requestDelayMs` | No | Delay between requests in ms (default: 0). Native modes batch sequentially, so this is the gap between items |
 | `requestTimeoutMs` | No | Per-request HTTP timeout in ms (default: 30000) |
 
 ### Custom API-request signer (KMS/HSM)

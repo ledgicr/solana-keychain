@@ -20,6 +20,11 @@ import {
     SolanaTransactionSigner,
 } from './types.js';
 
+/** Copies caller-supplied bytes into a fresh, zero-offset `Uint8Array`. */
+export function normalizeMessageBytes(bytes: ArrayLike<number>): Uint8Array {
+    return bytes instanceof Uint8Array ? bytes.slice() : new Uint8Array(Array.from(bytes));
+}
+
 /**
  * A UUID derived from SHA-256(message bytes), so a retry of the same bytes
  * reuses the key and the provider deduplicates the create.

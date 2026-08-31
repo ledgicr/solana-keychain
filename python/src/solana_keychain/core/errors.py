@@ -1,6 +1,9 @@
 """Error types for signer operations."""
 
 from enum import Enum, unique
+from typing import Any, TypedDict, cast
+
+from solders.signature import Signature
 
 
 @unique
@@ -43,6 +46,13 @@ _GENERIC_MESSAGES: dict[SignerErrorCode, str] = {
 }
 
 
+class _SignerErrorPickleState(TypedDict):
+    provider_transaction_id: str | None
+    status_code: int | None
+    idempotency_key: str | None
+    transaction_signature: Signature | None
+
+
 class SignerError(Exception):
     """Unified error raised by every signer operation.
 
@@ -52,6 +62,13 @@ class SignerError(Exception):
 
     ``status_code`` is the remote HTTP status when the failure came from a response,
     and ``None`` otherwise.
+
+    ``idempotency_key`` is the key an ambiguous create was submitted under, when the
+    backend sends one. With no ``provider_transaction_id`` to check, resending the
+    identical bytes under that key is the only recovery that cannot double-spend.
+
+    ``transaction_signature`` identifies the completed transaction supplied to a
+    caller-managed broadcast whose outcome could not be confirmed.
     """
 
     def __init__(
@@ -61,6 +78,8 @@ class SignerError(Exception):
         *,
         provider_transaction_id: str | None = None,
         status_code: int | None = None,
+        idempotency_key: str | None = None,
+        transaction_signature: Signature | None = None,
     ) -> None:
         message = _GENERIC_MESSAGES[code]
         if provider_transaction_id is not None:
@@ -70,9 +89,27 @@ class SignerError(Exception):
         self._detail = detail
         self.provider_transaction_id = provider_transaction_id
         self.status_code = status_code
+        self.idempotency_key = idempotency_key
+        self.transaction_signature = transaction_signature
 
     def __repr__(self) -> str:
         return f"SignerError({self.code.value})"
 
-    def __reduce__(self) -> tuple[type["SignerError"], tuple[SignerErrorCode]]:
-        return (SignerError, (self.code,))
+    def __reduce__(
+        self,
+    ) -> tuple[type["SignerError"], tuple[SignerErrorCode], _SignerErrorPickleState]:
+        state = _SignerErrorPickleState(
+            provider_transaction_id=self.provider_transaction_id,
+            status_code=self.status_code,
+            idempotency_key=self.idempotency_key,
+            transaction_signature=self.transaction_signature,
+        )
+        return (SignerError, (self.code,), state)
+
+    def __setstate__(self, state: dict[str, Any] | None) -> None:
+        if state is None:
+            return
+        self.provider_transaction_id = cast(str | None, state["provider_transaction_id"])
+        self.status_code = cast(int | None, state["status_code"])
+        self.idempotency_key = cast(str | None, state["idempotency_key"])
+        self.transaction_signature = cast(Signature | None, state["transaction_signature"])

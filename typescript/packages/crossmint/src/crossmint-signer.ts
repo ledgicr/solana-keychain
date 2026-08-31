@@ -3,6 +3,7 @@ import { getBase16Encoder, getBase58Decoder, getBase58Encoder, getBase64Encoder 
 import {
     abortableDelay,
     assertHttpsUrl,
+    assertSignatureValid,
     ED25519_SIGNATURE_LENGTH,
     fetchSignerJson,
     idempotencyKeyFromMessage,
@@ -10,6 +11,8 @@ import {
     providerMayHaveAccepted,
     providerStatus,
     sanitizeRemoteErrorResponse,
+    signBatchSequential,
+    SignerError,
     SignerErrorCode,
     SolanaSendingSigner,
     throwSignerError,
@@ -69,13 +72,18 @@ let base64Encoder: ReturnType<typeof getBase64Encoder> | undefined;
  *
  * Not retry-safe: any failure after the create is accepted rejects with
  * `BROADCAST_UNCONFIRMED` carrying `context.providerTransactionId`; check that
- * transaction with Crossmint before retrying. A create that fails without a
- * usable response rejects with `BROADCAST_UNCONFIRMED` and no
+ * transaction with Crossmint before retrying. A create whose response carries no
+ * readable transaction id rejects with `BROADCAST_UNCONFIRMED` and no
  * `providerTransactionId`.
  *
- * Each create carries an `x-idempotency-key` derived from the message bytes, so
- * replaying these exact bytes cannot create a second transaction; a rebuilt
- * transaction derives a different key and executes as a new transfer.
+ * Each create carries an `x-idempotency-key` derived from the message bytes and
+ * the signer locator, so replaying these exact bytes cannot create a second
+ * transaction; a rebuilt transaction derives a different key and executes as a
+ * new transfer.
+ *
+ * A batch signs sequentially and stops on the first rejection, whose
+ * `context.failedIndex` and `context.completedSignatures` carry the failing
+ * position and the signatures that already landed.
  */
 class CrossmintSigner<TAddress extends string = string> implements SolanaSendingSigner<TAddress> {
     // No signTransactions/signMessages: Kit classifies signers by duck-typed
@@ -199,24 +207,13 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
         transactions: readonly (Transaction | (Transaction & TransactionWithLifetime))[],
         config?: TransactionSendingSignerConfig,
     ): Promise<readonly SignatureBytes[]> {
-        config?.abortSignal?.throwIfAborted();
-
-        // Sign sequentially, not via Promise.all: each transaction has
-        // irreversible server-side effects (createTransaction, and auto-approval
-        // when signerSecret is set). Concurrent submission means a failure in one
-        // transaction would abandon siblings that Crossmint has already created
-        // and may execute, leading to duplicate spends on retry. Sequential
-        // execution stops on the first error before any further transaction is
-        // created.
-        const results: SignatureBytes[] = [];
-        for (const [index, transaction] of transactions.entries()) {
-            if (this.requestDelayMs > 0 && index > 0) {
-                await abortableDelay(this.requestDelayMs, config?.abortSignal);
-            }
-            config?.abortSignal?.throwIfAborted();
-            results.push(await this.signTransactionManaged(transaction, config?.abortSignal));
-        }
-        return results;
+        return await signBatchSequential(
+            transactions,
+            async transaction => await this.signTransactionManaged(transaction, config?.abortSignal),
+            this.requestDelayMs,
+            'completedSignatures',
+            config?.abortSignal,
+        );
     }
 
     async isAvailable(): Promise<boolean> {
@@ -233,19 +230,27 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
      * has already accepted, so an aborted transaction may still land server-side.
      */
     private async signTransactionManaged(transaction: Transaction, abortSignal?: AbortSignal): Promise<SignatureBytes> {
+        const idempotencyKey = await idempotencyKeyFromMessage(this.namespacedKeyInput(transaction.messageBytes));
         let created: CrossmintTransactionResponse;
         try {
-            created = await this.createTransaction(transaction, abortSignal);
+            created = await this.createTransaction(transaction, idempotencyKey, abortSignal);
         } catch (error) {
             if (!providerMayHaveAccepted(error)) {
                 throw error;
             }
             // Crossmint may be executing a transaction whose id never reached us.
             const status = providerStatus(error);
+            const providerTransactionId =
+                error instanceof SignerError ? error.context?.providerTransactionId : undefined;
             return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
                 cause: error,
-                message: 'Crossmint may have created the transaction, but no transaction id was returned',
+                idempotencyKey,
+                message:
+                    typeof providerTransactionId === 'string'
+                        ? `Crossmint may have created the transaction, but the outcome could not be confirmed (provider transaction id: ${providerTransactionId})`
+                        : 'Crossmint may have created the transaction, but no transaction id was returned',
                 ...(status === undefined ? {} : { status }),
+                ...(typeof providerTransactionId === 'string' ? { providerTransactionId } : {}),
             });
         }
         // Post-create failures leave an outcome Crossmint may still execute, so
@@ -255,6 +260,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
         } catch (error) {
             return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
                 cause: error,
+                idempotencyKey,
                 message: `Crossmint may have executed the transaction, but the outcome could not be confirmed (provider transaction id: ${created.id})`,
                 providerTransactionId: created.id,
             });
@@ -284,7 +290,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
                 // ensures the approval is signed and submitted at most once.
                 continue;
             }
-            const terminalSignature = this.resolveTerminalStatus(response, approvalSubmitted);
+            const terminalSignature = await this.resolveTerminalStatus(response, approvalSubmitted);
             if (terminalSignature) {
                 return terminalSignature;
             }
@@ -293,7 +299,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
             response = await this.getTransaction(response.id, abortSignal);
         }
 
-        const terminalSignature = this.resolveTerminalStatus(response, approvalSubmitted);
+        const terminalSignature = await this.resolveTerminalStatus(response, approvalSubmitted);
         if (terminalSignature) {
             return terminalSignature;
         }
@@ -303,14 +309,14 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
         });
     }
 
-    private resolveTerminalStatus(
+    private async resolveTerminalStatus(
         response: CrossmintTransactionResponse,
         approvalSubmitted: boolean,
-    ): SignatureBytes | undefined {
+    ): Promise<SignatureBytes | undefined> {
         const status = response.status as CrossmintTransactionStatus;
         switch (status) {
             case 'success':
-                return this.extractSignature(response);
+                return await this.extractSignature(response);
             case 'failed':
                 return throwSignerError(SignerErrorCode.SIGNING_FAILED, {
                     message: `Crossmint transaction failed: ${stringifyError(response.error)}`,
@@ -379,6 +385,7 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
 
     private async createTransaction(
         transaction: Transaction,
+        idempotencyKey: string,
         abortSignal?: AbortSignal,
     ): Promise<CrossmintTransactionResponse> {
         const wireTransaction = getBase64EncodedWireTransaction(transaction);
@@ -395,14 +402,20 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
         };
 
         const path = `/${API_VERSION}/wallets/${encodeURIComponent(this.walletLocator)}/transactions`;
-        const response = await this.request(
-            path,
-            'POST',
-            body,
-            abortSignal,
-            await idempotencyKeyFromMessage(transaction.messageBytes),
-        );
-        return parseTransactionResponse(response, 'create transaction');
+        const response = await this.request(path, 'POST', body, abortSignal, idempotencyKey);
+        try {
+            return parseTransactionResponse(response, 'create transaction');
+        } catch (error) {
+            const providerTransactionId = providerTransactionIdOf(response);
+            if (providerTransactionId === undefined) {
+                throw error;
+            }
+            return throwSignerError(SignerErrorCode.REMOTE_API_ERROR, {
+                cause: error,
+                message: 'Failed to create transaction: unusable response body',
+                providerTransactionId,
+            });
+        }
     }
 
     private async getTransaction(
@@ -444,7 +457,18 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
         });
     }
 
-    private extractSignature(response: CrossmintTransactionResponse): SignatureBytes {
+    private namespacedKeyInput(messageBytes: Transaction['messageBytes']): Uint8Array {
+        const locator = new TextEncoder().encode(this.signer ?? '');
+        const prefix = new TextEncoder().encode(`crossmint:solana:${locator.length}:`);
+        const input = new Uint8Array(prefix.length + locator.length + 1 + messageBytes.length);
+        input.set(prefix);
+        input.set(locator, prefix.length);
+        input.set([0x3a], prefix.length + locator.length);
+        input.set(messageBytes, prefix.length + locator.length + 1);
+        return input;
+    }
+
+    private async extractSignature(response: CrossmintTransactionResponse): Promise<SignatureBytes> {
         let embeddedError: unknown;
         if (response.onChain?.transaction) {
             let executedTransaction: Transaction | undefined;
@@ -457,8 +481,13 @@ class CrossmintSigner<TAddress extends string = string> implements SolanaSending
                 embeddedError = error;
             }
             if (executedTransaction) {
-                const [, feePayerSignature] = Object.entries(executedTransaction.signatures)[0] ?? [];
-                if (feePayerSignature) {
+                const [feePayer, feePayerSignature] = Object.entries(executedTransaction.signatures)[0] ?? [];
+                if (feePayer && feePayerSignature && feePayerSignature.some(byte => byte !== 0)) {
+                    await assertSignatureValid({
+                        data: executedTransaction.messageBytes,
+                        signature: feePayerSignature,
+                        signerAddress: feePayer as Address,
+                    });
                     return feePayerSignature;
                 }
                 embeddedError = new Error('Crossmint transaction carries no fee-payer signature');
@@ -503,9 +532,18 @@ async function fetchWallet(
     return wallet as CrossmintWalletResponse;
 }
 
+function providerTransactionIdOf(payload: unknown): string | undefined {
+    const id = (payload as { id?: unknown } | null | undefined)?.id;
+    return isUsableTransactionId(id) ? id : undefined;
+}
+
+function isUsableTransactionId(value: unknown): value is string {
+    return typeof value === 'string' && value.trim().length > 0;
+}
+
 function parseTransactionResponse(payload: unknown, context: string): CrossmintTransactionResponse {
     const transaction = payload as Partial<CrossmintTransactionResponse>;
-    if (!transaction.id || !transaction.status) {
+    if (!isUsableTransactionId(transaction.id) || !transaction.status) {
         throwSignerError(SignerErrorCode.REMOTE_API_ERROR, {
             message: `Failed to ${context}: missing transaction id/status`,
         });

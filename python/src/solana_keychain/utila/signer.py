@@ -71,9 +71,17 @@ def _trim_vault_id(value: str) -> str:
     return value.removeprefix("vaults/")
 
 
-def _trim_wallet_id(value: str) -> str:
-    _, separator, wallet_id = value.rpartition("/wallets/")
-    return wallet_id if separator else value
+def _trim_wallet_id(value: str, vault_id: str) -> str:
+    """Reduce a full wallet resource name to its id."""
+    parent, separator, wallet_id = value.rpartition("/wallets/")
+    if not separator:
+        return value
+    if parent != f"vaults/{vault_id}" or "/" in wallet_id:
+        raise SignerError(
+            SignerErrorCode.CONFIG_ERROR,
+            "wallet_id resource name must belong to the configured vault_id",
+        )
+    return wallet_id
 
 
 @dataclass
@@ -145,7 +153,7 @@ class UtilaSigner(TransactionSigner):
         self._service_account_email = config.service_account_email
         self._signing_key = signing_key
         self._vault_id = _trim_vault_id(config.vault_id)
-        self._wallet_id = _trim_wallet_id(config.wallet_id)
+        self._wallet_id = _trim_wallet_id(config.wallet_id, self._vault_id)
         self._network = config.network
         self._poll_interval_ms = config.poll_interval_ms
         self._max_poll_attempts = config.max_poll_attempts

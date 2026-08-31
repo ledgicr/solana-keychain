@@ -3,9 +3,38 @@ use crate::sdk_adapter::{Pubkey, Signature, VersionedTransaction};
 use crate::traits::{SignTransactionResult, SignedTransaction};
 use base64::{engine::general_purpose::STANDARD, Engine};
 
+/// Holds a provider transaction id when cancellation prevents returning it.
+#[cfg(any(feature = "crossmint", feature = "fordefi"))]
+#[derive(Clone, Debug, Default)]
+pub struct PendingTransactionId(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+#[cfg(any(feature = "crossmint", feature = "fordefi"))]
+impl PendingTransactionId {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The provider transaction id left behind by a cancelled call, if any.
+    pub fn get(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(crate) fn set(&self, provider_tx_id: &str) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(provider_tx_id.to_string());
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = None;
+        }
+    }
+}
+
 /// A UUID derived from SHA-256(message bytes), so a retry of the same bytes
 /// reuses the key and the provider deduplicates the create.
-#[cfg(any(feature = "crossmint", feature = "fordefi"))]
+#[cfg(any(feature = "crossmint", feature = "fireblocks", feature = "fordefi"))]
 pub(crate) fn idempotency_key_from_message(message_bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(message_bytes);
@@ -24,18 +53,22 @@ pub(crate) fn idempotency_key_from_message(message_bytes: &[u8]) -> String {
     )
 }
 
-/// A 4xx is the only create outcome that rules out a transaction; anything else
-/// (no response, timeout, 5xx, unusable success body) may already be executing.
-/// `status` is `None` when no response arrived, and is passed on only when the
-/// response was the failure.
-#[cfg(any(feature = "crossmint", feature = "fordefi"))]
-pub(crate) fn unconfirmed_unless_rejected(status: Option<u16>, error: SignerError) -> SignerError {
-    if matches!(status, Some(status) if (400..500).contains(&status)) {
+/// Classifies ambiguous creates while preserving their provider id and idempotency key.
+#[cfg(any(feature = "crossmint", feature = "fireblocks", feature = "fordefi"))]
+pub(crate) fn unconfirmed_unless_rejected(
+    status: Option<u16>,
+    provider_tx_id: Option<String>,
+    idempotency_key: Option<&str>,
+    error: SignerError,
+) -> SignerError {
+    if matches!(status, Some(status) if (400..500).contains(&status) && status != 408) {
         return error;
     }
     SignerError::BroadcastUnconfirmed {
-        provider_tx_id: None,
+        provider_tx_id,
         provider_status: status.filter(|status| *status >= 400),
+        idempotency_key: idempotency_key.map(str::to_string),
+        transaction_signature: None,
         detail: error.detail_string(),
     }
 }

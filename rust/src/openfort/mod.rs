@@ -30,7 +30,7 @@
 
 mod types;
 
-use crate::remote_util::parse_json_response;
+use crate::remote_util::{encode_uri_component, parse_json_response};
 use crate::sdk_adapter::{Pubkey, Signature, VersionedTransaction};
 use crate::signature_util::{signature_from_hex, verify_or_reject};
 use crate::traits::{SignTransactionResult, SignedTransaction, TransactionSigner};
@@ -43,6 +43,8 @@ use serde_json::Value;
 use std::str::FromStr;
 
 use self::types::SignResponse;
+
+const WALLET_JWT_LIFETIME_SECS: i64 = 120;
 
 /// Normalize the wallet secret to a PEM string `jsonwebtoken` can parse.
 /// Accepts either a full PEM (passed through verbatim) or a bare base64
@@ -201,11 +203,19 @@ impl OpenfortSigner {
     }
 
     fn account_path(&self) -> String {
-        format!("{}/{}", OPENFORT_ACCOUNTS_PATH, self.account_id)
+        format!(
+            "{}/{}",
+            OPENFORT_ACCOUNTS_PATH,
+            encode_uri_component(&self.account_id)
+        )
     }
 
     fn sign_path(&self) -> String {
-        format!("{}/{}/sign", OPENFORT_BACKEND_PATH, self.account_id)
+        format!(
+            "{}/{}/sign",
+            OPENFORT_BACKEND_PATH,
+            encode_uri_component(&self.account_id)
+        )
     }
 
     /// `GET /v2/accounts/{accountId}` — bearer auth only, no wallet JWT.
@@ -247,6 +257,7 @@ impl OpenfortSigner {
             "POST",
             path,
             Some(request_body),
+            WALLET_JWT_LIFETIME_SECS,
         )?;
 
         let mut headers = reqwest::header::HeaderMap::new();

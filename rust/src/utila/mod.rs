@@ -2,7 +2,7 @@
 
 mod types;
 
-use crate::remote_util::parse_json_response;
+use crate::remote_util::{encode_uri_component, parse_json_response};
 use crate::sdk_adapter::{Pubkey, Signature, VersionedTransaction};
 use crate::signature_util::extract_and_verify_returned_signature;
 use crate::traits::{SignTransactionResult, SignedTransaction, TransactionSigner};
@@ -12,7 +12,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
-use std::{fmt::Write, str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 use types::{
     InitiateTransactionDetails, InitiateTransactionRequest, SolanaSerializedTransaction,
     TransactionEnvelope, TransactionState, UtilaTransaction, WalletResponse,
@@ -124,11 +124,14 @@ impl UtilaSigner {
             .designated_signers
             .unwrap_or_else(|| vec![format!("users/{}", config.service_account_email)]);
 
+        let vault_id = trim_resource_prefix(&config.vault_id, "vaults/").to_string();
+        let wallet_id = trim_wallet_id(&config.wallet_id, &vault_id)?.to_string();
+
         Ok(Self {
             service_account_email: config.service_account_email,
             signing_key: Arc::new(signing_key),
-            vault_id: trim_resource_prefix(&config.vault_id, "vaults/").to_string(),
-            wallet_id: trim_wallet_id(&config.wallet_id).to_string(),
+            vault_id,
+            wallet_id,
             network: config.network,
             api_base_url,
             client,
@@ -285,7 +288,7 @@ impl UtilaSigner {
             }
         }
 
-        Err(SignerError::RemoteApiError(format!(
+        Err(SignerError::remote_api(format!(
             "Utila transaction polling timed out after {} attempts",
             self.max_poll_attempts
         )))
@@ -414,38 +417,17 @@ fn trim_resource_prefix<'a>(value: &'a str, prefix: &str) -> &'a str {
     value.strip_prefix(prefix).unwrap_or(value)
 }
 
-fn trim_wallet_id(value: &str) -> &str {
-    if let Some((_, wallet_id)) = value.rsplit_once("/wallets/") {
-        wallet_id
-    } else {
-        value
+/// Reduce a full wallet resource name to its id.
+fn trim_wallet_id<'a>(value: &'a str, vault_id: &str) -> Result<&'a str, SignerError> {
+    let Some((parent, wallet_id)) = value.rsplit_once("/wallets/") else {
+        return Ok(value);
+    };
+    if parent != format!("vaults/{vault_id}") || wallet_id.contains('/') {
+        return Err(SignerError::ConfigError(
+            "wallet_id resource name must belong to the configured vault_id".to_string(),
+        ));
     }
-}
-
-fn encode_uri_component(input: &str) -> String {
-    let mut encoded = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        if matches!(
-            byte,
-            b'A'..=b'Z'
-                | b'a'..=b'z'
-                | b'0'..=b'9'
-                | b'-'
-                | b'_'
-                | b'.'
-                | b'!'
-                | b'~'
-                | b'*'
-                | b'\''
-                | b'('
-                | b')'
-        ) {
-            encoded.push(byte as char);
-        } else {
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    encoded
+    Ok(wallet_id)
 }
 
 #[cfg(test)]

@@ -261,6 +261,87 @@ func TestSignTransactionProgramCallSignOnly(t *testing.T) {
 	}
 }
 
+func TestSignTransactionProgramCallCarriesAMessageDerivedExternalTxID(t *testing.T) {
+	priv := testutils.TestPrivateKey()
+	pub := testutils.TestPublicKey()
+
+	tx, err := testutils.CreateTestTransaction(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgBytes, err := tx.Message.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature := solana.SignatureFromBytes(ed25519.Sign(priv, msgBytes))
+
+	s, created := programCallSigner(t, pub.String(), map[string]any{
+		"id":     "tx-789",
+		"status": "SIGNED",
+		"signedMessages": []map[string]any{
+			{"signature": map[string]string{"fullSig": hex.EncodeToString(signature[:])}},
+		},
+	})
+
+	if _, err := s.SignTransaction(context.Background(), tx); err != nil {
+		t.Fatal(err)
+	}
+
+	want := core.IdempotencyKeyFromMessage(
+		append([]byte("fireblocks:solana:program_call:SOL:"+testVaultID+":"), msgBytes...))
+	request := created.Load()
+	if request == nil {
+		t.Fatal("no create request recorded")
+	}
+	if got := (*request)["externalTxId"]; got != want {
+		t.Errorf("externalTxId = %v, want %s", got, want)
+	}
+}
+
+func TestSignMessageRawCarriesNoExternalTxID(t *testing.T) {
+	priv := testutils.TestPrivateKey()
+	pub := testutils.TestPublicKey()
+	message := []byte("hello")
+	signature := solana.SignatureFromBytes(ed25519.Sign(priv, message))
+
+	created := &atomic.Pointer[map[string]any]{}
+	s := newTestSigner(t, pub.String(), func(mux *http.ServeMux) {
+		mux.HandleFunc("/v1/transactions", func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Error(err)
+			}
+			created.Store(&decoded)
+			testutils.WriteJSON(w, http.StatusOK, map[string]any{"id": "tx-raw", "status": "SUBMITTED"})
+		})
+		mux.HandleFunc("/v1/transactions/tx-raw", func(w http.ResponseWriter, _ *http.Request) {
+			testutils.WriteJSON(w, http.StatusOK, map[string]any{
+				"id":     "tx-raw",
+				"status": "COMPLETED",
+				"signedMessages": []map[string]any{
+					{"signature": map[string]string{"fullSig": hex.EncodeToString(signature[:])}},
+				},
+			})
+		})
+	})
+
+	if _, err := s.SignMessage(context.Background(), message); err != nil {
+		t.Fatal(err)
+	}
+
+	request := created.Load()
+	if request == nil {
+		t.Fatal("no create request recorded")
+	}
+	if _, present := (*request)["externalTxId"]; present {
+		t.Error("a RAW create must carry no externalTxId")
+	}
+}
+
 // The signature may arrive as the txHash of the signed transaction.
 func TestSignTransactionProgramCallTxHashCarrier(t *testing.T) {
 	priv := testutils.TestPrivateKey()
@@ -356,6 +437,140 @@ func TestSignTransactionProgramCallBroadcastIsUnconfirmed(t *testing.T) {
 	var se *core.SignerError
 	if errors.As(err, &se) && se.ProviderTxID != "tx-789" {
 		t.Errorf("ProviderTxID = %q, want tx-789", se.ProviderTxID)
+	}
+}
+
+func TestSignTransactionProgramCallUnresolvedPollKeepsTransactionID(t *testing.T) {
+	pub := testutils.TestPublicKey()
+
+	for _, tc := range []struct {
+		name       string
+		pollStatus int
+		pollBody   map[string]any
+	}{
+		{"budget exhausted", http.StatusOK, map[string]any{"id": "tx-789", "status": "SUBMITTED"}},
+		{"poll failed", http.StatusServiceUnavailable, map[string]any{"error": "unavailable"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx, err := testutils.CreateTestTransaction(pub)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			s := newTestSignerWithProgramCall(t, pub.String(), true, func(mux *http.ServeMux) {
+				mux.HandleFunc("/v1/transactions", func(w http.ResponseWriter, _ *http.Request) {
+					testutils.WriteJSON(w, http.StatusOK, map[string]any{"id": "tx-789", "status": "SUBMITTED"})
+				})
+				mux.HandleFunc("/v1/transactions/tx-789", func(w http.ResponseWriter, _ *http.Request) {
+					testutils.WriteJSON(w, tc.pollStatus, tc.pollBody)
+				})
+			})
+
+			_, err = s.SignTransaction(context.Background(), tx)
+			if code, _ := core.CodeOf(err); code != core.CodeBroadcastUnconfirmed {
+				t.Fatalf("got %s, want BROADCAST_UNCONFIRMED", code)
+			}
+			var se *core.SignerError
+			if errors.As(err, &se) && se.ProviderTxID != "tx-789" {
+				t.Errorf("ProviderTxID = %q, want tx-789", se.ProviderTxID)
+			}
+		})
+	}
+}
+
+func TestCreateWithUnusableBody(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		useProgramCall bool
+		wantCode       core.Code
+		wantTxID       string
+	}{
+		{"program call reports unconfirmed with the id", true, core.CodeBroadcastUnconfirmed, "tx-accepted"},
+		{"raw stays a plain failure", false, core.CodeSerializationError, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pub := testutils.TestPublicKey()
+			s := newTestSignerWithProgramCall(t, pub.String(), tc.useProgramCall, func(mux *http.ServeMux) {
+				mux.HandleFunc("/v1/transactions", func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"tx-accepted","status":123}`)
+				})
+			})
+
+			tx, err := testutils.CreateTestTransaction(pub)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = s.SignTransaction(context.Background(), tx)
+			if code, _ := core.CodeOf(err); code != tc.wantCode {
+				t.Fatalf("got %s, want %s", code, tc.wantCode)
+			}
+			var se *core.SignerError
+			if errors.As(err, &se) && se.ProviderTxID != tc.wantTxID {
+				t.Errorf("ProviderTxID = %q, want %q", se.ProviderTxID, tc.wantTxID)
+			}
+		})
+	}
+}
+
+func TestCreateRejectsBlankTransactionIDWithoutPolling(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		useProgramCall bool
+		wantCode       core.Code
+	}{
+		{"program call preserves its recovery key", true, core.CodeBroadcastUnconfirmed},
+		{"raw reports a serialization failure", false, core.CodeSerializationError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pub := testutils.TestPublicKey()
+			var polls atomic.Int64
+			s := newTestSignerWithProgramCall(t, pub.String(), tc.useProgramCall, func(mux *http.ServeMux) {
+				mux.HandleFunc("/v1/transactions", func(w http.ResponseWriter, _ *http.Request) {
+					testutils.WriteJSON(w, http.StatusOK, map[string]any{"id": " \t", "status": "SUBMITTED"})
+				})
+				mux.HandleFunc("/v1/transactions/", func(w http.ResponseWriter, _ *http.Request) {
+					polls.Add(1)
+					testutils.WriteJSON(w, http.StatusOK, map[string]any{"status": "SUBMITTED"})
+				})
+			})
+
+			var err error
+			var wantIdempotencyKey string
+			if tc.useProgramCall {
+				tx, createErr := testutils.CreateTestTransaction(pub)
+				if createErr != nil {
+					t.Fatal(createErr)
+				}
+				message, marshalErr := tx.Message.MarshalBinary()
+				if marshalErr != nil {
+					t.Fatal(marshalErr)
+				}
+				wantIdempotencyKey = s.externalTxID(message)
+				_, err = s.SignTransaction(context.Background(), tx)
+			} else {
+				_, err = s.SignMessage(context.Background(), []byte("hello"))
+			}
+
+			if code, _ := core.CodeOf(err); code != tc.wantCode {
+				t.Fatalf("got %s, want %s", code, tc.wantCode)
+			}
+			if polls.Load() != 0 {
+				t.Fatalf("blank transaction id triggered %d polls", polls.Load())
+			}
+			if tc.useProgramCall {
+				var signerErr *core.SignerError
+				if !errors.As(err, &signerErr) {
+					t.Fatalf("expected SignerError, got %T", err)
+				}
+				if signerErr.ProviderTxID != "" {
+					t.Errorf("ProviderTxID = %q, want empty", signerErr.ProviderTxID)
+				}
+				if signerErr.IdempotencyKey != wantIdempotencyKey {
+					t.Errorf("IdempotencyKey = %q, want %q", signerErr.IdempotencyKey, wantIdempotencyKey)
+				}
+			}
+		})
 	}
 }
 

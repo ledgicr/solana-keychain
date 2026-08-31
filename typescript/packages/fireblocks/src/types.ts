@@ -56,6 +56,7 @@ export interface CreateRawTransactionRequest {
 
 export interface CreateProgramCallTransactionRequest {
     assetId: string;
+    externalTxId: string;
     extraParameters: ProgramCallExtraParameters;
     operation: 'PROGRAM_CALL';
     source: TransactionSource;

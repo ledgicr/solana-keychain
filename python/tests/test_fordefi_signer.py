@@ -1,9 +1,7 @@
 import asyncio
 import base64
-import hashlib
 import json
 import logging
-import uuid
 from typing import Any
 
 import httpx
@@ -25,6 +23,7 @@ from solders.transaction import VersionedTransaction
 from solana_keychain import SignerError, SignerErrorCode
 from solana_keychain.core import (
     ModifyingSigner,
+    PendingTransactionId,
     SendingSigner,
     TransactionSigner,
     signed_message_bytes,
@@ -240,6 +239,24 @@ def test_black_box_config_rejects_a_fee() -> None:
     assert excinfo.value.code == SignerErrorCode.CONFIG_ERROR
 
 
+def test_black_box_config_rejects_a_pending_transaction_id() -> None:
+    """Black box signing never broadcasts, so the slot would never be written."""
+    with pytest.raises(SignerError) as excinfo:
+        make_black_box_signer(Keypair(), pending_transaction_id=PendingTransactionId())
+    assert excinfo.value.code == SignerErrorCode.CONFIG_ERROR
+
+
+def test_manual_config_rejects_a_pending_transaction_id() -> None:
+    """Manual signing never broadcasts, so the slot would never be written."""
+    with pytest.raises(SignerError) as excinfo:
+        make_manual_signer(
+            Keypair(),
+            chain="solana_devnet",
+            pending_transaction_id=PendingTransactionId(),
+        )
+    assert excinfo.value.code == SignerErrorCode.CONFIG_ERROR
+
+
 def test_config_rejects_zero_max_poll_attempts() -> None:
     with pytest.raises(SignerError) as excinfo:
         make_black_box_signer(Keypair(), max_poll_attempts=0)
@@ -386,6 +403,7 @@ async def test_sign_message_polling_timeout() -> None:
     with pytest.raises(SignerError) as excinfo:
         await signer.sign_message(b"hello")
     assert excinfo.value.code == SignerErrorCode.REMOTE_API_ERROR
+    assert excinfo.value.provider_transaction_id == "tx-1"
     assert len(respx.calls) == 4
 
 
@@ -404,6 +422,17 @@ async def test_sign_transaction_native_polling_timeout_is_broadcast_unconfirmed(
 
 
 @respx.mock
+async def test_native_submit_server_error_keeps_a_transaction_id_from_the_body() -> None:
+    keypair = Keypair()
+    signer = make_native_signer(keypair, chain="solana_devnet")
+    respx.post(TRANSACTIONS_URL).mock(return_value=httpx.Response(502, json={"id": "tx-accepted"}))
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_and_send_transaction(create_test_transaction(keypair.pubkey()))
+    assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
+    assert excinfo.value.provider_transaction_id == "tx-accepted"
+
+
+@respx.mock
 async def test_native_submit_server_error_is_unconfirmed_without_a_transaction_id() -> None:
     keypair = Keypair()
     signer = make_native_signer(keypair, chain="solana_devnet")
@@ -418,6 +447,31 @@ async def test_native_submit_server_error_is_unconfirmed_without_a_transaction_i
 
 
 @respx.mock
+async def test_native_submit_accepted_with_an_empty_id_is_unconfirmed() -> None:
+    keypair = Keypair()
+    signer = make_native_signer(keypair, chain="solana_devnet")
+    respx.post(TRANSACTIONS_URL).mock(return_value=httpx.Response(200, json={"id": ""}))
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_and_send_transaction(create_test_transaction(keypair.pubkey()))
+    assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
+    assert excinfo.value.provider_transaction_id is None
+
+
+@respx.mock
+async def test_native_submit_accepted_with_a_whitespace_id_is_unconfirmed() -> None:
+    keypair = Keypair()
+    signer = make_native_signer(keypair, chain="solana_devnet")
+    route = respx.post(TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(200, json={"id": " \t\n"})
+    )
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_and_send_transaction(create_test_transaction(keypair.pubkey()))
+    assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
+    assert excinfo.value.provider_transaction_id is None
+    assert route.call_count == 1
+
+
+@respx.mock
 async def test_native_submit_accepted_without_an_id_is_unconfirmed() -> None:
     keypair = Keypair()
     signer = make_native_signer(keypair, chain="solana_devnet")
@@ -427,6 +481,21 @@ async def test_native_submit_accepted_without_an_id_is_unconfirmed() -> None:
     assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
     assert excinfo.value.provider_transaction_id is None
     assert excinfo.value.status_code is None
+
+
+@respx.mock
+async def test_native_submit_timed_out_while_processing_is_unconfirmed() -> None:
+    """A 408 is a timeout reached while the create was processed, not a rejection."""
+    keypair = Keypair()
+    signer = make_native_signer(keypair, chain="solana_devnet")
+    respx.post(TRANSACTIONS_URL).mock(
+        return_value=httpx.Response(408, json={"detail": "Reached time out while processing"})
+    )
+    with pytest.raises(SignerError) as excinfo:
+        await signer.sign_and_send_transaction(create_test_transaction(keypair.pubkey()))
+    assert excinfo.value.code == SignerErrorCode.BROADCAST_UNCONFIRMED
+    assert excinfo.value.provider_transaction_id is None
+    assert excinfo.value.status_code == 408
 
 
 @respx.mock
@@ -527,6 +596,33 @@ async def test_sign_transaction_native_cancellation_carries_the_transaction_id(
 
 
 @respx.mock
+async def test_native_cancellation_leaves_the_transaction_id_in_the_pending_slot() -> None:
+    """Awaiting a cancelled task discards the raised message, so the registered
+    slot is the only structured carrier for the id the caller must reconcile."""
+    keypair = Keypair()
+    pending = PendingTransactionId()
+    signer = make_native_signer(keypair, chain="solana_devnet", pending_transaction_id=pending)
+    polling = asyncio.Event()
+
+    async def hang(_request: httpx.Request) -> httpx.Response:
+        polling.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    respx.post(TRANSACTIONS_URL).mock(return_value=httpx.Response(200, json={"id": "tx-1"}))
+    respx.get(f"{TRANSACTIONS_URL}/tx-1").mock(side_effect=hang)
+
+    task = asyncio.create_task(
+        signer.sign_and_send_transaction(create_test_transaction(keypair.pubkey()))
+    )
+    await polling.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert pending.get() == "tx-1"
+
+
+@respx.mock
 async def test_sign_transaction_black_box_success() -> None:
     keypair = Keypair()
     signer = make_black_box_signer(keypair)
@@ -597,10 +693,32 @@ async def test_sign_transaction_native_success() -> None:
     assert body["details"]["data"] == base64.b64encode(
         signed_message_bytes(transaction.message)
     ).decode("ascii")
-    digest = bytearray(hashlib.sha256(signed_message_bytes(transaction.message)).digest()[:16])
-    digest[6] = (digest[6] & 0x0F) | 0x40
-    digest[8] = (digest[8] & 0x3F) | 0x80
-    assert respx.calls[0].request.headers["x-idempotence-id"] == str(uuid.UUID(bytes=bytes(digest)))
+    namespaced = (
+        f"fordefi:solana:auto:solana_mainnet:{VAULT_ID}:priority|high||:".encode()
+        + signed_message_bytes(transaction.message)
+    )
+    assert respx.calls[0].request.headers["x-idempotence-id"] == idempotency_key_from_message(
+        namespaced
+    )
+
+
+@respx.mock
+async def test_a_completed_native_send_leaves_no_id_in_the_pending_slot() -> None:
+    """A stale id would send a caller reconciling a transaction they already hold
+    the signature for."""
+    keypair = Keypair()
+    pending = PendingTransactionId()
+    signer = make_native_signer(keypair, chain="solana_devnet", pending_transaction_id=pending)
+    raw_transaction, signature = make_signed_wire_transaction(keypair)
+    mock_sign_flow(
+        status_response("signed"),
+        status_response("completed", raw_transaction=raw_transaction),
+    )
+
+    result = await signer.sign_and_send_transaction(create_test_transaction(keypair.pubkey()))
+
+    assert result == signature
+    assert pending.get() is None
 
 
 @respx.mock
@@ -739,10 +857,31 @@ async def test_manual_idempotence_id_cannot_collide_with_an_auto_create() -> Non
 
     await signer.modify_and_sign_transaction(transaction)
 
-    namespaced = f"fordefi:solana:manual:solana_mainnet:{VAULT_ID}:".encode() + message_data
+    namespaced = f"fordefi:solana:manual:solana_mainnet:{VAULT_ID}::".encode() + message_data
     observed = respx.calls[0].request.headers["x-idempotence-id"]
     assert observed == idempotency_key_from_message(namespaced)
     assert observed != idempotency_key_from_message(message_data)
+
+
+async def test_native_idempotence_id_binds_the_fee() -> None:
+    """Fordefi rewrites the Compute Budget instructions from the fee the create
+    carries, so identical bytes under different fees are different operations."""
+    keypair = Keypair()
+    message_data = signed_message_bytes(create_test_transaction(keypair.pubkey()).message)
+    fees: list[dict[str, Any] | None] = [
+        None,
+        {"type": "priority", "priority_level": "low"},
+        {"type": "priority", "priority_level": "high"},
+        {"type": "custom", "unit_price": "10"},
+        {"type": "custom", "priority_fee": "10"},
+    ]
+    observed = {
+        make_native_signer(keypair, chain="solana_mainnet", fee=fee)._native_idempotence_id(
+            message_data
+        )
+        for fee in fees
+    }
+    assert len(observed) == len(fees), "every fee must derive its own idempotence id"
 
 
 @respx.mock
@@ -843,17 +982,38 @@ async def test_manual_signing_rejects_a_non_vault_fee_payer_before_submitting() 
 
 
 @respx.mock
-async def test_manual_signing_rejects_a_presigned_transaction_before_submitting() -> None:
-    """Fordefi rewrites the message, which would silently void an existing signature."""
+async def test_native_auto_rejects_a_presigned_transaction_before_submitting() -> None:
+    """Fordefi replaces the blockhash before broadcasting, so re-signing bytes the
+    vault already signed would land the same transfer a second time."""
     keypair = Keypair()
-    signer = make_manual_signer(keypair)
+    signer = make_native_signer(keypair)
     transaction = create_test_transaction(keypair.pubkey())
     transaction.signatures = [keypair.sign_message(signed_message_bytes(transaction.message))]
 
     with pytest.raises(SignerError) as excinfo:
-        await signer.modify_and_sign_transaction(transaction)
+        await signer.sign_and_send_transaction(transaction)
     assert excinfo.value.code == SignerErrorCode.SIGNING_FAILED
     assert not respx.calls
+
+
+@respx.mock
+async def test_manual_signing_accepts_a_presigned_transaction() -> None:
+    """Manual signing never broadcasts, so submitting signed bytes is the caller's
+    call to make. The rewrite voids those signatures, and the returned transaction
+    carries only Fordefi's."""
+    keypair = Keypair()
+    signer = make_manual_signer(keypair)
+    transaction = create_test_transaction(keypair.pubkey())
+    stale_signature = keypair.sign_message(b"some earlier message")
+    transaction.signatures = [stale_signature]
+    returned = replace_blockhash(transaction, Hash.new_unique())
+    raw_transaction, signature = vault_signed_wire(keypair, returned)
+    mock_sign_flow(status_response("signed", raw_transaction=raw_transaction))
+
+    result = await signer.modify_and_sign_transaction(transaction)
+
+    assert result.signature == signature
+    assert stale_signature not in result.transaction.signatures
 
 
 @respx.mock

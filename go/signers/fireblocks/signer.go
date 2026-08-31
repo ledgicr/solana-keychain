@@ -92,6 +92,12 @@ func (s *Signer) SignMessage(ctx context.Context, message []byte) (solana.Signat
 	return s.signRawBytes(ctx, message)
 }
 
+// HasServerSideEffects reports whether signing creates a Fireblocks-side request
+// per transaction, which PROGRAM_CALL does and RAW does not. A batch of
+// PROGRAM_CALL transactions is therefore signed sequentially, so a failure cannot
+// abandon siblings Fireblocks has already accepted.
+func (s *Signer) HasServerSideEffects() bool { return s.useProgramCall }
+
 // SignTransaction signs tx and returns the encoded transaction, this signer's
 // signature, and its completeness. The transaction's message bytes are signed
 // remotely with a RAW operation (a sign-only PROGRAM_CALL when
@@ -167,9 +173,10 @@ func (s *Signer) signProgramCall(ctx context.Context, tx *solana.Transaction, me
 	}
 
 	request := createTransactionRequest{
-		AssetID:   s.assetID,
-		Operation: operationProgramCall,
-		Source:    transactionSource{Type: sourceVaultAccount, ID: s.vaultAccountID},
+		AssetID:      s.assetID,
+		Operation:    operationProgramCall,
+		Source:       transactionSource{Type: sourceVaultAccount, ID: s.vaultAccountID},
+		ExternalTxID: s.externalTxID(message),
 		ExtraParameters: programCallExtraParameters{
 			ProgramCallData: encoded,
 			SignOnly:        true,
@@ -189,9 +196,14 @@ func (s *Signer) signProgramCall(ctx context.Context, tx *solana.Transaction, me
 	return sig, nil
 }
 
+func (s *Signer) externalTxID(message []byte) string {
+	namespace := "fireblocks:solana:program_call:" + s.assetID + ":" + s.vaultAccountID + ":"
+	return core.IdempotencyKeyFromMessage(append([]byte(namespace), message...))
+}
+
 // requestAndPollSignature creates a signing request and polls it to completion.
 func (s *Signer) requestAndPollSignature(ctx context.Context, request createTransactionRequest, programCall bool) (solana.Signature, error) {
-	created, err := s.createTransaction(ctx, request)
+	created, err := s.createTransaction(ctx, request, programCall)
 	if err != nil {
 		return solana.Signature{}, err
 	}

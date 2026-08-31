@@ -1,5 +1,11 @@
 import { anyAbortSignal } from './abort.js';
-import { sanitizeRemoteErrorResponse, SignerError, SignerErrorCode, throwSignerError } from './errors.js';
+import {
+    createSignerError,
+    sanitizeRemoteErrorResponse,
+    SignerError,
+    SignerErrorCode,
+    throwSignerError,
+} from './errors.js';
 
 /** Default timeout applied to remote signer API requests. */
 export const DEFAULT_FETCH_TIMEOUT_MS = 60_000;
@@ -10,6 +16,14 @@ export const DEFAULT_FETCH_TIMEOUT_MS = 60_000;
  * instead of being buffered unbounded.
  */
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
+
+const providerResponseErrors = new WeakSet<SignerError>();
+
+function throwProviderResponseError(code: SignerErrorCode, context: Record<string, unknown>): never {
+    const error = createSignerError(code, context);
+    providerResponseErrors.add(error);
+    throw error;
+}
 
 export interface FetchSignerJsonOptions {
     /**
@@ -41,21 +55,24 @@ export interface FetchSignerJsonOptions {
 
 /** The provider's HTTP status when its response was the failure. */
 export function providerStatus(error: unknown): number | undefined {
-    const status = error instanceof SignerError ? error.context?.status : undefined;
+    const status =
+        error instanceof SignerError && providerResponseErrors.has(error) ? error.context?.status : undefined;
     return typeof status === 'number' ? status : undefined;
 }
 
 /**
- * A 4xx is the only create outcome that rules out a transaction; anything else
- * (no response, timeout, 5xx, unusable success body) may already be executing.
+ * A 4xx other than 408 is the only create outcome that rules out a transaction;
+ * anything else (no response, timeout, 5xx, unusable success body) may already be
+ * executing. A 408 is a timeout reached while the request was being processed, so
+ * it does not rule the transaction out either.
  */
 export function providerMayHaveAccepted(error: unknown): boolean {
     const status = providerStatus(error);
-    return status === undefined || status < 400 || status >= 500;
+    return status === undefined || status < 400 || status >= 500 || status === 408;
 }
 
 function throwResponseTooLarge(providerName: string, status: number): never {
-    throwSignerError(SignerErrorCode.PARSING_ERROR, {
+    throwProviderResponseError(SignerErrorCode.PARSING_ERROR, {
         maxResponseBytes: MAX_RESPONSE_BYTES,
         message: `${providerName} response exceeded maximum size`,
         status,
@@ -106,6 +123,23 @@ async function readCappedResponseText(response: Response, providerName: string):
         offset += chunk.byteLength;
     }
     return new TextDecoder().decode(bytes);
+}
+
+/**
+ * The top-level `id` of a failed response body, when there is one. A provider
+ * that has already accepted a transaction may still answer with a non-2xx
+ * status, and that id is the caller's only handle for reconciling it.
+ */
+function transactionIdInBody(body: string): string | undefined {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        return undefined;
+    }
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    const transactionId = (parsed as { id?: unknown }).id;
+    return typeof transactionId === 'string' && transactionId.trim() ? transactionId : undefined;
 }
 
 /**
@@ -161,8 +195,10 @@ export async function fetchSignerJson<TResponse>(options: FetchSignerJsonOptions
             if (error instanceof SignerError) throw error;
             errorText = 'Failed to read error response';
         }
-        throwSignerError(SignerErrorCode.REMOTE_API_ERROR, {
+        const providerTransactionId = transactionIdInBody(errorText);
+        throwProviderResponseError(SignerErrorCode.REMOTE_API_ERROR, {
             message: `${providerName} API error: ${response.status}`,
+            ...(providerTransactionId === undefined ? {} : { providerTransactionId }),
             response: sanitizeRemoteErrorResponse(errorText),
             status: response.status,
         });

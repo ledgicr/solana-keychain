@@ -36,6 +36,7 @@ type createTransactionRequest struct {
 	AssetID         string            `json:"assetId"`
 	Operation       string            `json:"operation"`
 	Source          transactionSource `json:"source"`
+	ExternalTxID    string            `json:"externalTxId,omitempty"`
 	ExtraParameters any               `json:"extraParameters"`
 }
 
@@ -178,8 +179,19 @@ func (s *Signer) selectVaultAddress(addresses []vaultAddress) (string, error) {
 	}
 }
 
-// createTransaction creates a signing request in Fireblocks.
-func (s *Signer) createTransaction(ctx context.Context, request createTransactionRequest) (createTransactionResponse, error) {
+// createTransaction creates a signing request in Fireblocks. A PROGRAM_CALL
+// create that neither succeeds nor is rejected by a 4xx leaves a request
+// Fireblocks may still act on, so it reports CodeBroadcastUnconfirmed with any
+// transaction id the response carried; a RAW create signs nothing on its own
+// and keeps the plain failure.
+func (s *Signer) createTransaction(ctx context.Context, request createTransactionRequest, programCall bool) (createTransactionResponse, error) {
+	ambiguous := func(status int, respBody []byte, err error) error {
+		if !programCall {
+			return err
+		}
+		return core.UnconfirmedUnlessRejected(status, transactionIDFromBody(respBody), request.ExternalTxID, err)
+	}
+
 	body, err := json.Marshal(request)
 	if err != nil {
 		return createTransactionResponse{}, core.WrapSignerError(core.CodeSerializationError, "failed to serialize fireblocks request", err)
@@ -187,17 +199,35 @@ func (s *Signer) createTransaction(ctx context.Context, request createTransactio
 
 	status, respBody, err := s.doRequest(ctx, http.MethodPost, "/v1/transactions", string(body))
 	if err != nil {
-		return createTransactionResponse{}, err
+		return createTransactionResponse{}, ambiguous(status, nil, err)
 	}
 	if !core.IsSuccess(status) {
-		return createTransactionResponse{}, core.NewRemoteAPIError("API error", status, respBody)
+		return createTransactionResponse{}, ambiguous(status, respBody, core.NewRemoteAPIError("API error", status, respBody))
 	}
 
 	var created createTransactionResponse
 	if err := json.Unmarshal(respBody, &created); err != nil {
-		return createTransactionResponse{}, core.WrapSignerError(core.CodeSerializationError, "failed to parse response", err)
+		return createTransactionResponse{}, ambiguous(status, respBody,
+			core.WrapSignerError(core.CodeSerializationError, "failed to parse response", err))
+	}
+	if strings.TrimSpace(created.ID) == "" {
+		return createTransactionResponse{}, ambiguous(status, respBody,
+			core.NewSignerError(core.CodeSerializationError, "Fireblocks create response did not include a transaction id"))
 	}
 	return created, nil
+}
+
+func transactionIDFromBody(body []byte) string {
+	var parsed struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return ""
+	}
+	if strings.TrimSpace(parsed.ID) == "" {
+		return ""
+	}
+	return parsed.ID
 }
 
 // getTransaction fetches the current status of a Fireblocks transaction.
@@ -222,12 +252,15 @@ func (s *Signer) getTransaction(ctx context.Context, txID string) (transactionRe
 // sign-only PROGRAM_CALL); FAILED/CANCELLED/REJECTED/BLOCKED fail signing; a
 // PROGRAM_CALL that reached the network despite signOnly reports
 // CodeBroadcastUnconfirmed; anything else waits pollInterval and retries.
-// Cancellation of ctx aborts the wait.
 func (s *Signer) pollForSignature(ctx context.Context, txID string, programCall bool) (transactionResponse, error) {
 	for attempt := 0; attempt < s.maxPollAttempts; attempt++ {
 		response, err := s.getTransaction(ctx, txID)
 		if err != nil {
-			return transactionResponse{}, err
+			if !programCall || ctx.Err() != nil {
+				return transactionResponse{}, err
+			}
+			return transactionResponse{}, core.NewBroadcastUnconfirmedError(txID,
+				"fireblocks PROGRAM_CALL outcome could not be resolved: "+err.Error())
 		}
 
 		if programCall {
@@ -256,5 +289,10 @@ func (s *Signer) pollForSignature(ctx context.Context, txID string, programCall 
 		}
 	}
 
-	return transactionResponse{}, core.PollTimeoutError("fireblocks", s.maxPollAttempts)
+	if programCall {
+		return transactionResponse{}, core.NewBroadcastUnconfirmedError(txID,
+			"fireblocks PROGRAM_CALL polling timed out after "+strconv.Itoa(s.maxPollAttempts)+
+				" attempts; the transaction may already be executing")
+	}
+	return transactionResponse{}, core.PollTimeoutError("fireblocks", s.maxPollAttempts, "")
 }

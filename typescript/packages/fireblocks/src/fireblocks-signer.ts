@@ -1,5 +1,5 @@
 import { Address, assertIsAddress } from '@solana/addresses';
-import { getBase16Decoder, getBase16Encoder, getBase58Encoder } from '@solana/codecs-strings';
+import { getBase16Decoder, getBase16Encoder, getBase58Encoder, getUtf8Encoder } from '@solana/codecs-strings';
 import {
     abortableDelay,
     assertHttpsUrl,
@@ -7,7 +7,13 @@ import {
     createSignatureDictionary,
     ED25519_SIGNATURE_LENGTH,
     fetchSignerJson,
+    idempotencyKeyFromMessage,
+    normalizeMessageBytes,
+    providerMayHaveAccepted,
+    providerStatus,
+    signBatchSequential,
     signBatchStaggered,
+    SignerError,
     SignerErrorCode,
     SolanaMessageSigner,
     SolanaTransactionSigner,
@@ -55,6 +61,7 @@ export async function createFireblocksSigner<TAddress extends string = string>(
 let base16Encoder: ReturnType<typeof getBase16Encoder> | undefined;
 let base16Decoder: ReturnType<typeof getBase16Decoder> | undefined;
 let base58Encoder: ReturnType<typeof getBase58Encoder> | undefined;
+let utf8Encoder: ReturnType<typeof getUtf8Encoder> | undefined;
 
 /** The version prefix sets the high bit of the first message byte, low bits hold the version. */
 function isV1Message(messageBytes: Transaction['messageBytes']): boolean {
@@ -287,8 +294,10 @@ class FireblocksSigner<TAddress extends string = string>
             });
         }
 
+        const externalTxId = await this.externalTxId(transaction.messageBytes);
         const request: CreateTransactionRequest = {
             assetId: this.assetId,
+            externalTxId,
             extraParameters: {
                 programCallData: getBase64EncodedWireTransaction(transaction),
                 signOnly: true,
@@ -301,13 +310,60 @@ class FireblocksSigner<TAddress extends string = string>
             },
         };
 
-        const createResponse = await this.request<CreateTransactionResponse>(
-            'POST',
-            '/v1/transactions',
-            request,
-            abortSignal,
-        );
-        return await this.pollForSignature(createResponse.id, 'PROGRAM_CALL', abortSignal);
+        const transactionId = await this.createProgramCallTransaction(request, externalTxId, abortSignal);
+        return await this.pollForSignature(transactionId, 'PROGRAM_CALL', abortSignal);
+    }
+
+    /** Creates a PROGRAM_CALL signing request. */
+    private async createProgramCallTransaction(
+        request: CreateTransactionRequest,
+        externalTxId: string,
+        abortSignal?: AbortSignal,
+    ): Promise<string> {
+        let createResponse: CreateTransactionResponse;
+        try {
+            createResponse = await this.request<CreateTransactionResponse>(
+                'POST',
+                '/v1/transactions',
+                request,
+                abortSignal,
+            );
+        } catch (error) {
+            if (!providerMayHaveAccepted(error)) {
+                throw error;
+            }
+            const status = providerStatus(error);
+            const providerTransactionId =
+                error instanceof SignerError ? error.context?.providerTransactionId : undefined;
+            return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
+                cause: error,
+                idempotencyKey: externalTxId,
+                message:
+                    typeof providerTransactionId === 'string'
+                        ? `Fireblocks may have accepted the PROGRAM_CALL, but the outcome could not be confirmed (provider transaction id: ${providerTransactionId})`
+                        : 'Fireblocks may have accepted the PROGRAM_CALL, but the outcome could not be confirmed and no transaction id was returned',
+                ...(status === undefined ? {} : { status }),
+                ...(typeof providerTransactionId === 'string' ? { providerTransactionId } : {}),
+            });
+        }
+        if (typeof createResponse.id !== 'string' || createResponse.id.length === 0) {
+            return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
+                idempotencyKey: externalTxId,
+                message:
+                    'Fireblocks accepted the PROGRAM_CALL but returned no transaction id, so the outcome cannot be confirmed',
+            });
+        }
+        return createResponse.id;
+    }
+
+    private async externalTxId(messageBytes: ArrayLike<number>): Promise<string> {
+        utf8Encoder ||= getUtf8Encoder();
+        const namespace = utf8Encoder.encode(`fireblocks:solana:program_call:${this.assetId}:${this.vaultAccountId}:`);
+        const bytes = normalizeMessageBytes(messageBytes);
+        const namespaced = new Uint8Array(namespace.length + bytes.length);
+        namespaced.set(namespace);
+        namespaced.set(bytes, namespace.length);
+        return await idempotencyKeyFromMessage(namespaced);
     }
 
     /**
@@ -321,7 +377,19 @@ class FireblocksSigner<TAddress extends string = string>
         const uri = `/v1/transactions/${encodeURIComponent(transactionId)}`;
 
         for (let attempt = 0; attempt < this.maxPollAttempts; attempt++) {
-            const txResponse = await this.request<TransactionResponse>('GET', uri, undefined, abortSignal);
+            let txResponse: TransactionResponse;
+            try {
+                txResponse = await this.request<TransactionResponse>('GET', uri, undefined, abortSignal);
+            } catch (error) {
+                if (operation !== 'PROGRAM_CALL' || abortSignal?.aborted === true) {
+                    throw error;
+                }
+                return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
+                    cause: error,
+                    message: 'Fireblocks PROGRAM_CALL outcome could not be resolved',
+                    providerTransactionId: transactionId,
+                });
+            }
 
             const status = txResponse.status as FireblocksTransactionStatus;
 
@@ -349,6 +417,12 @@ class FireblocksSigner<TAddress extends string = string>
             await abortableDelay(this.pollIntervalMs, abortSignal);
         }
 
+        if (operation === 'PROGRAM_CALL') {
+            return throwSignerError(SignerErrorCode.BROADCAST_UNCONFIRMED, {
+                message: `Fireblocks PROGRAM_CALL did not resolve within ${this.maxPollAttempts} attempts; the transaction may already be executing`,
+                providerTransactionId: transactionId,
+            });
+        }
         throwSignerError(SignerErrorCode.SIGNING_FAILED, {
             message: `Transaction did not complete within ${this.maxPollAttempts} attempts`,
         });
@@ -407,10 +481,7 @@ class FireblocksSigner<TAddress extends string = string>
         return await signBatchStaggered(
             messages,
             async message => {
-                const messageBytes =
-                    message.content instanceof Uint8Array
-                        ? message.content
-                        : new Uint8Array(Array.from(message.content));
+                const messageBytes = normalizeMessageBytes(message.content);
                 const signatureBytes = await this.signRawBytes(messageBytes, config?.abortSignal);
                 await assertSignatureValid({
                     data: messageBytes,
@@ -436,25 +507,31 @@ class FireblocksSigner<TAddress extends string = string>
     ): Promise<readonly SignatureDictionary[]> {
         this.ensureInitialized();
 
-        return await signBatchStaggered(
-            transactions,
-            async transaction => {
-                const signatureBytes = this.useProgramCall
-                    ? await this.signProgramCall(transaction, config?.abortSignal)
-                    : await this.signRawBytes(new Uint8Array(transaction.messageBytes), config?.abortSignal);
-                await assertSignatureValid({
-                    data: transaction.messageBytes,
-                    signature: signatureBytes,
-                    signerAddress: this.address,
-                });
-                return createSignatureDictionary({
-                    signature: signatureBytes,
-                    signerAddress: this.address,
-                });
-            },
-            this.requestDelayMs,
-            config?.abortSignal,
-        );
+        const signOne = async (transaction: (typeof transactions)[number]): Promise<SignatureDictionary> => {
+            const signatureBytes = this.useProgramCall
+                ? await this.signProgramCall(transaction, config?.abortSignal)
+                : await this.signRawBytes(normalizeMessageBytes(transaction.messageBytes), config?.abortSignal);
+            await assertSignatureValid({
+                data: transaction.messageBytes,
+                signature: signatureBytes,
+                signerAddress: this.address,
+            });
+            return createSignatureDictionary({
+                signature: signatureBytes,
+                signerAddress: this.address,
+            });
+        };
+
+        if (this.useProgramCall) {
+            return await signBatchSequential(
+                transactions,
+                signOne,
+                this.requestDelayMs,
+                'completedSignatures',
+                config?.abortSignal,
+            );
+        }
+        return await signBatchStaggered(transactions, signOne, this.requestDelayMs, config?.abortSignal);
     }
 
     /**

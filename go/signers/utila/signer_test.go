@@ -689,3 +689,15 @@ func TestStringDoesNotLeakSecrets(t *testing.T) {
 		}
 	}
 }
+
+func TestNewRejectsWalletResourceFromAnotherVault(t *testing.T) {
+	_, err := New(context.Background(), Config{
+		ServiceAccountEmail:         testEmail,
+		ServiceAccountPrivateKeyPEM: testRSAKey,
+		VaultID:                     "vaults/" + testVaultID,
+		WalletID:                    "vaults/other-vault/wallets/" + testWalletID,
+		Network:                     testNetwork,
+		APIBaseURL:                  "https://127.0.0.1:1",
+	})
+	testutils.AssertCode(t, err, core.CodeConfigError)
+}

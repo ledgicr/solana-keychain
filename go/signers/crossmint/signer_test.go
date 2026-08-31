@@ -351,7 +351,7 @@ func TestSignAndSendTransactionSuccess(t *testing.T) {
 		if marshalErr != nil {
 			t.Errorf("serialize submitted message: %v", marshalErr)
 		}
-		digest := sha256.Sum256(submittedMessage)
+		digest := sha256.Sum256(append([]byte("crossmint:solana:0::"), submittedMessage...))
 		key := digest[:16]
 		key[6] = (key[6] & 0x0f) | 0x40
 		key[8] = (key[8] & 0x3f) | 0x80
@@ -404,6 +404,18 @@ func assertUnconfirmedWithoutID(t *testing.T, err error, wantStatus int) {
 	}
 }
 
+func TestNamespacedKeyInputIsNamespacedBySignerLocator(t *testing.T) {
+	for _, tc := range []struct{ locator, want string }{
+		{"", "crossmint:solana:0::MSG"},
+		{"server:abc", "crossmint:solana:10:server:abc:MSG"},
+	} {
+		s := &Signer{signerLocator: tc.locator}
+		if got := string(s.namespacedKeyInput([]byte("MSG"))); got != tc.want {
+			t.Errorf("namespacedKeyInput(%q) = %q, want %q", tc.locator, got, tc.want)
+		}
+	}
+}
+
 func TestCreateServerErrorIsUnconfirmedWithoutID(t *testing.T) {
 	s := createStatusSigner(t, http.StatusServiceUnavailable, `{"message":"unavailable"}`)
 	tx, err := testutils.CreateTestTransaction(s.Pubkey())
@@ -414,6 +426,38 @@ func TestCreateServerErrorIsUnconfirmedWithoutID(t *testing.T) {
 	assertUnconfirmedWithoutID(t, err, http.StatusServiceUnavailable)
 }
 
+func TestUnconfirmedCreateCarriesTheKeyItWasSubmittedUnder(t *testing.T) {
+	var sentKey string
+	priv := testutils.TestPrivateKey()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+testWalletPath, walletHandler(t, testAPIKey, testutils.PubkeyOf(priv).String()))
+	mux.HandleFunc("POST "+testWalletPath+"/transactions", func(w http.ResponseWriter, r *http.Request) {
+		sentKey = r.Header.Get("x-idempotency-key")
+		testutils.WriteRawJSON(w, http.StatusServiceUnavailable, `{"message":"unavailable"}`)
+	})
+	cfg := baseConfig(testutils.StartTLSServer(t, mux))
+	cfg.MaxPollAttempts = 1
+	s := newTestSigner(t, cfg)
+	tx, err := testutils.CreateTestTransaction(s.Pubkey())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = s.SignAndSendTransaction(context.Background(), tx)
+
+	assertUnconfirmedWithoutID(t, err, http.StatusServiceUnavailable)
+	var se *core.SignerError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected a SignerError, got %v", err)
+	}
+	if sentKey == "" {
+		t.Fatal("the create carried no idempotency key")
+	}
+	if se.IdempotencyKey != sentKey {
+		t.Errorf("IdempotencyKey = %q, want %q", se.IdempotencyKey, sentKey)
+	}
+}
+
 func TestCreateAcceptedWithoutIDIsUnconfirmed(t *testing.T) {
 	s := createStatusSigner(t, http.StatusCreated, `{"status":"pending"}`)
 	tx, err := testutils.CreateTestTransaction(s.Pubkey())
@@ -422,6 +466,30 @@ func TestCreateAcceptedWithoutIDIsUnconfirmed(t *testing.T) {
 	}
 	_, err = s.SignAndSendTransaction(context.Background(), tx)
 	assertUnconfirmedWithoutID(t, err, 0)
+}
+
+func TestCreateAcceptedWithBlankIDIsUnconfirmedWithoutOne(t *testing.T) {
+	s := createStatusSigner(t, http.StatusCreated, `{"id":"   ","status":"pending"}`)
+	tx, err := testutils.CreateTestTransaction(s.Pubkey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignAndSendTransaction(context.Background(), tx)
+	assertUnconfirmedWithoutID(t, err, 0)
+}
+
+func TestCreateAcceptedWithUnusableBodyKeepsID(t *testing.T) {
+	s := createStatusSigner(t, http.StatusCreated, `{"id":"tx-accepted","status":123}`)
+	tx, err := testutils.CreateTestTransaction(s.Pubkey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignAndSendTransaction(context.Background(), tx)
+	testutils.AssertCode(t, err, core.CodeBroadcastUnconfirmed)
+	var se *core.SignerError
+	if !errors.As(err, &se) || se.ProviderTxID != "tx-accepted" {
+		t.Errorf("error must carry the accepted transaction id, got %v", err)
+	}
 }
 
 func TestCreateRejectionStaysPlainFailure(t *testing.T) {
@@ -506,6 +574,47 @@ func TestSignAndSendTransactionAcceptsSignatureFromOnChainTransactionBytes(t *te
 	// differs from the caller's. Its signature must never be placed in the
 	// caller's transaction, which could not verify with it.
 	assertCallerTransactionUntouched(t, localTx)
+}
+
+func TestSignAndSendTransactionRejectsSignatureNotCoveringReturnedMessage(t *testing.T) {
+	priv := testutils.TestPrivateKey()
+	signerPubkey := testutils.PubkeyOf(priv)
+
+	remoteTx, err := testutils.CreateTestTransaction(signerPubkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AddSignature(remoteTx, signerPubkey, testutils.SignWith(priv, []byte("unrelated bytes"))); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := remoteTx.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+testWalletPath, walletHandler(t, testAPIKey, signerPubkey.String()))
+	mux.HandleFunc("POST "+testWalletPath+"/transactions", func(w http.ResponseWriter, _ *http.Request) {
+		testutils.WriteRawJSON(w, http.StatusCreated, fmt.Sprintf(
+			`{"id":"tx-unverifiable","status":"success","onChain":{"transaction":%q}}`,
+			base58.Encode(raw)))
+	})
+	srv := testutils.StartTLSServer(t, mux)
+
+	cfg := baseConfig(srv)
+	cfg.MaxPollAttempts = 1
+	s := newTestSigner(t, cfg)
+
+	localTx, err := testutils.CreateTestTransaction(signerPubkey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SignAndSendTransaction(context.Background(), localTx)
+	testutils.AssertCode(t, err, core.CodeBroadcastUnconfirmed)
+	var se *core.SignerError
+	if !errors.As(err, &se) || se.ProviderTxID != "tx-unverifiable" {
+		t.Errorf("error must carry the accepted transaction id, got %v", err)
+	}
 }
 
 // A returned transaction whose message matches the submitted one really is signed

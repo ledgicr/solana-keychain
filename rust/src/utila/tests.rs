@@ -352,7 +352,7 @@ async fn test_sign_transaction_timeout() {
 
     let signer = create_test_signer(&server.uri(), Some(keypair_pubkey(&keypair)));
     let result = signer.sign_transaction(&mut transaction).await;
-    assert!(matches!(result, Err(SignerError::RemoteApiError(_))));
+    assert!(matches!(result, Err(SignerError::RemoteApiError { .. })));
 }
 
 #[tokio::test]
@@ -440,4 +440,16 @@ fn signed_transaction_payload_for_keypair(
 
 fn server_url() -> String {
     "http://127.0.0.1:1".to_string()
+}
+
+#[test]
+fn test_wallet_resource_naming_a_foreign_vault_is_rejected() {
+    let mut config = config();
+    config.vault_id = "vaults/vault-test".to_string();
+    config.wallet_id = "vaults/other-vault/wallets/wallet-test".to_string();
+
+    assert!(matches!(
+        UtilaSigner::new(config),
+        Err(SignerError::ConfigError(_))
+    ));
 }

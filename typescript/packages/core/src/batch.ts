@@ -1,5 +1,5 @@
 import { abortableDelay } from './abort.js';
-import { SignerErrorCode, throwSignerError } from './errors.js';
+import { SignerError, SignerErrorCode, throwSignerError } from './errors.js';
 
 const MAX_RECOMMENDED_REQUEST_DELAY_MS = 3000;
 
@@ -49,4 +49,35 @@ export async function signBatchStaggered<TItem, TResult>(
             return await fn(item, index);
         }),
     );
+}
+
+/** Signs items sequentially so completed provider-side work is retained on failure. */
+export async function signBatchSequential<TItem, TResult>(
+    items: readonly TItem[],
+    fn: (item: TItem, index: number) => Promise<TResult>,
+    delayMs: number,
+    completedKey: string,
+    abortSignal?: AbortSignal,
+): Promise<readonly TResult[]> {
+    abortSignal?.throwIfAborted();
+    const results: TResult[] = [];
+    for (const [index, item] of items.entries()) {
+        if (delayMs > 0 && index > 0) {
+            await abortableDelay(delayMs, abortSignal);
+        }
+        abortSignal?.throwIfAborted();
+        try {
+            results.push(await fn(item, index));
+        } catch (error) {
+            if (!(error instanceof SignerError)) {
+                throw error;
+            }
+            throwSignerError(error.code, {
+                ...error.context,
+                [completedKey]: [...results],
+                failedIndex: index,
+            });
+        }
+    }
+    return results;
 }
