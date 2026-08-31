@@ -6,7 +6,7 @@
 //!
 //! ```sh
 //! cargo run --example ledger_open_app \
-//!   --no-default-features --features memory,ledger,sdk-v3
+//!   --no-default-features --features memory,ledger,sdk-v4
 //! ```
 //!
 //! Expected: the device prompts to open Solana (confirm on-screen), then this
@@ -14,7 +14,7 @@
 //! already open (should be a silent no-op) and with a different app open (should
 //! quit to dashboard, then launch Solana).
 
-#[cfg(all(feature = "ledger", feature = "sdk-v3"))]
+#[cfg(all(feature = "ledger", feature = "sdk-v4"))]
 fn main() {
     use solana_keychain::ledger::LedgerSigner;
 
@@ -32,7 +32,7 @@ fn main() {
     }
 }
 
-#[cfg(not(all(feature = "ledger", feature = "sdk-v3")))]
+#[cfg(not(all(feature = "ledger", feature = "sdk-v4")))]
 fn main() {
-    eprintln!("build with --no-default-features --features memory,ledger,sdk-v3");
+    eprintln!("build with --no-default-features --features memory,ledger,sdk-v4");
 }

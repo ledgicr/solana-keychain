@@ -19,17 +19,21 @@
 //! operation through one thread is also correct on its own terms — a Ledger can
 //! only service one APDU exchange at a time.
 //!
-//! Currently gated to `sdk-v3` (see the `compile_error!` in `lib.rs`): the
-//! solana-* crate versions `solana-remote-wallet` pins line up with the v3 SDK.
+//! Gated to `sdk-v4` (see the `compile_error!` in `lib.rs`): the ledger backend
+//! needs `solana-remote-wallet` 4.x — the first line carrying the Nano Gen5
+//! product IDs — and the solana-* crate versions it pins line up with the v4
+//! SDK.
 
 mod dashboard;
 
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use solana_derivation_path::DerivationPath;
+use solana_remote_wallet::ledger::LedgerWallet;
 use solana_remote_wallet::remote_wallet::{
-    initialize_wallet_manager, RemoteWallet, RemoteWalletError,
+    initialize_wallet_manager, RemoteWallet, RemoteWalletError, RemoteWalletType,
 };
 
 use crate::error::SignerError;
@@ -261,22 +265,28 @@ fn device_actor(
             ));
         }
 
-        // `list_devices` already filters to valid Ledger wallets (VID/PID +
-        // HID usage). Select by manufacturer, not model — the model is the
-        // device name ("nano-gen5", "nano-x", "stax", …), never "ledger".
-        let ledgers: Vec<_> = manager
+        // `list_devices` filters to valid Ledger wallets by VID/PID + HID usage,
+        // but it also enumerates Trezor (and optionally Keystone) devices. The
+        // `wallet_type` variant is what identifies a Ledger — not the model,
+        // which is the device *name* ("nano-gen5", "nano-x", "stax", …) and never
+        // "ledger". Taking the `Rc<LedgerWallet>` straight out of the variant
+        // also removes the second `get_wallet`/`get_ledger` lookup by path.
+        let ledgers: Vec<Rc<LedgerWallet>> = manager
             .list_devices()
             .into_iter()
-            .filter(|d| d.manufacturer == solana_remote_wallet::locator::Manufacturer::Ledger)
+            .filter_map(|d| match d.wallet_type {
+                RemoteWalletType::Ledger(wallet) => Some(wallet),
+                _ => None,
+            })
             .collect();
 
         // Deterministic device selection: honor an explicit host path; otherwise
         // require exactly one device rather than silently picking the first (the
         // enumeration order is OS-dependent and unstable across re-plugs).
-        let info = match host_device_path.as_deref() {
+        let ledger = match host_device_path.as_deref() {
             Some(want) => ledgers
                 .into_iter()
-                .find(|d| d.host_device_path == want)
+                .find(|w| hid_path(w).as_deref() == Some(want))
                 .ok_or_else(|| {
                     SignerError::NotAvailable(format!("no Ledger device at host path `{want}`"))
                 })?,
@@ -288,9 +298,19 @@ fn device_actor(
                 }
                 1 => ledgers.into_iter().next().expect("len == 1"),
                 _ => {
+                    // `pretty_path` is the canonical Solana device locator
+                    // (`usb://ledger/<base pubkey>`) — stable across re-plugs,
+                    // unlike the OS HID path, so it is the useful half of the
+                    // disambiguation hint even though the path is what selects.
                     let list = ledgers
                         .iter()
-                        .map(|d| format!("  {} ({})", d.host_device_path, d.model))
+                        .map(|w| {
+                            format!(
+                                "  {} ({})",
+                                hid_path(w).unwrap_or_else(|| "<unknown path>".to_string()),
+                                w.pretty_path
+                            )
+                        })
                         .collect::<Vec<_>>()
                         .join("\n");
                     return Err(SignerError::NotAvailable(format!(
@@ -300,9 +320,6 @@ fn device_actor(
             },
         };
 
-        let ledger = manager
-            .get_ledger(&info.host_device_path)
-            .map_err(map_rw_err)?;
         let pubkey = ledger
             .get_pubkey(&path, confirm_pubkey_on_device)
             .map_err(map_rw_err)?;
@@ -379,10 +396,26 @@ fn device_actor(
     }
 }
 
+/// The OS HID path of a Ledger wallet's own device handle.
+///
+/// `solana-remote-wallet` 4.x makes `Device::path` and `Device::info`
+/// crate-private, so the value that used to be read as
+/// `Device::host_device_path` is recovered from the wallet's own `hidapi`
+/// handle instead. Same string, same format — and the same one
+/// [`dashboard::ensure_solana_app_open`] matches against.
+fn hid_path(wallet: &LedgerWallet) -> Option<String> {
+    let info = wallet.device.get_device_info().ok()?;
+    info.path().to_str().ok().map(str::to_string)
+}
+
 /// Extract the 64 raw bytes of a `solana-remote-wallet` signature so it can be
 /// rebuilt as the SDK-version-selected [`Signature`] type (byte-level bridge —
 /// no cross-version type unification required).
-fn signature_bytes(sig: solana_signature::Signature) -> [u8; 64] {
+///
+/// Taken as `impl AsRef<[u8]>` rather than naming `solana_signature::Signature`:
+/// under `sdk-v4` the `solana-signature` crate is bundled inside `solana-sdk`
+/// and is not a direct dependency to name.
+fn signature_bytes(sig: impl AsRef<[u8]>) -> [u8; 64] {
     let mut out = [0u8; 64];
     out.copy_from_slice(sig.as_ref());
     out
@@ -425,8 +458,11 @@ mod tests {
 
     #[test]
     fn signature_bytes_roundtrips() {
+        // The SDK-selected `Signature` stands in for `solana-remote-wallet`'s:
+        // both are `solana-signature` types, and the bridge is byte-level, so
+        // this exercises exactly the conversion the device path performs.
         let raw = [7u8; 64];
-        let sig = solana_signature::Signature::from(raw);
+        let sig = Signature::from(raw);
         assert_eq!(signature_bytes(sig), raw);
     }
 

@@ -76,10 +76,11 @@ pub mod utila;
 #[cfg(feature = "ledger")]
 pub mod ledger;
 
-// The `ledger` backend reuses solana-remote-wallet, whose solana-* crate
-// versions line up with the v3 SDK. Other SDK versions are not yet supported.
-#[cfg(all(feature = "ledger", not(feature = "sdk-v3")))]
-compile_error!("the `ledger` feature currently requires `sdk-v3`");
+// The `ledger` backend reuses solana-remote-wallet 4.x — the first line to
+// carry the Nano Gen5 product IDs — whose solana-* crate versions line up with
+// the v4 SDK. Other SDK versions are not supported.
+#[cfg(all(feature = "ledger", not(feature = "sdk-v4")))]
+compile_error!("the `ledger` feature currently requires `sdk-v4`");
 
 // Re-export core types
 pub use error::SignerError;

@@ -29,7 +29,7 @@
 | **Crossmint** | Crossmint managed wallets (`smart` and `mpc`) | `crossmint` |
 | **Openfort** | Openfort backend wallets with TEE-stored keys | `openfort` |
 | **Utila** | Utila MPC wallets and automated co-signer flow | `utila` |
-| **Ledger** | Ledger hardware wallet over USB-HID; key never leaves the device, per-signature on-device confirmation (requires `sdk-v3`) | `ledger` |
+| **Ledger** | Ledger hardware wallet over USB-HID; key never leaves the device, per-signature on-device confirmation (requires `sdk-v4`) | `ledger` |
 
 ## Installation
 
@@ -275,8 +275,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 [Ledger](https://www.ledger.com/) hardware-wallet signer over USB-HID, built on
 [`solana-remote-wallet`](https://docs.rs/solana-remote-wallet). The private key
 never leaves the device and every signature must be confirmed on the device
-screen. Requires the `ledger` + `sdk-v3` features, a connected and unlocked
+screen. Requires the `ledger` + `sdk-v4` features, a connected and unlocked
 device running the Solana app (and, on Linux, Ledger's `udev` rules).
+
+Supported devices are whatever `solana-remote-wallet` enumerates: Nano S,
+Nano S Plus, Nano X, Stax, Flex, and Nano Gen5. Gen5 is why this backend
+requires `sdk-v4` — its USB product IDs landed in `solana-remote-wallet` 4.1,
+and the 3.x line (which pairs with `sdk-v3`) is EOL and never received them.
 
 ```rust
 use solana_keychain::{Signer, SolanaSigner};

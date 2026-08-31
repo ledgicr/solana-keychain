@@ -46,8 +46,9 @@ openfort = [
     "dep:hex",
 ]
 utila = ["dep:reqwest", "dep:jsonwebtoken", "dep:chrono", "dep:tokio"]
-# Ledger hardware-wallet signing over USB-HID. Requires sdk-v3 (matches the
-# solana-* 3.x crates solana-remote-wallet pins). Not yet supported on sdk-v2/v4.
+# Ledger hardware-wallet signing over USB-HID. Requires sdk-v4 (matches the
+# solana-* crate versions solana-remote-wallet 4.x pins). Not supported on
+# sdk-v2/sdk-v3.
 # tokio is optional crate-wide; the actor bridge uses tokio::task::spawn_blocking,
 # so pull in tokio with its `rt` feature explicitly.
 ledger = [
@@ -58,10 +59,10 @@ ledger = [
     "dep:tokio",
     "tokio/rt",
 ]
-# NOTE: `ledger` is intentionally omitted here. It requires `sdk-v3` (enforced by
+# NOTE: `ledger` is intentionally omitted here. It requires `sdk-v4` (enforced by
 # a `compile_error!` in lib.rs), so folding it into `all` would break the common
 # `--features all` build under the default `sdk-v2`. Enable it explicitly with
-# `--features ledger,sdk-v3`.
+# `--features ledger,sdk-v4`.
 all = [
     "memory",
     "vault",
@@ -103,12 +104,14 @@ solana-shred-version-v3 = { package = "solana-shred-version", version = "=3.0.0"
 solana-signature = { version = ">=3.1, <3.5", optional = true }
 solana-sdk-v4 = { package = "solana-sdk", version = "=4.0.1", optional = true }
 
-# Ledger hardware wallet (USB-HID). 3.x line pins solana-pubkey ^3.0.0 /
-# solana-signature ^3.1.0 / solana-derivation-path ^3.0.0 — aligns with sdk-v3.
-# Default features pull a hidapi HID backend (linux-static-hidraw on Linux,
-# IOKit on macOS, native on Windows); agave-unstable-api silences the 3.1
-# deprecation gate (it becomes mandatory in 4.0).
-solana-remote-wallet = { version = "3.1.14", optional = true, features = ["agave-unstable-api"] }
+# Ledger hardware wallet (USB-HID). 4.2 line pins solana-pubkey >=4.2,<4.3 /
+# solana-signature >=3.4.1,<3.5 / solana-derivation-path ^3.0.0 — aligns with
+# sdk-v4. 4.1.0 is the first release carrying the Nano Gen5 product IDs
+# (LEDGER_NANO_GEN5_PIDS), so Gen5 support requires the 4.x line; the 3.x line
+# is EOL and never got them. Default features pull a hidapi HID backend
+# (linux-static-hidraw on Linux, IOKit on macOS, native on Windows);
+# agave-unstable-api is mandatory from 4.0 on.
+solana-remote-wallet = { version = "4.2.2", optional = true, features = ["agave-unstable-api"] }
 # DerivationPath type used by the ledger backend (same version solana-remote-wallet pins).
 solana-derivation-path = { version = "3.0.0", optional = true }
 # Off-chain message envelope for sign_message: a hardware wallet signs the
@@ -172,12 +175,7 @@ wiremock = "0.6"
 dotenvy = "0.15.7"
 litesvm = "0.7.0"
 litesvm-v3 = { package = "litesvm", version = "=0.8.1" }
-litesvm-v4 = { package = "litesvm", version = "=0.13.0" }
-# litesvm 0.13 (sdk-v4 tests) still exposes its simulate API in terms of
-# solana-transaction 3.x, while solana-sdk 4.x uses solana-transaction 4.x.
-# The bincode wire format is identical, so v4 transactions are round-tripped
-# into this type before calling simulate_transaction. Pinned to match litesvm.
-solana-transaction-litesvm-v4 = { package = "solana-transaction", version = "=3.1.0" }
+litesvm-v4 = { package = "litesvm", version = "=0.16.0" }
 # Pins the agave-* / solana-*-program cluster to 3.0.11 (last known-good).
 # v3.0.14 is partially migrated to solana-hash v4 which causes type mismatches.
 # All packages in this cluster have exact cross-version pins, so a single
