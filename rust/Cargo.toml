@@ -46,9 +46,10 @@ openfort = [
     "dep:hex",
 ]
 utila = ["dep:reqwest", "dep:jsonwebtoken", "dep:chrono", "dep:tokio"]
-# Ledger hardware-wallet signing over USB-HID. Requires sdk-v4 (matches the
-# solana-* crate versions solana-remote-wallet 4.x pins). Not supported on
-# sdk-v2/sdk-v3.
+# Ledger hardware-wallet signing over USB-HID. Works with any of sdk-v2/v3/v4:
+# the backend never shares a type with the selected SDK (pubkeys and signatures
+# cross the boundary as raw bytes), so solana-remote-wallet's own solana-* crates
+# resolve alongside the selected SDK's rather than having to match them.
 # tokio is optional crate-wide; the actor bridge uses tokio::task::spawn_blocking,
 # so pull in tokio with its `rt` feature explicitly.
 ledger = [
@@ -59,10 +60,11 @@ ledger = [
     "dep:tokio",
     "tokio/rt",
 ]
-# NOTE: `ledger` is intentionally omitted here. It requires `sdk-v4` (enforced by
-# a `compile_error!` in lib.rs), so folding it into `all` would break the common
-# `--features all` build under the default `sdk-v2`. Enable it explicitly with
-# `--features ledger,sdk-v4`.
+# NOTE: `ledger` is intentionally omitted here. Unlike the other backends it is
+# not a pure-Rust HTTP client — it pulls `hidapi`, which builds a native HID
+# library and needs platform HID headers, so folding it into `all` would put a C
+# toolchain requirement on every `--features all` build. Enable it explicitly
+# with `--features ledger`.
 all = [
     "memory",
     "vault",
@@ -104,11 +106,13 @@ solana-shred-version-v3 = { package = "solana-shred-version", version = "=3.0.0"
 solana-signature = { version = ">=3.1, <3.5", optional = true }
 solana-sdk-v4 = { package = "solana-sdk", version = "=4.0.1", optional = true }
 
-# Ledger hardware wallet (USB-HID). 4.2 line pins solana-pubkey >=4.2,<4.3 /
-# solana-signature >=3.4.1,<3.5 / solana-derivation-path ^3.0.0 — aligns with
-# sdk-v4. 4.1.0 is the first release carrying the Nano Gen5 product IDs
-# (LEDGER_NANO_GEN5_PIDS), so Gen5 support requires the 4.x line; the 3.x line
-# is EOL and never got them. Default features pull a hidapi HID backend
+# Ledger hardware wallet (USB-HID). The 4.x line is required for Nano Gen5:
+# 4.1.0 is the first release carrying its product IDs (LEDGER_NANO_GEN5_PIDS),
+# and the 3.x line is EOL and never received them. 4.2 pins solana-pubkey
+# >=4.2,<4.3 and solana-signature >=3.4.1,<3.5, which do not match the crates
+# sdk-v2/v3 select — that is fine, and deliberate: the ledger backend bridges to
+# the selected SDK by raw bytes, so cargo simply resolves both majors and no
+# type ever has to unify. Default features pull a hidapi HID backend
 # (linux-static-hidraw on Linux, IOKit on macOS, native on Windows);
 # agave-unstable-api is mandatory from 4.0 on.
 solana-remote-wallet = { version = "4.2.2", optional = true, features = ["agave-unstable-api"] }

@@ -19,10 +19,12 @@
 //! operation through one thread is also correct on its own terms — a Ledger can
 //! only service one APDU exchange at a time.
 //!
-//! Gated to `sdk-v4` (see the `compile_error!` in `lib.rs`): the ledger backend
-//! needs `solana-remote-wallet` 4.x — the first line carrying the Nano Gen5
-//! product IDs — and the solana-* crate versions it pins line up with the v4
-//! SDK.
+//! Works under any of `sdk-v2`/`sdk-v3`/`sdk-v4`. The backend needs
+//! `solana-remote-wallet` 4.x — the first line carrying the Nano Gen5 product
+//! IDs — whose solana-* crates do not match the ones `sdk-v2`/`sdk-v3` select.
+//! That costs nothing here: pubkeys and signatures cross to the selected SDK as
+//! raw bytes (see [`signature_bytes`]), so the two majors coexist in the
+//! dependency graph and no type is ever required to unify.
 
 mod dashboard;
 

@@ -8,7 +8,7 @@
 //!
 //! Run manually with a device attached:
 //! ```bash
-//! cargo test --no-default-features --features ledger,sdk-v4,integration-tests \
+//! cargo test --no-default-features --features ledger,sdk-v3,integration-tests \
 //!     ledger -- --nocapture
 //! ```
 
