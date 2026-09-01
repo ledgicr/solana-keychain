@@ -171,6 +171,9 @@ impl SolanaSigner for LedgerSigner {
         let serialized = solana_offchain_message::OffchainMessage::new(0, message)
             .and_then(|m| m.serialize())
             .map_err(|e| SignerError::ConfigError(format!("invalid off-chain message: {e:?}")))?;
+        // Kept for the post-signing verification below; `serialized` itself moves
+        // into the device closure.
+        let verify_against = serialized.clone();
         let cmd_tx = self.cmd_tx.clone();
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
             request_on(&cmd_tx, |reply| DeviceCommand::SignOffchainMessage {
@@ -180,7 +183,14 @@ impl SolanaSigner for LedgerSigner {
         })
         .await
         .map_err(|e| SignerError::Other(format!("Ledger signing task failed: {e}")))??;
-        Ok(Signature::from(sig_bytes))
+        let signature = Signature::from(sig_bytes);
+        // Same signature-binding invariant the remote backends hold to: never
+        // hand back a signature that does not verify against this signer's key
+        // over the bytes we computed. Here that also pins the envelope: the
+        // device signed the serialized `OffchainMessage`, so verification is
+        // against `serialized`, not the raw payload.
+        crate::signature_util::verify_or_reject(&signature, &self.pubkey, &verify_against)?;
+        Ok(signature)
     }
 
     async fn is_available(&self) -> bool {
@@ -220,6 +230,9 @@ impl TransactionSigner for LedgerSigner {
         tx: &mut VersionedTransaction,
     ) -> Result<SignTransactionResult, SignerError> {
         let message = tx.message.serialize();
+        // Kept for the post-signing verification below; `message` itself moves
+        // into the device closure.
+        let verify_against = message.clone();
         let cmd_tx = self.cmd_tx.clone();
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
             request_on(&cmd_tx, |reply| DeviceCommand::SignTransactionMessage {
@@ -231,6 +244,12 @@ impl TransactionSigner for LedgerSigner {
         .map_err(|e| SignerError::Other(format!("Ledger signing task failed: {e}")))??;
 
         let signature = Signature::from(sig_bytes);
+        // Signature binding, as the remote backends do it: reject rather than
+        // attach if the device's signature does not verify against this signer's
+        // key over the exact bytes we sent. On a hardware path this is what
+        // catches a transport-level corruption, or a device answering for a
+        // different derivation path than the one we cached a pubkey for.
+        crate::signature_util::verify_or_reject(&signature, &self.pubkey, &verify_against)?;
         TransactionUtil::add_signature_to_transaction(tx, &self.pubkey(), signature)?;
         let signed_transaction = (TransactionUtil::serialize_transaction(tx)?, signature);
         Ok(TransactionUtil::classify_signed_transaction(
