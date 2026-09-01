@@ -49,6 +49,19 @@ rust-test:
     cargo test --no-default-features --features {{ sdkv3 }}
     cargo test --no-default-features --features {{ sdkv4 }}
 
+# Launch the Solana app on a connected Ledger over the BOLOS dashboard.
+# Requires a plugged-in, unlocked device; prints what it found and did.
+# Not part of `test`: it needs hardware, so it is a manual diagnostic.
+[working-directory: 'rust']
+rust-ledger-open-app:
+    cargo run --example ledger_open_app --no-default-features --features memory,ledger,sdk-v3
+
+# Ledger hardware integration tests. They self-skip when no device is
+# connected, so this is safe to run without one.
+[working-directory: 'rust']
+rust-test-ledger:
+    cargo test --no-default-features --features memory,ledger,sdk-v3,integration-tests ledger -- --nocapture --test-threads=1
+
 [working-directory: 'rust']
 rust-test-integration:
     #!/usr/bin/env bash
