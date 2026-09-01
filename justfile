@@ -58,9 +58,12 @@ rust-ledger-open-app:
 
 # Ledger hardware integration tests. They self-skip when no device is
 # connected, so this is safe to run without one.
+# Uses the full sdkv3_int set rather than just `memory,ledger`: the shared
+# `tests::rpc_util` helper that `integration-tests` pulls in needs reqwest, so
+# the feature set has to include a remote backend.
 [working-directory: 'rust']
 rust-test-ledger:
-    cargo test --no-default-features --features memory,ledger,sdk-v3,integration-tests ledger -- --nocapture --test-threads=1
+    cargo test --no-default-features --features {{ sdkv3_int }},ledger ledger -- --nocapture --test-threads=1
 
 [working-directory: 'rust']
 rust-test-integration:
