@@ -6,18 +6,25 @@
 //! canonical Ledger APDU client. The private key never leaves the device, and
 //! every signature must be confirmed on the device screen.
 //!
-//! ## Why a dedicated thread
+//! ## Why one shared, permanent device thread
+//!
+//! Two independent reasons, and the second is the strict one.
 //!
 //! `solana-remote-wallet` is single-threaded: its `RemoteWalletManager` and
 //! `LedgerWallet` handles are reference-counted with [`std::rc::Rc`] and wrap a
-//! `hidapi` device that is not [`Sync`]. The [`SolanaSigner`] trait, by
-//! contrast, is `async` and `Send + Sync`. To bridge the two we confine **all**
-//! device I/O to one dedicated OS thread (the "device actor"). [`LedgerSigner`]
-//! holds only a channel [`Sender`] (which is `Send + Sync`) and a cached public
-//! key; each trait method performs a blocking request/response round-trip with
-//! the actor from inside [`tokio::task::spawn_blocking`]. Serializing every
-//! operation through one thread is also correct on its own terms — a Ledger can
-//! only service one APDU exchange at a time.
+//! `hidapi` device that is not [`Sync`], while the [`SolanaSigner`] trait is
+//! `async` and `Send + Sync`. Confining device I/O to one OS thread bridges
+//! that, and is correct on its own terms — a Ledger services one APDU exchange
+//! at a time.
+//!
+//! But the thread must also be a **process-wide singleton that never exits**,
+//! because of how IOKit schedules HID devices on macOS. See [`DEVICE_THREAD`]:
+//! a per-signer thread makes any connect/drop/reconnect cycle abort the process.
+//!
+//! So [`LedgerSigner`] owns no thread and no device handle at all — just a
+//! cached pubkey and a derivation path. Each trait method does a blocking
+//! request/reply against the shared thread from inside
+//! [`tokio::task::spawn_blocking`].
 //!
 //! Works under any of `sdk-v2`/`sdk-v3`/`sdk-v4`. The backend needs
 //! `solana-remote-wallet` 4.x — the first line carrying the Nano Gen5 product
@@ -30,7 +37,6 @@ mod dashboard;
 
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::JoinHandle;
 
 use solana_derivation_path::DerivationPath;
 use solana_remote_wallet::ledger::LedgerWallet;
@@ -54,28 +60,85 @@ pub const DEFAULT_DERIVATION_PATH: &str = "m/44'/501'/0'";
 /// Requests sent to the device-actor thread. Each carries a one-shot reply
 /// channel the actor uses to return the result.
 enum DeviceCommand {
+    /// Establish (or reuse) a device session and read the pubkey at `path_str`.
+    Connect {
+        path_str: String,
+        confirm_pubkey_on_device: bool,
+        host_device_path: Option<String>,
+        reply: Sender<Result<[u8; 32], SignerError>>,
+    },
     /// Sign serialized transaction-message bytes (Solana app "sign" APDU).
     SignTransactionMessage {
+        path_str: String,
         message: Vec<u8>,
         reply: Sender<Result<[u8; 64], SignerError>>,
     },
     /// Sign an off-chain message (Solana app "sign off-chain message" APDU).
     SignOffchainMessage {
+        path_str: String,
         message: Vec<u8>,
         reply: Sender<Result<[u8; 64], SignerError>>,
     },
     /// Liveness probe: can we read the pubkey without on-device confirmation?
-    IsAvailable { reply: Sender<bool> },
+    IsAvailable {
+        path_str: String,
+        reply: Sender<bool>,
+    },
+    /// Is any Ledger attached, regardless of whether it is usable?
+    ///
+    /// Exists so callers never have to touch `hidapi` themselves; see
+    /// [`device_channel`] for why that matters.
+    IsAttached { reply: Sender<bool> },
+}
+
+/// The one, process-wide device thread. Started on first use, never joined.
+///
+/// ## Why it must be a singleton
+///
+/// On macOS, `hidapi::HidApi::new()` enumerates through IOKit, which schedules
+/// each HID device onto **the calling thread's `CFRunLoop`**
+/// (`IOHIDDeviceScheduleWithRunLoop` <- `CFRunLoopAddSource`). When that thread
+/// exits, its run loop goes with it, but IOKit's process-global HID manager
+/// still holds the scheduled sources. The next `HidApi::new()` on a *different*
+/// thread then re-applies device matching over that stale state, and the process
+/// dies with SIGTRAP inside CoreFoundation's `__CFCheckCFInfoPACSignature`.
+///
+/// So a per-signer device thread cannot work: any create/drop/reconnect cycle
+/// crashes the process. Single operations always looked fine, which is exactly
+/// what made this read as a flaky test rather than a lifecycle bug. Confirmed
+/// from the crash report -- the faulting frames are the chain above.
+///
+/// One thread that never exits keeps every HID source scheduled on a run loop
+/// that stays alive, which is the only arrangement IOKit tolerates. It is also
+/// the right shape anyway: a Ledger services one APDU exchange at a time, so
+/// serialising through a single thread costs nothing.
+static DEVICE_THREAD: std::sync::OnceLock<Sender<DeviceCommand>> = std::sync::OnceLock::new();
+
+/// Channel to the device thread, starting it if this is the first call.
+///
+/// Everything that touches `hidapi` must go through here; calling
+/// `HidApi::new()` from any other thread is what crashes. See [`DEVICE_THREAD`].
+fn device_channel() -> &'static Sender<DeviceCommand> {
+    DEVICE_THREAD.get_or_init(|| {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        // The handle is deliberately dropped: this thread outlives every signer,
+        // so there is nothing to join and no handle worth keeping.
+        std::thread::Builder::new()
+            .name("ledger-device".to_string())
+            .spawn(move || device_thread(cmd_rx))
+            .expect("failed to spawn the Ledger device thread");
+        cmd_tx
+    })
 }
 
 /// A [`SolanaSigner`] backed by a Ledger hardware wallet.
+///
+/// Cheap to create and drop: it holds no thread and no device handle, only the
+/// cached pubkey and the derivation path to use. All device work happens on the
+/// shared thread described at [`DEVICE_THREAD`].
 pub struct LedgerSigner {
-    cmd_tx: Sender<DeviceCommand>,
     pubkey: Pubkey,
-    // Kept so the worker thread is observable for the lifetime of the signer.
-    // When `LedgerSigner` is dropped, `cmd_tx` drops, the actor's `recv()`
-    // returns `Err`, and the thread exits on its own.
-    _worker: JoinHandle<()>,
+    path_str: String,
 }
 
 impl std::fmt::Debug for LedgerSigner {
@@ -116,36 +179,41 @@ impl LedgerSigner {
         let path_str = derivation_path
             .unwrap_or(DEFAULT_DERIVATION_PATH)
             .to_string();
+        // Validate before troubling the device, so a typo is a clear config
+        // error rather than an obscure APDU failure.
+        DerivationPath::from_absolute_path_str(&path_str)
+            .map_err(|e| SignerError::ConfigError(format!("invalid derivation path: {e}")))?;
+
         let host_device_path = host_device_path.map(str::to_string);
-
-        let (setup_tx, setup_rx) = mpsc::channel::<Result<[u8; 32], SignerError>>();
-        let (cmd_tx, cmd_rx) = mpsc::channel::<DeviceCommand>();
-
-        let worker = std::thread::Builder::new()
-            .name("ledger-device".to_string())
-            .spawn(move || {
-                device_actor(
-                    path_str,
-                    confirm_pubkey_on_device,
-                    host_device_path,
-                    setup_tx,
-                    cmd_rx,
-                )
-            })
-            .map_err(|e| {
-                SignerError::Other(format!("failed to spawn Ledger device thread: {e}"))
-            })?;
-
-        // Wait for the actor to connect and report the public key (or fail).
-        let pubkey_bytes = setup_rx
-            .recv()
-            .map_err(|_| SignerError::NotAvailable("Ledger device thread exited".to_string()))??;
+        let pubkey_bytes = request_on(device_channel(), |reply| DeviceCommand::Connect {
+            path_str: path_str.clone(),
+            confirm_pubkey_on_device,
+            host_device_path,
+            reply,
+        })?;
 
         Ok(Self {
-            cmd_tx,
             pubkey: Pubkey::from(pubkey_bytes),
-            _worker: worker,
+            path_str,
         })
+    }
+
+    /// Is a Ledger attached, whether or not it is usable right now?
+    ///
+    /// Answers without requiring the device to be unlocked or the Solana app to
+    /// be open, so a caller can tell "no hardware" apart from "hardware present
+    /// but not ready" — which are very different things to report to a user.
+    /// Goes through the device thread; see [`DEVICE_THREAD`].
+    pub fn is_attached() -> bool {
+        let cmd_tx = device_channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if cmd_tx
+            .send(DeviceCommand::IsAttached { reply: reply_tx })
+            .is_err()
+        {
+            return false;
+        }
+        reply_rx.recv().unwrap_or(false)
     }
 }
 
@@ -174,11 +242,14 @@ impl SolanaSigner for LedgerSigner {
         // Kept for the post-signing verification below; `serialized` itself moves
         // into the device closure.
         let verify_against = serialized.clone();
-        let cmd_tx = self.cmd_tx.clone();
+        let path_str = self.path_str.clone();
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
-            request_on(&cmd_tx, |reply| DeviceCommand::SignOffchainMessage {
-                message: serialized,
-                reply,
+            request_on(device_channel(), |reply| {
+                DeviceCommand::SignOffchainMessage {
+                    path_str,
+                    message: serialized,
+                    reply,
+                }
             })
         })
         .await
@@ -194,11 +265,14 @@ impl SolanaSigner for LedgerSigner {
     }
 
     async fn is_available(&self) -> bool {
-        let cmd_tx = self.cmd_tx.clone();
+        let path_str = self.path_str.clone();
         tokio::task::spawn_blocking(move || {
             let (reply_tx, reply_rx) = mpsc::channel();
-            if cmd_tx
-                .send(DeviceCommand::IsAvailable { reply: reply_tx })
+            if device_channel()
+                .send(DeviceCommand::IsAvailable {
+                    path_str,
+                    reply: reply_tx,
+                })
                 .is_err()
             {
                 return false;
@@ -233,11 +307,14 @@ impl TransactionSigner for LedgerSigner {
         // Kept for the post-signing verification below; `message` itself moves
         // into the device closure.
         let verify_against = message.clone();
-        let cmd_tx = self.cmd_tx.clone();
+        let path_str = self.path_str.clone();
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
-            request_on(&cmd_tx, |reply| DeviceCommand::SignTransactionMessage {
-                message,
-                reply,
+            request_on(device_channel(), |reply| {
+                DeviceCommand::SignTransactionMessage {
+                    path_str,
+                    message,
+                    reply,
+                }
             })
         })
         .await
@@ -366,161 +443,247 @@ fn request_on<T: Send + 'static>(
 
 /// The device-actor thread body. Owns the single-threaded `solana-remote-wallet`
 /// handles and serves [`DeviceCommand`]s until the command channel closes.
-fn device_actor(
-    path_str: String,
+/// Establish a device session: enumerate, select, and read the pubkey.
+///
+/// Runs only on the device thread. Returns the wallet handle so the caller can
+/// cache it for subsequent commands.
+fn establish_session(
+    path: &DerivationPath,
     confirm_pubkey_on_device: bool,
-    host_device_path: Option<String>,
-    setup_tx: Sender<Result<[u8; 32], SignerError>>,
-    cmd_rx: Receiver<DeviceCommand>,
-) {
-    // ── Connect ────────────────────────────────────────────────────────────
-    let attempt = || {
-        let path = DerivationPath::from_absolute_path_str(&path_str)
-            .map_err(|e| SignerError::ConfigError(format!("invalid derivation path: {e}")))?;
-
-        // A failure to bring up the HID subsystem is an *availability* problem,
-        // not a signing failure — map it to NotAvailable directly rather than
-        // letting map_rw_err's catch-all bucket it as SigningFailed (which would
-        // also make the no-device unit test panic on CI runners lacking libhidapi).
-        let manager = initialize_wallet_manager().map_err(|e| {
-            SignerError::NotAvailable(format!("Ledger HID subsystem unavailable: {e}"))
-        })?;
-        let count = manager.update_devices().map_err(map_rw_err)?;
-        if count == 0 {
-            return Err(SignerError::NotAvailable(
-                "no Ledger device found (plug in, unlock, and open the Solana app)".to_string(),
-            ));
-        }
-
-        // `list_devices` filters to valid Ledger wallets by VID/PID + HID usage,
-        // but it also enumerates Trezor (and optionally Keystone) devices. The
-        // `wallet_type` variant is what identifies a Ledger — not the model,
-        // which is the device *name* ("nano-gen5", "nano-x", "stax", …) and never
-        // "ledger". Taking the `Rc<LedgerWallet>` straight out of the variant
-        // also removes the second `get_wallet`/`get_ledger` lookup by path.
-        let ledgers: Vec<Rc<LedgerWallet>> = manager
-            .list_devices()
-            .into_iter()
-            .filter_map(|d| match d.wallet_type {
-                RemoteWalletType::Ledger(wallet) => Some(wallet),
-                _ => None,
-            })
-            .collect();
-
-        // Deterministic device selection: honor an explicit host path; otherwise
-        // require exactly one device rather than silently picking the first (the
-        // enumeration order is OS-dependent and unstable across re-plugs).
-        let ledger = match host_device_path.as_deref() {
-            Some(want) => ledgers
-                .into_iter()
-                .find(|w| hid_path(w).as_deref() == Some(want))
-                .ok_or_else(|| {
-                    SignerError::NotAvailable(format!("no Ledger device at host path `{want}`"))
-                })?,
-            None => match ledgers.len() {
-                0 => {
-                    return Err(SignerError::NotAvailable(
-                        "no Ledger device found".to_string(),
-                    ))
-                }
-                1 => ledgers.into_iter().next().expect("len == 1"),
-                _ => {
-                    // `pretty_path` is the canonical Solana device locator
-                    // (`usb://ledger/<base pubkey>`) — stable across re-plugs,
-                    // unlike the OS HID path, so it is the useful half of the
-                    // disambiguation hint even though the path is what selects.
-                    let list = ledgers
-                        .iter()
-                        .map(|w| {
-                            format!(
-                                "  {} ({})",
-                                hid_path(w).unwrap_or_else(|| "<unknown path>".to_string()),
-                                w.pretty_path
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    return Err(SignerError::NotAvailable(format!(
-                        "multiple Ledger devices connected; pass host_device_path to select one:\n{list}"
-                    )));
-                }
-            },
-        };
-
-        let pubkey = ledger
-            .get_pubkey(&path, confirm_pubkey_on_device)
-            .map_err(map_rw_err)?;
-
-        Ok::<_, SignerError>((ledger, path, pubkey.to_bytes()))
-    };
-
-    // Try the normal Solana-app connection first: when the app is already open
-    // (the common case) this succeeds immediately and we never touch the
-    // dashboard — no second HID handle, no contention, no added latency.
-    let mut connected = attempt();
-
-    // If it failed, the Solana app may simply not be running. Once the user has
-    // unlocked with their PIN, auto-launch it for them (via the BOLOS dashboard)
-    // instead of erroring out with "open the Solana app", then retry across the
-    // USB re-enumeration that launching an app triggers. Best-effort: if the
-    // dashboard is unreachable we keep the original connect error. Declining the
-    // launch prompt on-device, though, is a real user decision — surface it.
-    if connected.is_err() {
-        match dashboard::ensure_solana_app_open(host_device_path.as_deref()) {
-            Ok(_launched) => {
-                for _ in 0..20 {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    connected = attempt();
-                    if connected.is_ok() {
-                        break;
-                    }
-                }
-            }
-            Err(e @ SignerError::UserRejected(_)) => {
-                let _ = setup_tx.send(Err(e));
-                return;
-            }
-            Err(e) => log::debug!("could not auto-open the Solana app ({e:?}); continuing"),
-        }
+    host_device_path: Option<&str>,
+) -> Result<(Rc<LedgerWallet>, [u8; 32]), SignerError> {
+    // A failure to bring up the HID subsystem is an *availability* problem,
+    // not a signing failure — map it to NotAvailable directly rather than
+    // letting map_rw_err's catch-all bucket it as SigningFailed (which would
+    // also make the no-device unit test panic on CI runners lacking libhidapi).
+    let manager = initialize_wallet_manager()
+        .map_err(|e| SignerError::NotAvailable(format!("Ledger HID subsystem unavailable: {e}")))?;
+    let count = manager.update_devices().map_err(map_rw_err)?;
+    if count == 0 {
+        return Err(SignerError::NotAvailable(
+            "no Ledger device found (plug in, unlock, and open the Solana app)".to_string(),
+        ));
     }
 
-    let (ledger, path) = match connected {
-        Ok((ledger, path, pubkey_bytes)) => {
-            if setup_tx.send(Ok(pubkey_bytes)).is_err() {
-                return; // caller gave up
+    // `list_devices` filters to valid Ledger wallets by VID/PID + HID usage,
+    // but it also enumerates Trezor (and optionally Keystone) devices. The
+    // `wallet_type` variant is what identifies a Ledger — not the model,
+    // which is the device *name* ("nano-gen5", "nano-x", "stax", …) and never
+    // "ledger". Taking the `Rc<LedgerWallet>` straight out of the variant
+    // also removes the second `get_wallet`/`get_ledger` lookup by path.
+    let ledgers: Vec<Rc<LedgerWallet>> = manager
+        .list_devices()
+        .into_iter()
+        .filter_map(|d| match d.wallet_type {
+            RemoteWalletType::Ledger(wallet) => Some(wallet),
+            _ => None,
+        })
+        .collect();
+
+    // Deterministic device selection: honor an explicit host path; otherwise
+    // require exactly one device rather than silently picking the first (the
+    // enumeration order is OS-dependent and unstable across re-plugs).
+    let ledger = match host_device_path {
+        Some(want) => ledgers
+            .into_iter()
+            .find(|w| hid_path(w).as_deref() == Some(want))
+            .ok_or_else(|| {
+                SignerError::NotAvailable(format!("no Ledger device at host path `{want}`"))
+            })?,
+        None => match ledgers.len() {
+            0 => {
+                return Err(SignerError::NotAvailable(
+                    "no Ledger device found".to_string(),
+                ))
             }
-            (ledger, path)
-        }
-        Err(e) => {
-            let _ = setup_tx.send(Err(e));
-            return;
-        }
+            1 => ledgers.into_iter().next().expect("len == 1"),
+            _ => {
+                // `pretty_path` is the canonical Solana device locator
+                // (`usb://ledger/<base pubkey>`) — stable across re-plugs,
+                // unlike the OS HID path, so it is the useful half of the
+                // disambiguation hint even though the path is what selects.
+                let list = ledgers
+                    .iter()
+                    .map(|w| {
+                        format!(
+                            "  {} ({})",
+                            hid_path(w).unwrap_or_else(|| "<unknown path>".to_string()),
+                            w.pretty_path
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(SignerError::NotAvailable(format!(
+                    "multiple Ledger devices connected; pass host_device_path to select one:\n{list}"
+                )));
+            }
+        },
     };
 
-    // ── Serve ──────────────────────────────────────────────────────────────
+    let pubkey = ledger
+        .get_pubkey(path, confirm_pubkey_on_device)
+        .map_err(map_rw_err)?;
+    Ok((ledger, pubkey.to_bytes()))
+}
+
+/// A live device session, cached on the device thread between commands.
+struct Session {
+    wallet: Rc<LedgerWallet>,
+    /// The host path this session was opened against, so a `Connect` asking for
+    /// a *different* device re-establishes instead of silently using this one.
+    host_device_path: Option<String>,
+}
+
+/// The device thread body. Runs for the life of the process.
+///
+/// Holds at most one open session and reuses it across commands, so repeated
+/// `LedgerSigner::connect` calls do not re-enumerate HID. Any device error drops
+/// the session, so the next connect re-establishes rather than reusing a handle
+/// to a device that has been unplugged, locked or switched apps.
+fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
+    let mut session: Option<Session> = None;
+
+    // Every command needs the caller's derivation path parsed; `connect` has
+    // already validated it, so a failure here is genuinely unexpected.
+    fn parse(path_str: &str) -> Result<DerivationPath, SignerError> {
+        DerivationPath::from_absolute_path_str(path_str)
+            .map_err(|e| SignerError::ConfigError(format!("invalid derivation path: {e}")))
+    }
+
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            DeviceCommand::SignTransactionMessage { message, reply } => {
-                let _ = reply.send(
-                    ledger
-                        .sign_message(&path, &message)
-                        .map(signature_bytes)
-                        .map_err(map_rw_err),
-                );
+            DeviceCommand::Connect {
+                path_str,
+                confirm_pubkey_on_device,
+                host_device_path,
+                reply,
+            } => {
+                let result = parse(&path_str).and_then(|path| {
+                    // Reuse only when it is the same device *and* the caller
+                    // does not need an on-screen confirmation, which by
+                    // definition has to reach the device.
+                    if let Some(existing) = session
+                        .as_ref()
+                        .filter(|s| s.host_device_path == host_device_path)
+                        .filter(|_| !confirm_pubkey_on_device)
+                    {
+                        if let Ok(pubkey) = existing.wallet.get_pubkey(&path, false) {
+                            return Ok(pubkey.to_bytes());
+                        }
+                        // The cached handle is stale; fall through and rebuild.
+                    }
+                    session = None;
+                    let attempt = |host: Option<&str>| {
+                        establish_session(&path, confirm_pubkey_on_device, host)
+                    };
+                    let mut connected = attempt(host_device_path.as_deref());
+
+                    // The Solana app may simply not be running. Once the user
+                    // has unlocked with their PIN, auto-launch it for them via
+                    // the BOLOS dashboard instead of erroring out with "open the
+                    // Solana app", then retry across the USB re-enumeration that
+                    // launching an app triggers. Best-effort: if the dashboard is
+                    // unreachable we keep the original connect error. Declining
+                    // the launch prompt on-device, though, is a real user
+                    // decision — surface it.
+                    if connected.is_err() {
+                        match dashboard::ensure_solana_app_open(host_device_path.as_deref()) {
+                            Ok(_launched) => {
+                                for _ in 0..20 {
+                                    std::thread::sleep(std::time::Duration::from_millis(250));
+                                    connected = attempt(host_device_path.as_deref());
+                                    if connected.is_ok() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e @ SignerError::UserRejected(_)) => return Err(e),
+                            Err(e) => log::debug!(
+                                "could not auto-open the Solana app ({e:?}); continuing"
+                            ),
+                        }
+                    }
+
+                    let (wallet, pubkey_bytes) = connected?;
+                    session = Some(Session {
+                        wallet,
+                        host_device_path,
+                    });
+                    Ok(pubkey_bytes)
+                });
+                let _ = reply.send(result);
             }
-            DeviceCommand::SignOffchainMessage { message, reply } => {
-                let _ = reply.send(
-                    ledger
-                        .sign_offchain_message(&path, &message)
+
+            DeviceCommand::SignTransactionMessage {
+                path_str,
+                message,
+                reply,
+            } => {
+                let result = with_session(&mut session, &path_str, |wallet, path| {
+                    wallet
+                        .sign_message(path, &message)
                         .map(signature_bytes)
-                        .map_err(map_rw_err),
-                );
+                        .map_err(map_rw_err)
+                });
+                let _ = reply.send(result);
             }
-            DeviceCommand::IsAvailable { reply } => {
-                let _ = reply.send(ledger.get_pubkey(&path, false).is_ok());
+
+            DeviceCommand::SignOffchainMessage {
+                path_str,
+                message,
+                reply,
+            } => {
+                let result = with_session(&mut session, &path_str, |wallet, path| {
+                    wallet
+                        .sign_offchain_message(path, &message)
+                        .map(signature_bytes)
+                        .map_err(map_rw_err)
+                });
+                let _ = reply.send(result);
+            }
+
+            DeviceCommand::IsAvailable { path_str, reply } => {
+                let ok = with_session(&mut session, &path_str, |wallet, path| {
+                    wallet.get_pubkey(path, false).map_err(map_rw_err)
+                })
+                .is_ok();
+                let _ = reply.send(ok);
+            }
+
+            DeviceCommand::IsAttached { reply } => {
+                const LEDGER_VID: u16 = 0x2c97;
+                let attached = hidapi::HidApi::new()
+                    .map(|api| api.device_list().any(|d| d.vendor_id() == LEDGER_VID))
+                    .unwrap_or(false);
+                let _ = reply.send(attached);
             }
         }
     }
+}
+
+/// Run `f` against the cached session, dropping it if the device errors.
+///
+/// Discarding the handle on error is what makes the next `connect` re-establish:
+/// a wallet whose device was unplugged, locked, or switched out of the Solana app
+/// never recovers, so holding on to it would turn one transient failure into a
+/// permanently broken signer.
+fn with_session<T>(
+    session: &mut Option<Session>,
+    path_str: &str,
+    f: impl FnOnce(&Rc<LedgerWallet>, &DerivationPath) -> Result<T, SignerError>,
+) -> Result<T, SignerError> {
+    let path = DerivationPath::from_absolute_path_str(path_str)
+        .map_err(|e| SignerError::ConfigError(format!("invalid derivation path: {e}")))?;
+    let Some(active) = session.as_ref() else {
+        return Err(SignerError::NotAvailable(
+            "no Ledger session; connect first".to_string(),
+        ));
+    };
+    let result = f(&active.wallet, &path);
+    if result.is_err() {
+        *session = None;
+    }
+    result
 }
 
 /// The OS HID path of a Ledger wallet's own device handle.
