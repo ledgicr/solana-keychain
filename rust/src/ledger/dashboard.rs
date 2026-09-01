@@ -24,6 +24,11 @@
 //! running) Solana app. Opening an app makes the device re-enumerate on USB, so
 //! the caller must tolerate a brief window before the Solana app answers.
 
+use std::rc::Rc;
+
+use solana_remote_wallet::ledger::{is_valid_ledger, LedgerWallet};
+use solana_remote_wallet::remote_wallet::RemoteWallet;
+
 use crate::error::SignerError;
 
 /// Ledger USB vendor id.
@@ -41,6 +46,66 @@ const HID_USB_DEVICE_CLASS: i32 = 0;
 
 fn is_apdu_interface(d: &hidapi::DeviceInfo) -> bool {
     d.usage_page() == HID_GLOBAL_USAGE_PAGE || d.interface_number() == HID_USB_DEVICE_CLASS
+}
+
+/// Construct `LedgerWallet`s for connected Ledgers that `solana-remote-wallet`'s
+/// own enumeration does not recognise.
+///
+/// `solana-remote-wallet` gates `RemoteWalletManager::update_devices` on
+/// `is_valid_ledger`, a hardcoded USB product-ID allowlist. A device released
+/// after the pinned remote-wallet is therefore invisible to `list_devices`, even
+/// though nothing about the APDU protocol differs. Nano Gen5 on remote-wallet
+/// 4.0.x is exactly this case: its product IDs first shipped in 4.1.0, as a
+/// six-line change adding the PID array to that allowlist and nothing else.
+///
+/// That allowlist is the *only* gate. `is_valid_ledger` has no other call site,
+/// `LedgerWallet::new` is public, and `RemoteWallet::read_device` neither
+/// re-checks the product ID nor depends on it — it reads the model from the HID
+/// product string and the firmware version over APDU. So the wallet can be built
+/// directly from our own enumeration, using the same Ledger-vendor plus
+/// APDU-interface filter this module already applies elsewhere.
+///
+/// This is deliberately a *fallback*, never the primary path: remote-wallet's
+/// enumeration is used whenever it recognises anything, so behaviour is
+/// unchanged for every device it knows about. It exists so a consumer pinned to
+/// an older remote-wallet — one whose own solana-* crate versions it cannot
+/// easily move — can still reach a newer device without forking the crate.
+pub(super) fn construct_unrecognized_ledgers() -> Vec<Rc<LedgerWallet>> {
+    let Ok(api) = hidapi::HidApi::new() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for info in api
+        .device_list()
+        .filter(|d| d.vendor_id() == LEDGER_VID && is_apdu_interface(d))
+    {
+        // Skip anything remote-wallet already handles: those arrive through
+        // `list_devices`, and the device must not be opened twice.
+        if is_valid_ledger(info.vendor_id(), info.product_id()) {
+            continue;
+        }
+        let Ok(device) = api.open_path(info.path()) else {
+            continue;
+        };
+        let mut wallet = LedgerWallet::new(device);
+        // Populates `version`, which the signing APDUs depend on.
+        match RemoteWallet::<hidapi::DeviceInfo>::read_device(&mut wallet, info) {
+            Ok(rw_info) => {
+                wallet.pretty_path = rw_info.get_pretty_path();
+                log::debug!(
+                    "constructed a Ledger unrecognised by solana-remote-wallet: pid={:#06x} model={}",
+                    info.product_id(),
+                    rw_info.model
+                );
+                out.push(Rc::new(wallet));
+            }
+            Err(e) => log::debug!(
+                "could not read a Ledger at pid={:#06x}: {e}",
+                info.product_id()
+            ),
+        }
+    }
+    out
 }
 
 /// BOLOS dashboard APDUs.

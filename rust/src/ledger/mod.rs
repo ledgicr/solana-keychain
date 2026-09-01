@@ -308,7 +308,7 @@ fn device_actor(
         // which is the device *name* ("nano-gen5", "nano-x", "stax", …) and never
         // "ledger". Taking the `Rc<LedgerWallet>` straight out of the variant
         // also removes the second `get_wallet`/`get_ledger` lookup by path.
-        let ledgers: Vec<Rc<LedgerWallet>> = manager
+        let mut ledgers: Vec<Rc<LedgerWallet>> = manager
             .list_devices()
             .into_iter()
             .filter_map(|d| match d.wallet_type {
@@ -316,6 +316,15 @@ fn device_actor(
                 _ => None,
             })
             .collect();
+
+        // If remote-wallet recognised nothing, a Ledger may still be attached
+        // whose USB product ID postdates the resolved remote-wallet's allowlist
+        // — Nano Gen5 against remote-wallet 4.0.x, for instance. Build those
+        // directly; see `dashboard::construct_unrecognized_ledgers` for why that
+        // is sound and why it is a fallback rather than the primary path.
+        if ledgers.is_empty() {
+            ledgers = dashboard::construct_unrecognized_ledgers();
+        }
 
         // Deterministic device selection: honor an explicit host path; otherwise
         // require exactly one device rather than silently picking the first (the
