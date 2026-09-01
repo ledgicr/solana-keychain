@@ -5,8 +5,7 @@
 //! app for the user instead of erroring "open the Solana app".
 //!
 //! ```sh
-//! cargo run --example ledger_open_app \
-//!   --no-default-features --features memory,ledger,sdk-v3
+//! just rust-ledger-open-app
 //! ```
 //!
 //! Expected: the device prompts to open Solana (confirm on-screen), then this

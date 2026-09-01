@@ -8,8 +8,7 @@
 //!
 //! Run manually with a device attached:
 //! ```bash
-//! cargo test --no-default-features --features memory,ledger,sdk-v3,integration-tests \
-//!     ledger -- --nocapture
+//! just rust-test-ledger
 //! ```
 
 #[cfg(feature = "ledger")]
