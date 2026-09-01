@@ -17,24 +17,62 @@ mod tests {
     use crate::ledger::LedgerSigner;
     use crate::traits::{SolanaSigner, TransactionSigner};
 
-    /// `connect(None, false, None)` either succeeds (device present) or returns a
-    /// clean `NotAvailable`/`UserRejected` error — it must never hang or panic.
+    /// Connect, or skip when there is genuinely no device.
+    ///
+    /// Skipping is deliberate: CI has no Ledger and these tests must not fail
+    /// there. But it is only legitimate when no device is attached. If one *is*
+    /// attached and we still cannot connect — locked, wrong app, another process
+    /// holding it — that is an operator problem, and panicking is the honest
+    /// outcome. Reporting it as a pass is how a locked Gen5 previously made this
+    /// whole suite look green while testing nothing.
     fn try_connect() -> Option<LedgerSigner> {
         match LedgerSigner::connect(None, false, None) {
             Ok(signer) => Some(signer),
-            Err(e) => {
-                // Say *why*, and surface the detail. Skipping is the point of
-                // these tests in CI, but a device that is plugged in and merely
-                // locked skips for a completely different reason than no device
-                // at all, and "no usable Ledger device" hid that distinction --
-                // which cost real debugging time when a Gen5 auto-locked
-                // mid-session and every test quietly reported a pass.
+            Err(e) if !LedgerSigner::is_attached() => {
                 eprintln!(
-                    "skipping Ledger hardware test -- could not connect: {}",
+                    "skipping Ledger hardware test -- no device attached: {}",
                     e.detail_string()
                 );
                 None
             }
+            Err(e) => panic!(
+                "a Ledger is attached but unusable, so this is a real failure \
+                 rather than a skip: {}",
+                e.detail_string()
+            ),
+        }
+    }
+
+    /// Regression test: connect, drop, reconnect — repeatedly, in one process.
+    ///
+    /// This is the shape that used to abort the whole test binary with SIGTRAP
+    /// inside macOS's HID stack. Dropping a signer returned while its device
+    /// actor still owned the `hidapi` handle, so the next `connect` initialised
+    /// HID concurrently with that teardown. Every operation passed in isolation,
+    /// which is precisely why it read as a flaky test instead of a lifecycle bug.
+    ///
+    /// It needs no button press, and a crash here fails the run rather than
+    /// producing a confusing partial pass.
+    #[tokio::test]
+    #[cfg(feature = "integration-tests")]
+    async fn test_ledger_reconnect_cycle_does_not_crash() {
+        let Some(first) = try_connect() else { return };
+        let pubkey = first.pubkey();
+        drop(first);
+
+        for round in 0..3 {
+            let signer = LedgerSigner::connect(None, false, None).unwrap_or_else(|e| {
+                panic!(
+                    "reconnect {round} failed after a clean drop: {}",
+                    e.detail_string()
+                )
+            });
+            assert_eq!(
+                signer.pubkey(),
+                pubkey,
+                "the same device must derive the same key across reconnects"
+            );
+            drop(signer);
         }
     }
 
