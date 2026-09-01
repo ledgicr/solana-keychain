@@ -475,6 +475,30 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
         RemoteWalletError::Hid(_) => {
             SignerError::NotAvailable("Ledger device disconnected or unavailable".to_string())
         }
+        // A locked device answers the transport but refuses the app-level
+        // command, which surfaces as an unclassified protocol error. Observed on
+        // a Nano Gen5 that auto-locked between operations: every call failed as
+        // `Protocol("Unknown error")`. Categorising that as a *signing* failure
+        // is actively misleading — nothing was signed and nothing is wrong with
+        // the transaction; the user needs to enter their PIN. It is
+        // `NotAvailable` for the same reason "no device" is, and the message has
+        // to say so, because the caller cannot see the device screen.
+        RemoteWalletError::Protocol(_) => {
+            // `SignerError` Display and Debug are both redacted by design, and
+            // `detail_string` is crate-private, so an external caller cannot
+            // read the remedy out of the error. Log it: this particular detail
+            // is device state, not secret material, and without it the user just
+            // sees "Signer not available" with nothing to act on.
+            log::warn!(
+                "Ledger did not answer an app-level command; it is most likely locked. \
+                 Unlock the device and open the Solana app, then retry."
+            );
+            SignerError::NotAvailable(
+                "Ledger did not answer — it is most likely locked. Unlock it (and open the Solana \
+                 app) and retry."
+                    .to_string(),
+            )
+        }
         other => SignerError::SigningFailed(format!("Ledger device error: {other}")),
     }
 }
@@ -513,6 +537,23 @@ mod tests {
     fn no_device_maps_to_not_available() {
         let err = map_rw_err(RemoteWalletError::NoDeviceFound);
         assert!(matches!(err, SignerError::NotAvailable(_)));
+    }
+
+    #[test]
+    fn locked_device_maps_to_not_available_and_says_so() {
+        // What a locked device actually produces, observed on a Nano Gen5 that
+        // auto-locked mid-session: the transport answers, the app-level command
+        // does not, and it arrives as an unclassified protocol error. It must not
+        // be reported as a signing failure — nothing was signed.
+        let err = map_rw_err(RemoteWalletError::Protocol("Unknown error"));
+        assert!(matches!(err, SignerError::NotAvailable(_)));
+        // The caller cannot see the device screen, so the remedy has to be in
+        // the message. `detail_string` is what surfaces it (Display is redacted).
+        assert!(
+            err.detail_string().contains("locked"),
+            "a locked device must be described as locked, got: {}",
+            err.detail_string()
+        );
     }
 
     #[test]
