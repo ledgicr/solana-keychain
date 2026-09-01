@@ -23,7 +23,16 @@ mod tests {
         match LedgerSigner::connect(None, false, None) {
             Ok(signer) => Some(signer),
             Err(e) => {
-                eprintln!("skipping: no usable Ledger device ({e:?})");
+                // Say *why*, and surface the detail. Skipping is the point of
+                // these tests in CI, but a device that is plugged in and merely
+                // locked skips for a completely different reason than no device
+                // at all, and "no usable Ledger device" hid that distinction --
+                // which cost real debugging time when a Gen5 auto-locked
+                // mid-session and every test quietly reported a pass.
+                eprintln!(
+                    "skipping Ledger hardware test -- could not connect: {}",
+                    e.detail_string()
+                );
                 None
             }
         }
