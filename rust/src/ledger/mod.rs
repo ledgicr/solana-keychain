@@ -159,18 +159,18 @@ impl SolanaSigner for LedgerSigner {
     ///
     /// A hardware wallet cannot raw-ed25519-sign arbitrary bytes the way the
     /// software backends do. It signs a *structured* off-chain message: the
-    /// payload is wrapped in the Solana off-chain envelope (the
-    /// `\xffsolana offchain` signing domain + header) and the device signs that.
-    /// The returned signature therefore covers the **serialized
-    /// `OffchainMessage`**, not the raw `message` bytes. Verify it against the
-    /// serialized form (`OffchainMessage::new(0, message)?.serialize()?`) — a
-    /// plain `signature.verify(pubkey, message)` over the raw bytes will fail.
-    /// This deviates from the raw-bytes contract of the software backends by
-    /// necessity; see the `sign_message` note on [`SolanaSigner`].
+    /// payload is wrapped in an envelope and the device signs the envelope. The
+    /// returned signature therefore covers the **envelope**, not the raw
+    /// `message` bytes — a plain `signature.verify(pubkey, message)` over the
+    /// payload will fail. Rebuild the same bytes with
+    /// [`ledger_offchain_envelope`] to verify. This deviates from the raw-bytes
+    /// contract of the software backends by necessity; see the `sign_message`
+    /// note on [`SolanaSigner`].
+    ///
+    /// Note the envelope is **not** what `solana_offchain_message` produces —
+    /// see [`ledger_offchain_envelope`] for why, and for the layout.
     async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
-        let serialized = solana_offchain_message::OffchainMessage::new(0, message)
-            .and_then(|m| m.serialize())
-            .map_err(|e| SignerError::ConfigError(format!("invalid off-chain message: {e:?}")))?;
+        let serialized = ledger_offchain_envelope(&self.pubkey, message)?;
         // Kept for the post-signing verification below; `serialized` itself moves
         // into the device closure.
         let verify_against = serialized.clone();
@@ -187,8 +187,8 @@ impl SolanaSigner for LedgerSigner {
         // Same signature-binding invariant the remote backends hold to: never
         // hand back a signature that does not verify against this signer's key
         // over the bytes we computed. Here that also pins the envelope: the
-        // device signed the serialized `OffchainMessage`, so verification is
-        // against `serialized`, not the raw payload.
+        // device signed the envelope, so verification is against it and not the
+        // raw payload.
         crate::signature_util::verify_or_reject(&signature, &self.pubkey, &verify_against)?;
         Ok(signature)
     }
@@ -257,6 +257,96 @@ impl TransactionSigner for LedgerSigner {
             signed_transaction,
         ))
     }
+}
+
+/// Longest payload that fits an off-chain message envelope bound for a Ledger.
+///
+/// Two independent caps apply and the tighter one wins. The device rejects a
+/// total envelope over `MAX_OFFCHAIN_MESSAGE_LENGTH` (Solana's 1232-byte packet
+/// size). Before that, `solana-remote-wallet` refuses to send anything over
+/// `v0::OffchainMessage::MAX_LEN_LEDGER + v0::OffchainMessage::HEADER_LEN`
+/// = 1212 + 3 = 1215, a guard it computes from the *crate's* header size (3) and
+/// not the header the device actually parses (85). Its guard is therefore the
+/// binding one, and 1215 - 85 is what is left for the payload.
+pub const MAX_OFFCHAIN_PAYLOAD_LEN: usize = 1215 - OFFCHAIN_HEADER_LEN_ONE_SIGNER;
+
+/// Envelope header length for a single signer:
+/// 16 (signing domain) + 1 (version) + 32 (application domain) + 1 (format)
+/// + 1 (signer count) + 32 (one signer) + 2 (message length).
+const OFFCHAIN_HEADER_LEN_ONE_SIGNER: usize = 16 + 1 + 32 + 1 + 1 + 32 + 2;
+
+/// Build the off-chain message envelope the **Ledger Solana app** expects.
+///
+/// This deliberately does not use `solana_offchain_message`, because that crate
+/// and the Ledger app implement different layouts and the crate's output is
+/// rejected outright. Verified against a real Nano Gen5: the crate's envelope
+/// returns APDU `SolanaInvalidMessageHeader`, exactly as raw unwrapped bytes do,
+/// which is why simply "wrapping the payload" did not fix off-chain signing.
+///
+/// What the crate emits (20-byte header):
+///   signing domain (16) ‖ version (1) ‖ format (1) ‖ length (2) ‖ message
+///
+/// What the app parses for v0 (85-byte header for one signer):
+///   signing domain (16) ‖ version=0 (1) ‖ **application domain (32)**
+///   ‖ format (1) ‖ **signer count (1)** ‖ **signers (32 each)**
+///   ‖ length (2, little-endian) ‖ message
+///
+/// The crate omits the application domain, the signer count and the signer list
+/// — 65 bytes for a single signer. The signer list is the part that matters
+/// most: the app derives the pubkey at the requested path and rejects the
+/// message unless that pubkey appears in the list, so the envelope has to name
+/// the signer. (Source: `LedgerHQ/app-solana`, `libsol/parser.c`
+/// `parse_offchain_message_header` and `src/handle_sign_offchain_message.c`.)
+///
+/// The application domain is left all-zero, which the app supports explicitly
+/// and displays as "Domain not provided". A future integration that wants the
+/// device to show a bound application identity should populate it — the value is
+/// covered by the signature, so it cannot be altered in flight.
+///
+/// The format byte is derived from the payload rather than fixed: 0
+/// (RestrictedAscii) when the payload is printable ASCII, 1 (LimitedUtf8)
+/// otherwise. Format 2 (ExtendedUtf8) is deliberately unsupported by hardware
+/// wallets per the spec, and the app rejects it, so a payload that is not valid
+/// UTF-8 is refused here rather than at the device.
+pub fn ledger_offchain_envelope(signer: &Pubkey, payload: &[u8]) -> Result<Vec<u8>, SignerError> {
+    // The app rejects a zero-length message (`header.length == 0`).
+    if payload.is_empty() {
+        return Err(SignerError::ConfigError(
+            "off-chain message payload is empty; a Ledger will not sign it".to_string(),
+        ));
+    }
+    if payload.len() > MAX_OFFCHAIN_PAYLOAD_LEN {
+        return Err(SignerError::ConfigError(format!(
+            "off-chain message payload is {} bytes; a Ledger accepts at most {}",
+            payload.len(),
+            MAX_OFFCHAIN_PAYLOAD_LEN
+        )));
+    }
+    // Mirror the app's own content checks so the failure is local and legible
+    // rather than an opaque APDU rejection after a round-trip.
+    let format: u8 = if payload.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        0 // RestrictedAscii
+    } else if std::str::from_utf8(payload).is_ok() {
+        1 // LimitedUtf8
+    } else {
+        return Err(SignerError::ConfigError(
+            "off-chain message payload is not valid UTF-8; a Ledger will not sign it".to_string(),
+        ));
+    };
+
+    let mut out = Vec::with_capacity(OFFCHAIN_HEADER_LEN_ONE_SIGNER + payload.len());
+    // Taken from the crate rather than hardcoded, so the domain stays in step
+    // with upstream even though the rest of the layout cannot.
+    out.extend_from_slice(solana_offchain_message::OffchainMessage::SIGNING_DOMAIN);
+    out.push(0); // header version 0
+    out.extend_from_slice(&[0u8; 32]); // application domain: not provided
+    out.push(format);
+    out.push(1); // exactly one signer
+    out.extend_from_slice(&signer.to_bytes());
+    out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    out.extend_from_slice(payload);
+    debug_assert_eq!(out.len(), OFFCHAIN_HEADER_LEN_ONE_SIGNER + payload.len());
+    Ok(out)
 }
 
 /// Send a command to the device actor and block for its reply. Called from
@@ -537,6 +627,61 @@ mod tests {
     fn no_device_maps_to_not_available() {
         let err = map_rw_err(RemoteWalletError::NoDeviceFound);
         assert!(matches!(err, SignerError::NotAvailable(_)));
+    }
+
+    #[test]
+    fn offchain_envelope_matches_the_ledger_app_layout() {
+        // Byte-exact against LedgerHQ/app-solana's `parse_offchain_message_header`.
+        // Pinning the layout matters more than usual here: the obvious choice —
+        // `solana_offchain_message`'s serializer — produces a *different*
+        // envelope that the device rejects, so a future refactor "simplifying"
+        // this back to the crate would silently break signing again.
+        let signer = Pubkey::from([7u8; 32]);
+        let payload = b"hello";
+        let env = ledger_offchain_envelope(&signer, payload).unwrap();
+
+        assert_eq!(&env[0..16], b"\xffsolana offchain", "signing domain");
+        assert_eq!(env[16], 0, "header version");
+        assert_eq!(&env[17..49], &[0u8; 32], "application domain: not provided");
+        assert_eq!(env[49], 0, "format 0 = RestrictedAscii for printable ASCII");
+        assert_eq!(env[50], 1, "exactly one signer");
+        assert_eq!(&env[51..83], &[7u8; 32], "the signer's pubkey");
+        assert_eq!(&env[83..85], &5u16.to_le_bytes(), "length, little-endian");
+        assert_eq!(&env[85..], payload, "message body");
+        assert_eq!(env.len(), 85 + payload.len());
+    }
+
+    #[test]
+    fn offchain_envelope_picks_the_format_from_the_payload() {
+        let signer = Pubkey::from([1u8; 32]);
+        // Printable ASCII -> RestrictedAscii.
+        let ascii = ledger_offchain_envelope(&signer, b"plain text").unwrap();
+        assert_eq!(ascii[49], 0);
+        // Valid UTF-8 that is not printable ASCII -> LimitedUtf8. The app
+        // rejects format 2, so this is the only other value it will take.
+        let utf8 = ledger_offchain_envelope(&signer, "café ☕".as_bytes()).unwrap();
+        assert_eq!(utf8[49], 1);
+        // Not UTF-8 at all: refused locally rather than at the device.
+        let err = ledger_offchain_envelope(&signer, &[0xff, 0xfe]).unwrap_err();
+        assert!(matches!(err, SignerError::ConfigError(_)));
+    }
+
+    #[test]
+    fn offchain_envelope_rejects_payloads_the_device_would_reject() {
+        let signer = Pubkey::from([2u8; 32]);
+        // The app rejects `header.length == 0`.
+        assert!(ledger_offchain_envelope(&signer, b"").is_err());
+        // At the limit it is accepted; one byte over it is not. The binding cap
+        // comes from solana-remote-wallet's send-side guard, not the device.
+        let at_limit = vec![b'a'; MAX_OFFCHAIN_PAYLOAD_LEN];
+        assert!(ledger_offchain_envelope(&signer, &at_limit).is_ok());
+        let over = vec![b'a'; MAX_OFFCHAIN_PAYLOAD_LEN + 1];
+        assert!(ledger_offchain_envelope(&signer, &over).is_err());
+        // And the whole envelope still fits what remote-wallet will send.
+        assert_eq!(
+            ledger_offchain_envelope(&signer, &at_limit).unwrap().len(),
+            1215
+        );
     }
 
     #[test]

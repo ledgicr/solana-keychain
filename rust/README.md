@@ -378,12 +378,25 @@ Ledger is a `TransactionSigner`: the device signs the caller's transaction
 exactly as given and the caller broadcasts. Its `sign_message` is the one
 deviation from the raw-bytes contract the software backends share. A hardware
 wallet cannot raw-ed25519-sign arbitrary bytes; it signs a *structured*
-off-chain message, so the payload is wrapped in Solana's off-chain envelope
-(`\xffsolana offchain` + header) and the signature covers the **serialized
-`OffchainMessage`**, not the bytes passed in. Verify against
-`OffchainMessage::new(0, message)?.serialize()?` — a plain
+off-chain message, so the payload is wrapped in an envelope and the signature
+covers the **envelope**, not the bytes passed in. A plain
 `signature.verify(pubkey, message)` over the raw payload will fail. Transaction
 signatures have no such caveat and verify identically to any other backend's.
+
+To verify, rebuild the envelope with the public `ledger::ledger_offchain_envelope`:
+
+```rust
+let envelope = solana_keychain::ledger::ledger_offchain_envelope(&signer.pubkey(), message)?;
+assert!(signature.verify(&signer.pubkey().to_bytes(), &envelope));
+```
+
+Note this is **not** `solana_offchain_message`'s serialization. That crate and the
+Ledger Solana app implement different layouts, and the crate's envelope is
+rejected by the device — it omits the application domain, the signer count and
+the signer list (65 bytes for one signer), and the app requires the signing
+pubkey to appear in that list. `ledger_offchain_envelope` documents the full
+layout. The practical consequence for a verifier is that it must rebuild these
+bytes rather than reach for the crate; the payload cap is 1130 bytes.
 
 The unified `Signer` enum wraps all backends in one type and implements only
 the base `SolanaSigner` trait. Capability access goes through

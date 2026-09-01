@@ -61,15 +61,22 @@ mod tests {
             .await
             .expect("device should sign the off-chain message");
         assert_eq!(signature.as_ref().len(), 64);
-        // `sign_message` signs the off-chain *envelope*, not the raw bytes, so
-        // verify against the serialized `OffchainMessage` (see the sign_message
-        // docs on the Ledger backend).
-        let serialized = solana_offchain_message::OffchainMessage::new(0, message)
-            .and_then(|m| m.serialize())
-            .expect("valid off-chain message");
+        // `sign_message` signs the *envelope*, not the raw bytes, so verify
+        // against the envelope the backend built. Note this is deliberately not
+        // `solana_offchain_message`'s serialization: that layout is rejected by
+        // the device, which is what made this path fail on hardware for months.
+        // See `ledger_offchain_envelope`.
+        let envelope =
+            crate::ledger::ledger_offchain_envelope(&signer.pubkey(), message).expect("envelope");
         assert!(
-            signature.verify(&signer.pubkey().to_bytes(), &serialized),
-            "signature must verify against the serialized off-chain message"
+            signature.verify(&signer.pubkey().to_bytes(), &envelope),
+            "signature must verify against the envelope the device signed"
+        );
+        // Guard against a regression to the previous, rejected layout: the
+        // signature must NOT verify against the raw payload.
+        assert!(
+            !signature.verify(&signer.pubkey().to_bytes(), message),
+            "signature covers the envelope, not the raw payload"
         );
     }
 
