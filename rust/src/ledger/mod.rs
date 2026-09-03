@@ -725,17 +725,34 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
         RemoteWalletError::NoDeviceFound => {
             SignerError::NotAvailable("no Ledger device found".to_string())
         }
-        RemoteWalletError::Hid(_) => {
-            SignerError::NotAvailable("Ledger device disconnected or unavailable".to_string())
-        }
-        // A locked device answers the transport but refuses the app-level
-        // command, which surfaces as an unclassified protocol error. Observed on
-        // a Nano Gen5 that auto-locked between operations: every call failed as
-        // `Protocol("Unknown error")`. Categorising that as a *signing* failure
-        // is actively misleading — nothing was signed and nothing is wrong with
-        // the transaction; the user needs to enter their PIN. It is
-        // `NotAvailable` for the same reason "no device" is, and the message has
-        // to say so, because the caller cannot see the device screen.
+        // A HID-layer failure is usually *not* a disconnect. The common cause is
+        // another process already holding the device: Ledger Live keeps its
+        // handle for as long as it runs, and so does any wallet tool or stray
+        // script that opened the device and never exited. Naming only the
+        // disconnect sends the user to check the cable, which is the one thing
+        // that is fine.
+        RemoteWalletError::Hid(_) => SignerError::NotAvailable(
+            "Ledger is not reachable. Either it was disconnected, or another application is \
+             holding the device — quit Ledger Live and any other wallet software, then retry."
+                .to_string(),
+        ),
+        // An unclassified protocol error means the transport answered but the
+        // app-level command did not. Two different states produce it and the
+        // error carries nothing that separates them:
+        //
+        //   1. The device is locked. Observed on a Nano Gen5 that auto-locked
+        //      between operations: every call failed as `Protocol("Unknown error")`.
+        //   2. Another process holds the device. Observed on a Nano Gen5 with
+        //      Ledger Live running: enumeration succeeds, so this is not
+        //      `NoDeviceFound`, and the handle opens, so it is not `Hid`, but no
+        //      app-level command completes.
+        //
+        // Reporting either as a *signing* failure is misleading — nothing was
+        // signed and nothing is wrong with the transaction. It is `NotAvailable`
+        // for the same reason "no device" is. Since we cannot tell the two
+        // apart here, the message names both remedies: claiming only "locked"
+        // sends anyone with Ledger Live open to re-enter a PIN that was never
+        // the problem.
         RemoteWalletError::Protocol(_) => {
             // `SignerError` Display and Debug are both redacted by design, and
             // `detail_string` is crate-private, so an external caller cannot
@@ -743,12 +760,14 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
             // is device state, not secret material, and without it the user just
             // sees "Signer not available" with nothing to act on.
             log::warn!(
-                "Ledger did not answer an app-level command; it is most likely locked. \
-                 Unlock the device and open the Solana app, then retry."
+                "Ledger did not answer an app-level command. It is either locked, or another \
+                 application is holding the device. Unlock it and open the Solana app, or quit \
+                 Ledger Live and any other wallet software, then retry."
             );
             SignerError::NotAvailable(
-                "Ledger did not answer — it is most likely locked. Unlock it (and open the Solana \
-                 app) and retry."
+                "Ledger did not answer. It is either locked — unlock it and open the Solana app — \
+                 or another application is holding the device, so quit Ledger Live and any other \
+                 wallet software. Then retry."
                     .to_string(),
             )
         }
@@ -861,6 +880,42 @@ mod tests {
             err.detail_string().contains("locked"),
             "a locked device must be described as locked, got: {}",
             err.detail_string()
+        );
+    }
+
+    #[test]
+    fn unclassified_protocol_error_also_names_the_busy_device() {
+        // The same `Protocol(_)` arm fires when another process holds the device
+        // — observed on a Nano Gen5 with Ledger Live running, and again with a
+        // stray script that had opened the device and not exited. Enumeration
+        // succeeds and the handle opens, so neither `NoDeviceFound` nor `Hid`
+        // catches it, and nothing in the error separates it from a locked
+        // device. A message that offers only "unlock it" therefore sends the
+        // user to re-enter a PIN that was never the problem, which is exactly
+        // the loop this arm has to break.
+        let err = map_rw_err(RemoteWalletError::Protocol("Unknown error"));
+        let detail = err.detail_string();
+        assert!(
+            detail.contains("another application"),
+            "a busy device must be offered as a cause, got: {detail}"
+        );
+        assert!(
+            detail.contains("Ledger Live"),
+            "the remedy has to name the usual culprit, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn hid_error_points_at_a_busy_device_not_just_the_cable() {
+        // A HID-layer failure is far more often a held handle than a real
+        // disconnect. Reporting only the disconnect sends the user to check the
+        // one thing that is fine.
+        let err = map_rw_err(RemoteWalletError::Hid("device open failed".to_string()));
+        assert!(matches!(err, SignerError::NotAvailable(_)));
+        let detail = err.detail_string();
+        assert!(
+            detail.contains("another application"),
+            "a held HID handle must be offered as a cause, got: {detail}"
         );
     }
 
