@@ -36,7 +36,9 @@
 mod dashboard;
 
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::Duration;
 
 use solana_derivation_path::DerivationPath;
 use solana_remote_wallet::ledger::LedgerWallet;
@@ -57,6 +59,66 @@ use crate::transaction_util::TransactionUtil;
 /// style and derives a *different* address.)
 pub const DEFAULT_DERIVATION_PATH: &str = "m/44'/501'/0'";
 
+/// Timeout for device commands that **cannot** involve the user.
+///
+/// Enumeration, an unconfirmed pubkey read and the liveness probe are pure
+/// host-to-device exchanges: the device either answers in milliseconds or
+/// something is wrong. Seconds is generous.
+pub const FAST_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default timeout for commands that wait on a human.
+///
+/// Signing blocks while the user reads the confirm screen, so this cannot be
+/// short. It is bounded by the device's own auto-lock: once the Ledger locks,
+/// the prompt is gone and no answer is ever coming, so waiting past that window
+/// only prolongs the stall. Five minutes sits inside Ledger's ten-minute
+/// default auto-lock while still being long enough for a user who stepped away
+/// mid-approval. Override with [`LedgerConfig::signing_timeout`].
+pub const DEFAULT_SIGNING_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How to open a [`LedgerSigner`].
+///
+/// Prefer this over [`LedgerSigner::connect`] when you need to control the
+/// signing timeout or suppress the dashboard auto-launch. `Default` reproduces
+/// `connect(None, false, None)` exactly.
+#[derive(Debug, Clone)]
+pub struct LedgerConfig {
+    /// BIP-44 path; `None` uses [`DEFAULT_DERIVATION_PATH`].
+    pub derivation_path: Option<String>,
+    /// Display the derived address on the device for the user to verify. This
+    /// requires a button press, so it waits on [`Self::signing_timeout`].
+    pub confirm_pubkey_on_device: bool,
+    /// Select one device by OS HID path when several Ledgers are attached.
+    pub host_device_path: Option<String>,
+    /// How long to wait on a command that needs a human. Defaults to
+    /// [`DEFAULT_SIGNING_TIMEOUT`].
+    pub signing_timeout: Duration,
+    /// Launch the Solana app from the BOLOS dashboard when a connect fails
+    /// because the app is not running. Defaults to `true`.
+    ///
+    /// **This writes APDUs to the device without asking the host user**, and on
+    /// most firmware the device then shows its own confirmation prompt. That is
+    /// the right default for an interactive CLI, where the alternative is
+    /// telling the user to go and navigate the device by hand. Set it to `false`
+    /// for unattended or server-side use, where a process should not be poking a
+    /// security device on its own initiative; connect then fails with the
+    /// underlying "open the Solana app" error instead. A decline on the device
+    /// is always surfaced as [`SignerError::UserRejected`] either way.
+    pub auto_open_app: bool,
+}
+
+impl Default for LedgerConfig {
+    fn default() -> Self {
+        Self {
+            derivation_path: None,
+            confirm_pubkey_on_device: false,
+            host_device_path: None,
+            signing_timeout: DEFAULT_SIGNING_TIMEOUT,
+            auto_open_app: true,
+        }
+    }
+}
+
 /// Requests sent to the device-actor thread. Each carries a one-shot reply
 /// channel the actor uses to return the result.
 enum DeviceCommand {
@@ -65,6 +127,8 @@ enum DeviceCommand {
         path_str: String,
         confirm_pubkey_on_device: bool,
         host_device_path: Option<String>,
+        /// Launch the Solana app from the dashboard if the connect fails.
+        auto_open_app: bool,
         reply: Sender<Result<[u8; 32], SignerError>>,
     },
     /// Sign serialized transaction-message bytes (Solana app "sign" APDU).
@@ -139,6 +203,8 @@ fn device_channel() -> &'static Sender<DeviceCommand> {
 pub struct LedgerSigner {
     pubkey: Pubkey,
     path_str: String,
+    /// Timeout for the device commands that wait on a button press.
+    signing_timeout: Duration,
 }
 
 impl std::fmt::Debug for LedgerSigner {
@@ -176,26 +242,66 @@ impl LedgerSigner {
         confirm_pubkey_on_device: bool,
         host_device_path: Option<&str>,
     ) -> Result<Self, SignerError> {
-        let path_str = derivation_path
-            .unwrap_or(DEFAULT_DERIVATION_PATH)
-            .to_string();
+        Self::connect_with(LedgerConfig {
+            derivation_path: derivation_path.map(str::to_string),
+            confirm_pubkey_on_device,
+            host_device_path: host_device_path.map(str::to_string),
+            ..LedgerConfig::default()
+        })
+    }
+
+    /// Connect using an explicit [`LedgerConfig`].
+    ///
+    /// Use this to set the signing timeout or to turn off the dashboard
+    /// auto-launch; see [`LedgerConfig`] for what each option costs.
+    ///
+    /// **Blocking**, exactly as [`LedgerSigner::connect`] is. Every command this
+    /// signer later issues is bounded: [`FAST_COMMAND_TIMEOUT`] for exchanges
+    /// that cannot involve the user, and [`LedgerConfig::signing_timeout`] for
+    /// the ones that wait on a button press.
+    pub fn connect_with(config: LedgerConfig) -> Result<Self, SignerError> {
+        let LedgerConfig {
+            derivation_path,
+            confirm_pubkey_on_device,
+            host_device_path,
+            signing_timeout,
+            auto_open_app,
+        } = config;
+
+        let path_str = derivation_path.unwrap_or_else(|| DEFAULT_DERIVATION_PATH.to_string());
         // Validate before troubling the device, so a typo is a clear config
         // error rather than an obscure APDU failure.
         DerivationPath::from_absolute_path_str(&path_str)
             .map_err(|e| SignerError::ConfigError(format!("invalid derivation path: {e}")))?;
 
-        let host_device_path = host_device_path.map(str::to_string);
-        let pubkey_bytes = request_on(device_channel(), |reply| DeviceCommand::Connect {
+        // A connect can reach the user in two ways: an explicit on-device
+        // address confirmation, and the dashboard auto-launch, which most
+        // firmware asks the user to approve. Either one means this has to wait
+        // on a human rather than on the wire.
+        let timeout = if confirm_pubkey_on_device || auto_open_app {
+            signing_timeout
+        } else {
+            FAST_COMMAND_TIMEOUT
+        };
+
+        let pubkey_bytes = request_on(device_channel(), timeout, |reply| DeviceCommand::Connect {
             path_str: path_str.clone(),
             confirm_pubkey_on_device,
             host_device_path,
+            auto_open_app,
             reply,
         })?;
 
         Ok(Self {
             pubkey: Pubkey::from(pubkey_bytes),
             path_str,
+            signing_timeout,
         })
+    }
+
+    /// The timeout this signer applies to commands that wait on a button press.
+    pub fn signing_timeout(&self) -> Duration {
+        self.signing_timeout
     }
 
     /// Is a Ledger attached, whether or not it is usable right now?
@@ -205,6 +311,12 @@ impl LedgerSigner {
     /// but not ready" — which are very different things to report to a user.
     /// Goes through the device thread; see [`DEVICE_THREAD`].
     pub fn is_attached() -> bool {
+        if check_actor_responsive().is_err() {
+            // The device thread is stuck on an earlier command, so it cannot
+            // answer this either. Reporting "no device" would be a lie, but so
+            // would blocking: this probe exists to be quick.
+            return false;
+        }
         let cmd_tx = device_channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         if cmd_tx
@@ -213,7 +325,14 @@ impl LedgerSigner {
         {
             return false;
         }
-        reply_rx.recv().unwrap_or(false)
+        match reply_rx.recv_timeout(FAST_COMMAND_TIMEOUT) {
+            Ok(attached) => attached,
+            Err(RecvTimeoutError::Timeout) => {
+                mark_abandoned();
+                false
+            }
+            Err(RecvTimeoutError::Disconnected) => false,
+        }
     }
 }
 
@@ -243,8 +362,9 @@ impl SolanaSigner for LedgerSigner {
         // into the device closure.
         let verify_against = serialized.clone();
         let path_str = self.path_str.clone();
+        let timeout = self.signing_timeout;
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
-            request_on(device_channel(), |reply| {
+            request_on(device_channel(), timeout, |reply| {
                 DeviceCommand::SignOffchainMessage {
                     path_str,
                     message: serialized,
@@ -264,9 +384,15 @@ impl SolanaSigner for LedgerSigner {
         Ok(signature)
     }
 
+    /// Liveness probe. Never waits on the user, so it is bounded by
+    /// [`FAST_COMMAND_TIMEOUT`] rather than the signing timeout, and reports
+    /// `false` rather than blocking when the device thread is wedged.
     async fn is_available(&self) -> bool {
         let path_str = self.path_str.clone();
         tokio::task::spawn_blocking(move || {
+            if check_actor_responsive().is_err() {
+                return false;
+            }
             let (reply_tx, reply_rx) = mpsc::channel();
             if device_channel()
                 .send(DeviceCommand::IsAvailable {
@@ -277,7 +403,14 @@ impl SolanaSigner for LedgerSigner {
             {
                 return false;
             }
-            reply_rx.recv().unwrap_or(false)
+            match reply_rx.recv_timeout(FAST_COMMAND_TIMEOUT) {
+                Ok(available) => available,
+                Err(RecvTimeoutError::Timeout) => {
+                    mark_abandoned();
+                    false
+                }
+                Err(RecvTimeoutError::Disconnected) => false,
+            }
         })
         .await
         .unwrap_or(false)
@@ -308,8 +441,9 @@ impl TransactionSigner for LedgerSigner {
         // into the device closure.
         let verify_against = message.clone();
         let path_str = self.path_str.clone();
+        let timeout = self.signing_timeout;
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
-            request_on(device_channel(), |reply| {
+            request_on(device_channel(), timeout, |reply| {
                 DeviceCommand::SignTransactionMessage {
                     path_str,
                     message,
@@ -426,19 +560,97 @@ pub fn ledger_offchain_envelope(signer: &Pubkey, payload: &[u8]) -> Result<Vec<u
     Ok(out)
 }
 
-/// Send a command to the device actor and block for its reply. Called from
-/// inside `spawn_blocking`, with a `cmd_tx` cloned out of the signer.
+/// Number of commands the device thread has finished, ever.
+///
+/// Paired with [`ABANDONED_AT`] to tell "the actor is busy" apart from "the
+/// actor is wedged", which a caller cannot otherwise observe.
+static COMPLETED: AtomicU64 = AtomicU64::new(0);
+
+/// The [`COMPLETED`] count at the moment a caller last gave up waiting, or
+/// `u64::MAX` when no timeout is outstanding.
+static ABANDONED_AT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Record that a caller stopped waiting for a reply.
+fn mark_abandoned() {
+    ABANDONED_AT.store(COMPLETED.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+/// Refuse to enqueue behind a command that is still blocking the device thread.
+///
+/// This is the part that a caller-side timeout alone does not solve, and it is
+/// why the timeout is not the whole fix. The actor is a single serialized
+/// thread, and the HID read it blocks in has no timeout of its own:
+/// `solana-remote-wallet`'s `Ledger::read` calls `hidapi`'s blocking
+/// `HidDevice::read`. So when a command wedges, giving the *caller* its thread
+/// back leaves the actor stuck forever, and without this check every later
+/// command from every other signer in the process would queue behind it and
+/// burn its own full timeout in turn -- turning one stalled prompt into a
+/// process-wide stall that degrades one timeout at a time.
+///
+/// Failing fast is the honest answer: the device genuinely cannot serve anyone
+/// until the stuck exchange resolves. The moment the actor finishes anything,
+/// `COMPLETED` moves past the recorded mark and normal service resumes by
+/// itself, so a slow user who eventually presses the button costs nothing.
+fn check_actor_responsive() -> Result<(), SignerError> {
+    let abandoned = ABANDONED_AT.load(Ordering::SeqCst);
+    if abandoned == u64::MAX {
+        return Ok(());
+    }
+    if COMPLETED.load(Ordering::SeqCst) > abandoned {
+        // The actor drained the stuck command; stop reporting it as wedged.
+        let _ =
+            ABANDONED_AT.compare_exchange(abandoned, u64::MAX, Ordering::SeqCst, Ordering::SeqCst);
+        return Ok(());
+    }
+    Err(SignerError::NotAvailable(
+        "the Ledger device thread is still blocked on an earlier command that timed out. \
+         Dismiss any prompt left on the device screen, or unplug and replug it, then retry."
+            .to_string(),
+    ))
+}
+
+/// Send a command to the device actor and block for its reply, up to `timeout`.
+///
+/// Called from inside `spawn_blocking`. On timeout the reply receiver is
+/// dropped, which the actor detects when it finally answers: see
+/// [`respond`], which drops the cached session so the next connect
+/// re-establishes rather than reusing a handle left mid-exchange.
 fn request_on<T: Send + 'static>(
     cmd_tx: &Sender<DeviceCommand>,
+    timeout: Duration,
     build: impl FnOnce(Sender<Result<T, SignerError>>) -> DeviceCommand,
 ) -> Result<T, SignerError> {
+    check_actor_responsive()?;
     let (reply_tx, reply_rx) = mpsc::channel();
     cmd_tx.send(build(reply_tx)).map_err(|_| {
         SignerError::NotAvailable("Ledger device thread is not running".to_string())
     })?;
-    reply_rx
-        .recv()
-        .map_err(|_| SignerError::NotAvailable("Ledger device thread stopped".to_string()))?
+    match reply_rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            mark_abandoned();
+            Err(SignerError::NotAvailable(format!(
+                "Ledger did not respond within {}s. If a confirmation is waiting on the device \
+                 screen, answer it and retry; otherwise unplug and replug the device.",
+                timeout.as_secs()
+            )))
+        }
+        Err(RecvTimeoutError::Disconnected) => Err(SignerError::NotAvailable(
+            "Ledger device thread stopped".to_string(),
+        )),
+    }
+}
+
+/// Answer a command, noticing when the caller has already given up.
+///
+/// `send` fails only if the reply receiver was dropped, which happens exactly
+/// when [`request_on`] timed out. That command may have left the device
+/// mid-exchange, so the cached session is no longer trustworthy and is dropped.
+fn respond<T>(session: &mut Option<Session>, reply: &Sender<T>, result: T) {
+    if reply.send(result).is_err() {
+        *session = None;
+    }
+    COMPLETED.fetch_add(1, Ordering::SeqCst);
 }
 
 /// The device-actor thread body. Owns the single-threaded `solana-remote-wallet`
@@ -556,6 +768,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                 path_str,
                 confirm_pubkey_on_device,
                 host_device_path,
+                auto_open_app,
                 reply,
             } => {
                 let result = parse(&path_str).and_then(|path| {
@@ -586,7 +799,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                     // unreachable we keep the original connect error. Declining
                     // the launch prompt on-device, though, is a real user
                     // decision — surface it.
-                    if connected.is_err() {
+                    if connected.is_err() && auto_open_app {
                         match dashboard::ensure_solana_app_open(host_device_path.as_deref()) {
                             Ok(_launched) => {
                                 for _ in 0..20 {
@@ -611,7 +824,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                     });
                     Ok(pubkey_bytes)
                 });
-                let _ = reply.send(result);
+                respond(&mut session, &reply, result);
             }
 
             DeviceCommand::SignTransactionMessage {
@@ -625,7 +838,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                         .map(signature_bytes)
                         .map_err(map_rw_err)
                 });
-                let _ = reply.send(result);
+                respond(&mut session, &reply, result);
             }
 
             DeviceCommand::SignOffchainMessage {
@@ -639,7 +852,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                         .map(signature_bytes)
                         .map_err(map_rw_err)
                 });
-                let _ = reply.send(result);
+                respond(&mut session, &reply, result);
             }
 
             DeviceCommand::IsAvailable { path_str, reply } => {
@@ -647,7 +860,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                     wallet.get_pubkey(path, false).map_err(map_rw_err)
                 })
                 .is_ok();
-                let _ = reply.send(ok);
+                respond(&mut session, &reply, ok);
             }
 
             DeviceCommand::IsAttached { reply } => {
@@ -655,7 +868,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                 let attached = hidapi::HidApi::new()
                     .map(|api| api.device_list().any(|d| d.vendor_id() == LEDGER_VID))
                     .unwrap_or(false);
-                let _ = reply.send(attached);
+                respond(&mut session, &reply, attached);
             }
         }
     }
@@ -778,10 +991,266 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    /// The actor-health statics are process-global, so the tests that drive
+    /// them cannot run concurrently with each other.
+    static HEALTH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn reset_actor_health() {
+        COMPLETED.store(0, Ordering::SeqCst);
+        ABANDONED_AT.store(u64::MAX, Ordering::SeqCst);
+    }
+
+    /// A device thread that accepts commands and never answers, which is what a
+    /// Ledger left on a confirm screen looks like from the host.
+    fn wedged_actor() -> (Sender<DeviceCommand>, Receiver<DeviceCommand>) {
+        mpsc::channel()
+    }
+
+    fn connect_cmd(reply: Sender<Result<[u8; 32], SignerError>>) -> DeviceCommand {
+        DeviceCommand::Connect {
+            path_str: DEFAULT_DERIVATION_PATH.to_string(),
+            confirm_pubkey_on_device: false,
+            host_device_path: None,
+            auto_open_app: false,
+            reply,
+        }
+    }
+
+    // ── F-1: actor timeouts ──
+
+    #[test]
+    fn a_command_times_out_instead_of_blocking_forever() {
+        let _guard = HEALTH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_actor_health();
+        // The receiver is held so `send` succeeds, but nothing ever serves it.
+        // Before this timeout existed the call below never returned: the reply
+        // channel used a plain blocking `recv()`, and the HID read the real
+        // actor blocks in (`solana-remote-wallet`'s `Ledger::read` -> hidapi
+        // `HidDevice::read`) has no timeout of its own.
+        let (tx, _rx) = wedged_actor();
+        let start = Instant::now();
+        let err = request_on(&tx, Duration::from_millis(200), connect_cmd).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(5), "must not hang");
+        assert!(matches!(err, SignerError::NotAvailable(_)));
+        assert!(
+            err.detail_string().contains("did not respond"),
+            "got: {}",
+            err.detail_string()
+        );
+        reset_actor_health();
+    }
+
+    #[test]
+    fn a_wedged_actor_fails_fast_instead_of_queueing_behind_it() {
+        let _guard = HEALTH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_actor_health();
+        let (tx, _rx) = wedged_actor();
+        // First caller gives up after its timeout.
+        let _ = request_on(&tx, Duration::from_millis(200), connect_cmd);
+        // The second must not wait its own full timeout: the actor is a single
+        // serialized thread, so it cannot serve anyone until the stuck exchange
+        // resolves. Without this, one stalled prompt degrades the whole process
+        // one timeout at a time.
+        let start = Instant::now();
+        let err = request_on(&tx, Duration::from_secs(30), connect_cmd).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "second call waited {:?}; it should have failed fast",
+            start.elapsed()
+        );
+        assert!(
+            err.detail_string().contains("still blocked"),
+            "got: {}",
+            err.detail_string()
+        );
+        reset_actor_health();
+    }
+
+    #[test]
+    fn the_actor_recovers_once_it_completes_a_command() {
+        let _guard = HEALTH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_actor_health();
+        let (tx, _rx) = wedged_actor();
+        let _ = request_on(&tx, Duration::from_millis(200), connect_cmd);
+        assert!(check_actor_responsive().is_err(), "should read as wedged");
+        // The user finally pressed the button: the actor finishes the stuck
+        // command and bumps its completion count. Normal service must resume
+        // without anyone reconnecting or restarting the process.
+        COMPLETED.fetch_add(1, Ordering::SeqCst);
+        assert!(check_actor_responsive().is_ok(), "should have recovered");
+        assert_eq!(
+            ABANDONED_AT.load(Ordering::SeqCst),
+            u64::MAX,
+            "the wedge mark must be cleared, not merely stepped over"
+        );
+        reset_actor_health();
+    }
+
+    #[test]
+    fn an_abandoned_reply_drops_the_cached_session() {
+        let _guard = HEALTH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_actor_health();
+        // A caller that timed out has dropped its receiver. The actor notices
+        // when it finally answers, and must discard the session: that command
+        // may have left the device mid-exchange, so the next connect has to
+        // re-establish rather than reuse the handle.
+        let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+        drop(reply_rx);
+        let mut session: Option<Session> = None;
+        // Stand-in for a live session; `respond` only ever sets it to `None`.
+        let before = COMPLETED.load(Ordering::SeqCst);
+        respond(&mut session, &reply_tx, true);
+        assert!(session.is_none(), "session must be dropped");
+        assert_eq!(
+            COMPLETED.load(Ordering::SeqCst),
+            before + 1,
+            "completion must be counted even when the caller gave up"
+        );
+        reset_actor_health();
+    }
+
+    #[test]
+    fn the_two_timeout_tiers_are_ordered_and_bounded() {
+        // A probe that cannot involve the user must not inherit the
+        // wait-for-a-human budget, and the signing default must stay inside a
+        // Ledger's ten-minute auto-lock: past that the prompt is gone and no
+        // answer is coming.
+        assert!(FAST_COMMAND_TIMEOUT < DEFAULT_SIGNING_TIMEOUT);
+        assert!(FAST_COMMAND_TIMEOUT >= Duration::from_secs(5));
+        assert!(DEFAULT_SIGNING_TIMEOUT <= Duration::from_secs(600));
+        assert_eq!(
+            LedgerConfig::default().signing_timeout,
+            DEFAULT_SIGNING_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn auto_open_app_defaults_on_and_is_overridable() {
+        // Default true keeps the interactive CLI behaviour these tests were
+        // written against; the point of the option is unattended callers.
+        assert!(LedgerConfig::default().auto_open_app);
+        let quiet = LedgerConfig {
+            auto_open_app: false,
+            ..LedgerConfig::default()
+        };
+        assert!(!quiet.auto_open_app);
+    }
 
     // NOTE: signing paths require a physical device and are covered by the
     // hardware integration test (see `tests/test_ledger_integration.rs`), not
     // here — these unit tests only cover the pure logic that needs no device.
+
+    // ── F-3: signature binding is what closes the device-swap race ──
+
+    /// Two distinct keys, standing in for two physically different Ledgers.
+    fn device_key(seed: u8) -> (crate::sdk_adapter::Keypair, Pubkey) {
+        let kp = crate::sdk_adapter::keypair_from_seed(&[seed; 32]).expect("valid seed");
+        let pubkey = crate::sdk_adapter::keypair_pubkey(&kp);
+        (kp, pubkey)
+    }
+
+    #[test]
+    fn a_swapped_device_is_caught_as_a_verification_failure() {
+        // The race this closes: `LedgerSigner` caches a pubkey at connect, but
+        // the actor's cached session is keyed on the host path, not on the
+        // signer. If a second `connect` re-points the session at a different
+        // device, an existing signer's next command runs against *that* device.
+        //
+        // The signature then comes back from the wrong key. Because every
+        // signature is verified against the pubkey cached at connect, and never
+        // against whatever the device reports now, this surfaces as a clean
+        // rejection instead of a wrong-key signature being attached.
+        let (device_a, pubkey_a) = device_key(1);
+        let (device_b, pubkey_b) = device_key(2);
+        assert_ne!(pubkey_a, pubkey_b);
+
+        let envelope = ledger_offchain_envelope(&pubkey_a, b"transfer 1 SOL").unwrap();
+        // The swapped-in device signs the bytes we sent, with its own key.
+        let from_b = crate::sdk_adapter::keypair_sign_message(&device_b, &envelope);
+
+        let err = crate::signature_util::verify_or_reject(&from_b, &pubkey_a, &envelope)
+            .expect_err("a signature from a swapped device must never be attached");
+        assert!(matches!(err, SignerError::SigningFailed(_)));
+
+        // Control: the device we actually connected to is accepted.
+        let from_a = crate::sdk_adapter::keypair_sign_message(&device_a, &envelope);
+        assert!(crate::signature_util::verify_or_reject(&from_a, &pubkey_a, &envelope).is_ok());
+    }
+
+    #[test]
+    fn a_corrupted_signature_is_rejected_on_the_offchain_path() {
+        // Transport corruption on the off-chain path. The bytes verified are the
+        // envelope, not the payload, which is the whole reason this check has to
+        // be built from `ledger_offchain_envelope` and not from the raw message.
+        let (device, pubkey) = device_key(3);
+        let envelope = ledger_offchain_envelope(&pubkey, b"hello").unwrap();
+        let good = crate::sdk_adapter::keypair_sign_message(&device, &envelope);
+        assert!(crate::signature_util::verify_or_reject(&good, &pubkey, &envelope).is_ok());
+
+        let mut raw = signature_bytes(good);
+        raw[0] ^= 0x01;
+        let corrupted = Signature::from(raw);
+        assert!(
+            crate::signature_util::verify_or_reject(&corrupted, &pubkey, &envelope).is_err(),
+            "a single flipped bit must fail verification"
+        );
+    }
+
+    #[test]
+    fn a_corrupted_signature_is_rejected_on_the_transaction_path() {
+        // Same guarantee on the transaction path, over the exact bytes that
+        // cross to the device: `tx.message.serialize()`.
+        let (device, pubkey) = device_key(4);
+        let tx = crate::test_util::create_test_transaction(&pubkey);
+        let message = tx.message.serialize();
+        let good = crate::sdk_adapter::keypair_sign_message(&device, &message);
+        assert!(crate::signature_util::verify_or_reject(&good, &pubkey, &message).is_ok());
+
+        let mut raw = signature_bytes(good);
+        raw[63] ^= 0x80;
+        let corrupted = Signature::from(raw);
+        assert!(
+            crate::signature_util::verify_or_reject(&corrupted, &pubkey, &message).is_err(),
+            "a single flipped bit must fail verification"
+        );
+    }
+
+    #[test]
+    fn both_signing_paths_verify_before_returning() {
+        // The tests above prove the predicate rejects bad signatures. They
+        // cannot prove the signing paths still *call* it, and that is the
+        // failure that would actually ship: a refactor dropping the check leaves
+        // every test above green. So assert it against the source.
+        //
+        // Neither call is behind a `cfg`, and no other code path returns a
+        // signature: the dashboard is reachable only from `Connect`, which
+        // returns a pubkey.
+        let src = include_str!("mod.rs");
+        // Split off this test module first: its own source mentions the call,
+        // and counting that would let the guard satisfy itself.
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("module has a test section");
+        let verify_calls = production
+            .matches("verify_or_reject(&signature, &self.pubkey")
+            .count();
+        assert_eq!(
+            verify_calls, 2,
+            "expected exactly one verify_or_reject in sign_message and one in \
+             sign_transaction; found {verify_calls}"
+        );
+        for path in ["async fn sign_message", "async fn sign_transaction"] {
+            let body = production.split(path).nth(1).expect("signing fn present");
+            let end = body.find("\n    }").expect("fn body terminates");
+            assert!(
+                body[..end].contains("verify_or_reject"),
+                "{path} must verify the device signature before returning it"
+            );
+        }
+    }
 
     #[test]
     fn default_derivation_path_is_solana_bip44() {
