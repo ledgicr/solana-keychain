@@ -65,6 +65,12 @@ rust-ledger-open-app:
 rust-test-ledger:
     cargo test --no-default-features --features {{ sdkv3_int }},ledger ledger -- --nocapture --test-threads=1
 
+# Which solana-remote-wallet did this graph resolve? Device support depends on
+# it, so the troubleshooting docs point here rather than at a raw cargo command.
+[working-directory: 'rust']
+rust-which-remote-wallet:
+    cargo tree -i solana-remote-wallet
+
 # Run one #[ignore]d Ledger hardware test by name. Used by the evidence runbook
 # so it does not hand-roll cargo flags that drift from this file.
 [working-directory: 'rust']

@@ -180,7 +180,7 @@ names the product id and the version requirement instead of blaming the cable.
 Check what you resolved with:
 
 ```bash
-cargo tree -i solana-remote-wallet
+just rust-which-remote-wallet
 ```
 
 ## Off-chain message signing
