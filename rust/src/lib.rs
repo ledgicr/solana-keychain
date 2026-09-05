@@ -126,8 +126,7 @@ pub use fordefi::{
 };
 #[cfg(feature = "ledger")]
 pub use ledger::{
-    LedgerConfig, LedgerSigner, DEFAULT_DERIVATION_PATH, DEFAULT_SIGNING_TIMEOUT,
-    FAST_COMMAND_TIMEOUT,
+    LedgerConfig, LedgerSigner, DEFAULT_DERIVATION_PATH, DEFAULT_SIGN_TIMEOUT, OPS_TIMEOUT,
 };
 #[cfg(feature = "openfort")]
 pub use openfort::{OpenfortSigner, OpenfortSignerConfig};
