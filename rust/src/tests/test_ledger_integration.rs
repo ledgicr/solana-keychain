@@ -224,6 +224,30 @@ mod tests {
             "is_attached must not hang behind a prompt"
         );
 
+        // And a second *signing* request must be refused in milliseconds
+        // rather than queueing behind the prompt. This is the observable that
+        // the atomic claim exists to provide: before it, admission was
+        // check-then-act and this call would have waited out its whole signing
+        // timeout.
+        let mut tx2 = crate::test_util::create_test_transaction(&signer.pubkey());
+        let start = std::time::Instant::now();
+        let refused = signer.sign_transaction(&mut tx2).await;
+        let elapsed = start.elapsed();
+        assert!(
+            refused.is_err(),
+            "a second signature during a pending prompt must be refused"
+        );
+        let detail = refused.unwrap_err().detail_string();
+        assert!(
+            detail.contains("busy with another operation"),
+            "must be the busy error, got: {detail}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must fail fast, took {elapsed:?}"
+        );
+        eprintln!("second signer refused in {elapsed:?}: {detail}");
+
         eprintln!("\n>>> You may now REJECT the pending prompt to finish.\n");
         let _ = signing.await;
     }
