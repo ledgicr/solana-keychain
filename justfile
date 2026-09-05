@@ -65,6 +65,13 @@ rust-ledger-open-app:
 rust-test-ledger:
     cargo test --no-default-features --features {{ sdkv3_int }},ledger ledger -- --nocapture --test-threads=1
 
+# What is attached and what does the device say about itself? Read-only
+# diagnostic for a failed connect; needs a device, changes nothing.
+[working-directory: 'rust']
+rust-ledger-diagnose:
+    cargo test --no-default-features --features {{ sdkv3_int }},ledger \
+        diagnose_attached_ledger -- --ignored --nocapture --test-threads=1
+
 # Ledger hardware evidence pack. Interactive: it walks the operator through the
 # device states unit tests cannot reach and writes a timestamped markdown
 # transcript for attaching to a PR. Run once per device in the matrix.
