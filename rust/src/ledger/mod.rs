@@ -26,6 +26,29 @@
 //! request/reply against the shared thread from inside
 //! [`tokio::task::spawn_blocking`].
 //!
+//! ## One session, and what that costs
+//!
+//! The device thread caches **one** session at a time. Two consequences worth
+//! knowing before designing around this backend.
+//!
+//! One on-device confirmation at a time, per process. Signing serializes through
+//! the single actor, and a dispatched APDU cannot be cancelled, so a second
+//! signing request arriving while the device is mid-prompt fails fast rather
+//! than queueing behind a human who may never answer.
+//!
+//! Two physical Ledgers cannot be used concurrently. Alternating between signers
+//! bound to different devices thrashes the one cached session: each command
+//! re-establishes against its own `host_device_path`, so throughput collapses,
+//! and a signature produced on the wrong device fails closed at
+//! `verify_or_reject` rather than being attached. It is safe, but it is not
+//! usable. Sequential use of one device at a time is the supported shape.
+//!
+//! TODO: replace the single `Option<Session>` with a map keyed by host device
+//! path, so concurrent devices each keep their own handle. Deliberately not done
+//! alongside the re-establish logic in [`with_session`]: the interaction between
+//! "rebuild a missing session" and "which of several sessions is missing" is
+//! subtle enough to want its own change.
+//!
 //! Works under any of `sdk-v2`/`sdk-v3`/`sdk-v4`. The backend needs
 //! `solana-remote-wallet` 4.x — the first line carrying the Nano Gen5 product
 //! IDs — whose solana-* crates do not match the ones `sdk-v2`/`sdk-v3` select.
@@ -94,9 +117,16 @@ pub struct LedgerConfig {
     /// Launch the Solana app from the BOLOS dashboard when a connect fails
     /// because the app is not running. Defaults to `true`.
     ///
-    /// **This writes APDUs to the device without asking the host user**, and on
-    /// most firmware the device then shows its own confirmation prompt. That is
-    /// the right default for an interactive CLI, where the alternative is
+    /// **This writes APDUs to the device without asking the host user.** Two
+    /// facts about what the device does in response:
+    ///
+    /// - Launching the Solana app prompts for consent on the device screen.
+    /// - If a *different* app is currently open, it is quit back to the
+    ///   dashboard **without any on-device prompt** before that consent prompt
+    ///   appears. So the first visible effect of a connect can be another app
+    ///   closing, with nothing asked first.
+    ///
+    /// Default `true` is right for an interactive CLI, where the alternative is
     /// telling the user to go and navigate the device by hand. Set it to `false`
     /// for unattended or server-side use, where a process should not be poking a
     /// security device on its own initiative; connect then fails with the
@@ -238,6 +268,12 @@ impl LedgerSigner {
     /// [`SignerError::NotAvailable`] listing each device's path so the caller can
     /// retry with a specific one.
     ///
+    /// Naming a path does **not** make two devices usable concurrently. The
+    /// device thread caches one session, so alternating between signers bound to
+    /// different devices re-establishes on every command. It stays correct -- a
+    /// signature from the wrong device fails closed at verification -- but it is
+    /// not a supported concurrency model. See the module documentation.
+    ///
     /// Requires the Ledger to be plugged in, unlocked, and running the Solana
     /// app. On Linux, the appropriate `udev` rules must be installed.
     ///
@@ -370,6 +406,11 @@ impl SolanaSigner for LedgerSigner {
     ///
     /// Note the envelope is **not** what `solana_offchain_message` produces —
     /// see [`ledger_offchain_envelope`] for why, and for the layout.
+    ///
+    /// **Blind signing.** A payload that is not printable ASCII is sent as
+    /// format 1 (LimitedUtf8), and the Solana app refuses those unless the user
+    /// has enabled blind signing in its settings. Keep payloads to printable
+    /// ASCII to avoid the requirement entirely.
     async fn sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
         let serialized = ledger_offchain_envelope(&self.pubkey, message)?;
         // Kept for the post-signing verification below; `serialized` itself moves
