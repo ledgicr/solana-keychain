@@ -607,11 +607,23 @@ never leaves the device and every signature must be confirmed on the device
 screen. Requires the `ledger` feature, a connected and unlocked device running
 the Solana app (and, on Linux, Ledger's [`udev` rules](https://github.com/LedgerHQ/udev-rules)).
 
+**Do not enable trace logging for `solana_remote_wallet` in production.** It logs
+raw APDU bytes at `TRACE`, which includes transaction and message content, and
+prints approval prompts to stdout.
+
+See [docs/LEDGER.md](../docs/LEDGER.md) for timeouts, the auto-launch opt-out and
+troubleshooting.
+
 Supported devices are whatever `solana-remote-wallet` enumerates: Nano S,
 Nano S Plus, Nano X, Stax, Flex and Nano Gen5. Gen5 needs `solana-remote-wallet`
 >= 4.1, the first release carrying its USB product IDs; the dependency range is
 left wide at `4` so a consumer still on the solana 3.x-transaction line resolves
-to 4.0.3 and gets every other device without migrating first.
+to 4.0.3 and gets every other device without migrating first. That resolution is
+a property of *your* graph, not of this crate: check it with
+`cargo tree -i solana-remote-wallet`. A Gen5 on a 4.0.x build does not fail
+loudly, it simply never enumerates, so the backend detects an attached
+Ledger-vendor device it could not enumerate and names the product id and the
+version requirement rather than reporting "no Ledger device found".
 
 Works under any of `sdk-v2`/`sdk-v3`/`sdk-v4`. The backend exchanges pubkeys and
 signatures with the selected SDK as raw bytes, so `solana-remote-wallet`'s own
@@ -641,7 +653,9 @@ with "open the Solana app". Declining that prompt on-device, like declining a
 signature, surfaces as `SignerError::UserRejected`.
 
 Transactions the Solana app cannot clear-sign require **blind signing** to be
-enabled in the app's settings.
+enabled in the app's settings. The same applies to off-chain messages that are
+not printable ASCII: those go as format 1 (LimitedUtf8) and the app refuses them
+without blind signing. Keeping payloads to printable ASCII avoids it entirely.
 
 ## Security Audit
 

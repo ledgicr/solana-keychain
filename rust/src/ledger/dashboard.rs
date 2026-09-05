@@ -99,6 +99,64 @@ pub fn ensure_solana_app_open(host_device_path: Option<&str>) -> Result<bool, Si
     }
 }
 
+/// Pick the device matching `want`, or nothing.
+///
+/// The Solana-app host path and this dashboard path are both HID paths on the
+/// same physical device, but may name different *interfaces*, so an exact match
+/// is not guaranteed even when the right device is attached. Hence the prefix
+/// step.
+///
+/// What this must never do is fall back to an arbitrary device, which is what it
+/// used to do: an exact-match miss selected `ledgers.first()`. With two Ledgers
+/// attached that meant `ensure_solana_app_open` could quit the running app and
+/// launch Solana on the device the caller did *not* name -- writing
+/// app-management APDUs to the wrong security device, silently. Returning
+/// `None` and letting the caller error is the only safe answer.
+///
+/// The prefix step is deliberately conservative: it takes the candidates sharing
+/// the longest common prefix with `want` that ends on a path delimiter, and
+/// accepts only if exactly one candidate does. Ambiguity resolves to `None`,
+/// because guessing between two devices is the bug being fixed.
+fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
+    if let Some(exact) = available.iter().position(|p| *p == want) {
+        return Some(exact);
+    }
+
+    /// Length of the shared prefix, truncated back to the last delimiter so a
+    /// coincidental partial component does not count as a match.
+    fn shared_prefix_len(a: &str, b: &str) -> usize {
+        let common = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+        a[..common]
+            .rfind(['/', ':', '@', '\\'])
+            .map_or(0, |i| i + 1)
+    }
+
+    let best = available
+        .iter()
+        .map(|p| shared_prefix_len(p, want))
+        .max()
+        .unwrap_or(0);
+    // The prefix must be nearly the whole path, so that what differs is a
+    // trailing interface identifier and nothing more. A weak rule is worse than
+    // no rule here: on Linux two *different* Ledgers appear as `/dev/hidraw2`
+    // and `/dev/hidraw3`, which share `/dev/`, so anything that accepts a short
+    // common prefix reintroduces exactly the wrong-device bug this replaces.
+    // Requiring 80% means `/dev/` (5 of 12) is refused while a macOS
+    // `IOService:/.../IOUSBHostInterface@0` vs `@1` pair (66 of 67) is accepted.
+    if best * 5 < want.len() * 4 {
+        return None;
+    }
+    let mut matching = available
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| shared_prefix_len(p, want) == best);
+    let (idx, _) = matching.next()?;
+    if matching.next().is_some() {
+        return None; // ambiguous; never guess
+    }
+    Some(idx)
+}
+
 /// Open the Ledger HID device, honoring an explicit host path or requiring a
 /// single connected device.
 fn open_ledger(
@@ -111,18 +169,24 @@ fn open_ledger(
         .collect();
 
     match host_device_path {
-        // The Solana-app host path and this dashboard path are both HID paths on
-        // the same physical device, but may name different interfaces. Match the
-        // device by its USB path prefix if an exact path match isn't found.
         Some(want) => {
-            let info = ledgers
+            let paths: Vec<String> = ledgers
                 .iter()
-                .find(|d| d.path().to_string_lossy() == want)
-                .or_else(|| ledgers.first())
-                .ok_or_else(|| {
-                    SignerError::NotAvailable(format!("no Ledger device at host path `{want}`"))
-                })?;
-            info.open_device(api)
+                .map(|d| d.path().to_string_lossy().into_owned())
+                .collect();
+            let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let idx = select_ledger(&refs, want).ok_or_else(|| {
+                SignerError::NotAvailable(format!(
+                    "no Ledger device at host path `{want}`; attached: {}",
+                    if refs.is_empty() {
+                        "none".to_string()
+                    } else {
+                        refs.join(", ")
+                    }
+                ))
+            })?;
+            ledgers[idx]
+                .open_device(api)
                 .map_err(|e| SignerError::NotAvailable(format!("cannot open Ledger: {e}")))
         }
         None => ledgers
@@ -312,6 +376,59 @@ fn read_apdu(device: &hidapi::HidDevice) -> Result<(Vec<u8>, u16), SignerError> 
 
 #[cfg(test)]
 mod tests {
+    use super::select_ledger;
+
+    // ── F-3c: never open a device the caller did not name ──
+
+    #[test]
+    fn an_exact_path_wins() {
+        let devices = ["/dev/hidraw2", "/dev/hidraw3"];
+        assert_eq!(select_ledger(&devices, "/dev/hidraw3"), Some(1));
+    }
+
+    #[test]
+    fn a_missing_path_is_never_substituted_by_another_device() {
+        // The defect: an exact-match miss used to select `ledgers.first()`. With
+        // two Ledgers attached that meant quitting an app and launching Solana
+        // on the device the caller did not name.
+        let devices = ["/dev/hidraw2", "/dev/hidraw3"];
+        assert_eq!(
+            select_ledger(&devices, "/dev/hidraw9"),
+            None,
+            "an unmatched path must resolve to nothing, not to some other device"
+        );
+    }
+
+    #[test]
+    fn a_sibling_interface_on_the_same_device_matches_by_prefix() {
+        // The legitimate reason a prefix step exists: one physical Ledger
+        // exposes several HID interfaces, and the Solana-app path may name a
+        // different one than the dashboard path.
+        let devices = ["IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@1"];
+        let want = "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@0";
+        assert_eq!(select_ledger(&devices, want), Some(0));
+    }
+
+    #[test]
+    fn two_devices_sharing_a_prefix_are_ambiguous_and_refused() {
+        // Guessing between two devices is exactly the bug being fixed, so an
+        // equal-length tie must resolve to None rather than to either one.
+        let devices = [
+            "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@0",
+            "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@1",
+        ];
+        let want = "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@7";
+        assert_eq!(select_ledger(&devices, want), None);
+    }
+
+    #[test]
+    fn a_shared_root_is_not_evidence_of_anything() {
+        // Two unrelated devices both under /dev must not match each other.
+        let devices = ["/dev/hidraw2"];
+        assert_eq!(select_ledger(&devices, "/dev/hidraw9"), None);
+        assert_eq!(select_ledger(&[], "/dev/hidraw2"), None);
+    }
+
     use super::*;
 
     #[test]
