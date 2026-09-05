@@ -125,7 +125,10 @@ pub use fordefi::{
     FordefiSolanaFee, PemRequestSigner, SolanaChainUniqueId,
 };
 #[cfg(feature = "ledger")]
-pub use ledger::LedgerSigner;
+pub use ledger::{
+    LedgerConfig, LedgerSigner, DEFAULT_DERIVATION_PATH, DEFAULT_SIGNING_TIMEOUT,
+    FAST_COMMAND_TIMEOUT,
+};
 #[cfg(feature = "openfort")]
 pub use openfort::{OpenfortSigner, OpenfortSignerConfig};
 #[cfg(feature = "para")]
@@ -441,6 +444,19 @@ impl Signer {
         })
         .await
         .map_err(|e| SignerError::Other(format!("Ledger connect task failed: {e}")))??;
+        Ok(Self::Ledger(signer))
+    }
+
+    /// Open a Ledger signer with an explicit [`LedgerConfig`].
+    ///
+    /// The knobs that matter for unattended use are
+    /// [`LedgerConfig::signing_timeout`] and [`LedgerConfig::auto_open_app`];
+    /// see that type for what each one costs.
+    #[cfg(feature = "ledger")]
+    pub async fn from_ledger_with(config: LedgerConfig) -> Result<Self, SignerError> {
+        let signer = tokio::task::spawn_blocking(move || LedgerSigner::connect_with(config))
+            .await
+            .map_err(|e| SignerError::Other(format!("Ledger connect task failed: {e}")))??;
         Ok(Self::Ledger(signer))
     }
 
