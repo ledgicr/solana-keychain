@@ -9,7 +9,7 @@ screen.
 ```rust
 use solana_keychain::{LedgerConfig, LedgerSigner};
 
-// Interactive default: sole attached device, 5-minute signing timeout,
+// Interactive default: sole attached device, DEFAULT_SIGN_TIMEOUT for signing,
 // auto-launches the Solana app if it is not already open.
 let signer = LedgerSigner::connect(None, false, None)?;
 
@@ -28,22 +28,34 @@ blocks while the user reads a confirm screen.
 
 | Tier | Commands | Default |
 |---|---|---|
-| Fast | enumeration, unconfirmed pubkey read, `is_available`, `is_attached` | `FAST_COMMAND_TIMEOUT`, 10s |
-| Interactive | `sign_transaction`, `sign_message`, connect with `confirm_pubkey_on_device` or `auto_open_app` | `LedgerConfig::signing_timeout`, 300s |
+| Fast | enumeration, unconfirmed pubkey read, `is_available`, `is_attached` | `OPS_TIMEOUT` |
+| Interactive | `sign_transaction`, `sign_message`, connect with `confirm_pubkey_on_device` or `auto_open_app` | `LedgerConfig::signing_timeout`, defaults to `DEFAULT_SIGN_TIMEOUT` |
 
-The interactive default sits inside a Ledger's ten-minute auto-lock. Past that
-the prompt is gone and no answer is coming, so waiting longer only prolongs the
-stall.
+Both defaults are named constants rather than numbers repeated here. This
+document used to restate them in prose, and kept the old figures after
+`DEFAULT_SIGN_TIMEOUT` was retuned downwards, so a reader trusting it would have
+had a confirmation time out minutes earlier than promised.
+`docs_quote_the_real_timeout_constants` now fails if the prose and the code drift
+apart again.
+
+Two minutes is long enough for a deliberate read-and-approve and short enough
+that an abandoned prompt does not hold the device for the rest of the process's
+life.
 
 **Why a timeout alone is not the whole story.** The device thread is a single
 serialized actor, and the read it blocks in has no timeout of its own:
 `solana-remote-wallet`'s `Ledger::read` calls `hidapi`'s blocking
-`HidDevice::read`. Returning control to one caller therefore leaves the actor
-stuck. So a command that times out also marks the actor unresponsive, and
-subsequent commands fail fast with "still blocked" rather than queueing behind
-it and burning their own timeouts in turn. The mark clears itself the moment the
-actor completes anything, so a slow user who eventually presses the button costs
-nothing.
+`HidDevice::read`, which nothing on the host can interrupt. Returning control to
+one caller therefore leaves the actor stuck, and without more, every later
+command would queue behind a human who may never press the button and burn its
+own full timeout in turn.
+
+So the device is **claimed**, not merely checked. Anything that touches it takes
+an exclusive claim with a single `compare_exchange` *before* the command is
+enqueued, and releases it on drop. Exactly one of any number of racing callers
+wins; the rest get "Ledger is busy with another operation or awaiting on-device
+confirmation" in milliseconds. One process therefore serializes to one on-device
+confirmation at a time, by construction rather than by timing.
 
 ## `auto_open_app` and its device side effect
 
@@ -69,12 +81,16 @@ failure looks identical to an unplugged cable.
 The canonical rules come from
 [`LedgerHQ/udev-rules`](https://github.com/LedgerHQ/udev-rules):
 
-```bash
-wget -q -O - https://raw.githubusercontent.com/LedgerHQ/udev-rules/master/add_udev_rules.sh | sudo bash
-```
+**Write the file yourself. Do not pipe a script into a root shell.** Ledger's
+README suggests
+`wget -q -O - .../master/add_udev_rules.sh | sudo bash`, and this documentation
+used to repeat it. That fetches a *mutable branch* and hands the response to
+`sudo bash`: whoever controls that branch, that repository or that download path
+at the moment you run it gets root on your machine. The content is nine lines of
+static udev rules. There is no reason to execute it at all.
 
-That writes `/etc/udev/rules.d/20-hw1.rules` and reloads udev. The current
-contents:
+The rules, verbatim, as of `LedgerHQ/udev-rules` commit
+[`6d9b0257`](https://github.com/LedgerHQ/udev-rules/commit/6d9b02572ce3ba3cddcbabdb6f625a8cf333e592):
 
 ```
 # HW.1, Nano
@@ -86,6 +102,27 @@ SUBSYSTEMS=="usb", ATTRS{idVendor}=="2c97", TAG+="uaccess", TAG+="udev-acl"
 # Same, but with hidraw-based library (instead of libusb)
 KERNEL=="hidraw*", ATTRS{idVendor}=="2c97", MODE="0666"
 ```
+
+Save that as `/etc/udev/rules.d/20-hw1.rules`, then reload:
+
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+If you would rather fetch it than paste it, pin the revision and check the
+digest **before** it goes anywhere near `sudo`:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/LedgerHQ/udev-rules/6d9b0257/20-hw1.rules
+echo "0a67fa9b7024048f7f967fef8d33c2da38dae9354e996c131b79a014f62b7efc  20-hw1.rules" | shasum -a 256 -c
+# only if that prints OK:
+sudo install -m 0644 20-hw1.rules /etc/udev/rules.d/20-hw1.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Read the file before installing it either way. It is short, and it is granting
+device access on your machine.
 
 Two things worth knowing:
 
@@ -105,10 +142,10 @@ After installing, unplug and replug the device.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `NotAvailable` mentioning udev, on Linux | Rules not installed, or installed but not reloaded | Run the script above, then replug |
+| `NotAvailable` mentioning udev, on Linux | Rules not installed, or installed but not reloaded | Install the rules above, then replug |
 | `NotAvailable` naming a product id and a `solana-remote-wallet` version | Device model newer than the resolved `solana-remote-wallet` | See the table below |
 | `NotAvailable`: "either locked, or another application is holding the device" | Device auto-locked, **or** Ledger Live has the handle | Unlock and open the Solana app; quit Ledger Live |
-| `NotAvailable`: "still blocked on an earlier command that timed out" | A prompt was abandoned on the device | Answer or dismiss it, or replug |
+| `NotAvailable`: "busy with another operation or awaiting on-device confirmation" | Another caller holds the device, or a prompt is unanswered | Answer or dismiss it on the device, or wait |
 | `NotAvailable` listing several devices | More than one Ledger attached | Pass `host_device_path` |
 | `UserRejected` | Declined on the device screen | Retry and approve |
 

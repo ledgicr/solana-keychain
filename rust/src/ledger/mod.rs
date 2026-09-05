@@ -1537,6 +1537,32 @@ mod tests {
     }
 
     #[test]
+    fn docs_quote_the_real_timeout_constants() {
+        // docs/LEDGER.md said "5-minute" and "300s" for a while after
+        // DEFAULT_SIGN_TIMEOUT was retuned to 120s. A reader trusting the prose
+        // would have had a confirmation time out three minutes early. The doc
+        // now names the constants instead of restating their values, and this
+        // pins that: no bare duration may appear in the timeout table, and the
+        // constants it names must be the ones that exist.
+        let doc = include_str!("../../../docs/LEDGER.md");
+        for stale in ["5-minute signing timeout", "300s", "FAST_COMMAND_TIMEOUT"] {
+            assert!(
+                !doc.contains(stale),
+                "docs/LEDGER.md still contains `{stale}`, which no longer matches the code"
+            );
+        }
+        for named in ["OPS_TIMEOUT", "DEFAULT_SIGN_TIMEOUT"] {
+            assert!(
+                doc.contains(named),
+                "docs/LEDGER.md should name `{named}` rather than restate its value"
+            );
+        }
+        // And the constants the doc names really are the public ones.
+        assert_eq!(OPS_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(DEFAULT_SIGN_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[test]
     fn the_two_timeout_tiers_are_ordered_and_bounded() {
         // A probe that cannot involve the user must not inherit the
         // wait-for-a-human budget, and the signing default must stay inside a
