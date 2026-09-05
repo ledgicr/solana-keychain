@@ -152,6 +152,9 @@ impl Default for LedgerConfig {
 enum DeviceCommand {
     /// Establish (or reuse) a device session and read the pubkey at `path_str`.
     Connect {
+        /// Released when the actor drops this command, so a caller-side
+        /// timeout cannot free a device that is still busy.
+        claim: DeviceClaim,
         path_str: String,
         confirm_pubkey_on_device: bool,
         host_device_path: Option<String>,
@@ -161,6 +164,9 @@ enum DeviceCommand {
     },
     /// Sign serialized transaction-message bytes (Solana app "sign" APDU).
     SignTransactionMessage {
+        /// Released when the actor drops this command, so a caller-side
+        /// timeout cannot free a device that is still busy.
+        claim: DeviceClaim,
         path_str: String,
         message: Vec<u8>,
         /// Which device this signer was opened against, so a lost session
@@ -170,6 +176,9 @@ enum DeviceCommand {
     },
     /// Sign an off-chain message (Solana app "sign off-chain message" APDU).
     SignOffchainMessage {
+        /// Released when the actor drops this command, so a caller-side
+        /// timeout cannot free a device that is still busy.
+        claim: DeviceClaim,
         path_str: String,
         message: Vec<u8>,
         /// Which device this signer was opened against, so a lost session
@@ -179,6 +188,9 @@ enum DeviceCommand {
     },
     /// Liveness probe: can we read the pubkey without on-device confirmation?
     IsAvailable {
+        /// Released when the actor drops this command, so a caller-side
+        /// timeout cannot free a device that is still busy.
+        claim: DeviceClaim,
         path_str: String,
         host_device_path: Option<String>,
         reply: Sender<bool>,
@@ -332,13 +344,16 @@ impl LedgerSigner {
         let requested_device = host_device_path.clone();
         // A connect can reach the user too, so it takes the same claim rather
         // than racing a signature already at the confirm screen.
-        let _claim = DeviceClaim::acquire()?;
-        let pubkey_bytes = request_on(device_channel(), timeout, |reply| DeviceCommand::Connect {
-            path_str: path_str.clone(),
-            confirm_pubkey_on_device,
-            host_device_path,
-            auto_open_app,
-            reply,
+        let claim = DeviceClaim::acquire()?;
+        let pubkey_bytes = request_on(device_channel(), timeout, claim, |claim, reply| {
+            DeviceCommand::Connect {
+                claim,
+                path_str: path_str.clone(),
+                confirm_pubkey_on_device,
+                host_device_path,
+                auto_open_app,
+                reply,
+            }
         })?;
 
         Ok(Self {
@@ -426,10 +441,11 @@ impl SolanaSigner for LedgerSigner {
         // the device before enqueueing, so a racing caller fails fast instead of
         // waiting out its whole timeout behind someone else's prompt. Held until
         // this function returns, by any path.
-        let _claim = DeviceClaim::acquire()?;
+        let claim = DeviceClaim::acquire()?;
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
-            request_on(device_channel(), timeout, |reply| {
+            request_on(device_channel(), timeout, claim, |claim, reply| {
                 DeviceCommand::SignOffchainMessage {
+                    claim,
                     path_str,
                     message: serialized,
                     host_device_path,
@@ -458,12 +474,13 @@ impl SolanaSigner for LedgerSigner {
         tokio::task::spawn_blocking(move || {
             // Probe, not an operation: if someone else holds the device, report
             // "not available" rather than queueing behind their prompt.
-            let Some(_claim) = DeviceClaim::try_acquire() else {
+            let Some(claim) = DeviceClaim::try_acquire() else {
                 return false;
             };
             let (reply_tx, reply_rx) = mpsc::channel();
             if device_channel()
                 .send(DeviceCommand::IsAvailable {
+                    claim,
                     path_str,
                     host_device_path,
                     reply: reply_tx,
@@ -513,10 +530,11 @@ impl TransactionSigner for LedgerSigner {
         // the device before enqueueing, so a racing caller fails fast instead of
         // waiting out its whole timeout behind someone else's prompt. Held until
         // this function returns, by any path.
-        let _claim = DeviceClaim::acquire()?;
+        let claim = DeviceClaim::acquire()?;
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
-            request_on(device_channel(), timeout, |reply| {
+            request_on(device_channel(), timeout, claim, |claim, reply| {
                 DeviceCommand::SignTransactionMessage {
+                    claim,
                     path_str,
                     message,
                     host_device_path,
@@ -670,6 +688,15 @@ fn busy_error() -> SignerError {
 
 /// An exclusive claim on the device, released when dropped.
 ///
+/// **The claim is moved into the command and dropped by the actor**, not held by
+/// the caller. That matters: a caller-held guard is released when the caller
+/// returns, including when it returns from a *timeout*, while the actor can
+/// still be blocked indefinitely in the untimed HID read. Releasing then would
+/// let the next caller acquire and queue behind an operation that is still
+/// running, waiting out its own full timeout instead of failing fast, which is
+/// the exact stall the claim exists to prevent. So ownership crosses the channel
+/// and the release happens when the device work actually finishes.
+///
 /// ## Why this is not a bool check
 ///
 /// It used to be: callers read `DEVICE_BUSY` and returned early if set, and the
@@ -725,10 +752,13 @@ impl Drop for DeviceClaim {
 fn request_on<T: Send + 'static>(
     cmd_tx: &Sender<DeviceCommand>,
     timeout: Duration,
-    build: impl FnOnce(Sender<Result<T, SignerError>>) -> DeviceCommand,
+    claim: DeviceClaim,
+    build: impl FnOnce(DeviceClaim, Sender<Result<T, SignerError>>) -> DeviceCommand,
 ) -> Result<T, SignerError> {
     let (reply_tx, reply_rx) = mpsc::channel();
-    cmd_tx.send(build(reply_tx)).map_err(|_| {
+    // On a send failure the command comes back inside `SendError` and drops
+    // here, which releases the claim: the actor is gone and will not do it.
+    cmd_tx.send(build(claim, reply_tx)).map_err(|_| {
         SignerError::NotAvailable("Ledger device thread is not running".to_string())
     })?;
     match reply_rx.recv_timeout(timeout) {
@@ -922,6 +952,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             DeviceCommand::Connect {
+                claim: _claim,
                 path_str,
                 confirm_pubkey_on_device,
                 host_device_path,
@@ -994,6 +1025,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
             }
 
             DeviceCommand::SignTransactionMessage {
+                claim: _claim,
                 path_str,
                 message,
                 host_device_path,
@@ -1014,6 +1046,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
             }
 
             DeviceCommand::SignOffchainMessage {
+                claim: _claim,
                 path_str,
                 message,
                 host_device_path,
@@ -1034,6 +1067,7 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
             }
 
             DeviceCommand::IsAvailable {
+                claim: _claim,
                 path_str,
                 host_device_path,
                 reply,
@@ -1324,8 +1358,12 @@ mod tests {
         mpsc::channel()
     }
 
-    fn connect_cmd(reply: Sender<Result<[u8; 32], SignerError>>) -> DeviceCommand {
+    fn connect_cmd(
+        claim: DeviceClaim,
+        reply: Sender<Result<[u8; 32], SignerError>>,
+    ) -> DeviceCommand {
         DeviceCommand::Connect {
+            claim,
             path_str: DEFAULT_DERIVATION_PATH.to_string(),
             confirm_pubkey_on_device: false,
             host_device_path: None,
@@ -1346,7 +1384,13 @@ mod tests {
         // in has no timeout of its own.
         let (tx, _rx) = wedged_actor();
         let start = Instant::now();
-        let err = request_on(&tx, Duration::from_millis(200), connect_cmd).unwrap_err();
+        let err = request_on(
+            &tx,
+            Duration::from_millis(200),
+            DeviceClaim::acquire().unwrap(),
+            connect_cmd,
+        )
+        .unwrap_err();
         assert!(
             start.elapsed() >= Duration::from_millis(200),
             "must honour the deadline"
@@ -1456,6 +1500,45 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_timeout_does_not_release_the_device() {
+        // The second-round defect. The claim was a caller-held guard, so it was
+        // released when the caller returned -- including when it returned from a
+        // *timeout*. But the actor can still be blocked in the untimed HID read
+        // at that point, so the next caller would acquire, enqueue behind an
+        // operation that is still running, and wait out its own full timeout.
+        // The fail-fast promise quietly became a second full stall.
+        //
+        // Ownership now crosses the channel: the claim is moved into the command
+        // and dropped by the actor when the work finishes. A wedged actor never
+        // drops it, so it stays held.
+        let _guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        DEVICE_BUSY.store(false, Ordering::SeqCst);
+
+        // `_rx` is held so the send succeeds and nothing ever serves it: a
+        // wedged actor.
+        let (tx, _rx) = wedged_actor();
+        let claim = DeviceClaim::acquire().expect("idle");
+        let err = request_on(&tx, Duration::from_millis(150), claim, connect_cmd).unwrap_err();
+        assert!(err.detail_string().contains("busy with another operation"));
+
+        assert!(
+            device_is_busy(),
+            "the caller timed out but the actor is still blocked, so the device \
+             must stay claimed"
+        );
+        assert!(
+            DeviceClaim::acquire().is_err(),
+            "a later caller must fail fast, not queue behind the wedged actor"
+        );
+
+        // Draining the command drops the claim, which is what the actor does
+        // once the device work completes.
+        drop(_rx);
+        assert!(!device_is_busy(), "the claim releases with the command");
+        DEVICE_BUSY.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
     fn an_abandoned_reply_channel_does_not_panic_the_actor() {
         // A caller that timed out has dropped its receiver. The actor answers
         // into a dead channel; `let _ = reply.send(..)` must swallow that. If it
@@ -1545,7 +1628,16 @@ mod tests {
         // pins that: no bare duration may appear in the timeout table, and the
         // constants it names must be the ones that exist.
         let doc = include_str!("../../../docs/LEDGER.md");
-        for stale in ["5-minute signing timeout", "300s", "FAST_COMMAND_TIMEOUT"] {
+        // `cargo ` is here because CLAUDE.md requires Rust commands to be
+        // exposed through Just: the recipes carry flags a hand-written command
+        // gets wrong. Two separate reviews caught this doc reintroducing raw
+        // cargo, so it is now a test rather than a habit.
+        for stale in [
+            "5-minute signing timeout",
+            "300s",
+            "FAST_COMMAND_TIMEOUT",
+            "cargo ",
+        ] {
             assert!(
                 !doc.contains(stale),
                 "docs/LEDGER.md still contains `{stale}`, which no longer matches the code"
