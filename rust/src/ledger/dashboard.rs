@@ -134,9 +134,18 @@ fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
     /// Length of the shared prefix, truncated back to the last delimiter so a
     /// coincidental partial component does not count as a match.
     fn shared_prefix_len(a: &str, b: &str) -> usize {
-        let common = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+        // Bytes throughout, never a string slice. HID paths arrive via
+        // `to_string_lossy` and can hold multibyte characters; if two paths
+        // first differ *inside* one, the matching-byte count is not a char
+        // boundary and `a[..common]` panics. Explicit device selection must
+        // return an error in that case, never abort the process.
+        let a = a.as_bytes();
+        let b = b.as_bytes();
+        let common = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+        const DELIMS: [u8; 4] = [b'/', b':', b'@', b'\\'];
         a[..common]
-            .rfind(['/', ':', '@', '\\'])
+            .iter()
+            .rposition(|byte| DELIMS.contains(byte))
             .map_or(0, |i| i + 1)
     }
 
@@ -166,6 +175,7 @@ fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
     Some(idx)
 }
 
+#[cfg(test)]
 /// Which app the device reports running, without changing anything.
 ///
 /// Read-only counterpart to [`ensure_solana_app_open`], for diagnosing a failed
@@ -178,6 +188,7 @@ pub(super) fn running_app(host_device_path: Option<&str>) -> Result<Option<Strin
     current_app(&device)
 }
 
+#[cfg(test)]
 /// Send one raw APDU and return `(payload, status_word)`, for diagnostics only.
 ///
 /// Exists because `solana-remote-wallet` reports an app-protocol mismatch as an
@@ -468,6 +479,35 @@ mod tests {
         ];
         let want = "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@7";
         assert_eq!(select_ledger(&devices, want), None);
+    }
+
+    #[test]
+    fn a_multibyte_path_does_not_panic() {
+        // The defect: `shared_prefix_len` counted matching *bytes* and then
+        // sliced the string by that count. Two paths differing inside a
+        // multibyte character gave a non-boundary index, so explicit device
+        // selection panicked instead of returning an error. These pairs differ
+        // mid-character on purpose.
+        let cases: [(&str, &str); 4] = [
+            ("/dev/ledger-é", "/dev/ledger-è"),
+            ("IOService:/usb/ledger@café", "IOService:/usb/ledger@cafè"),
+            ("/dev/日本語", "/dev/日本誤"),
+            ("/dev/🔒a", "/dev/🔓a"),
+        ];
+        for (have, want) in cases {
+            // Must not panic. Either answer is acceptable; aborting is not.
+            let _ = select_ledger(&[have], want);
+            let _ = select_ledger(&[want], have);
+        }
+    }
+
+    #[test]
+    fn a_multibyte_sibling_interface_still_matches() {
+        // And the prefix rule keeps working when the shared part is multibyte:
+        // these differ only in the trailing interface digit.
+        let devices = ["IOService:/AppleT8103/usb-drd0/lédger@01100000/Interface@0"];
+        let want = "IOService:/AppleT8103/usb-drd0/lédger@01100000/Interface@1";
+        assert_eq!(select_ledger(&devices, want), Some(0));
     }
 
     #[test]
