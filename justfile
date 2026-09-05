@@ -65,6 +65,20 @@ rust-ledger-open-app:
 rust-test-ledger:
     cargo test --no-default-features --features {{ sdkv3_int }},ledger ledger -- --nocapture --test-threads=1
 
+# Run one #[ignore]d Ledger hardware test by name. Used by the evidence runbook
+# so it does not hand-roll cargo flags that drift from this file.
+[working-directory: 'rust']
+rust-ledger-hw-test name:
+    cargo test --no-default-features --features {{ sdkv3_int }},ledger \
+        {{ name }} -- --ignored --nocapture --test-threads=1
+
+# One iteration of the reconnect regression. The runbook loops this and checks
+# for signal termination, which is why it is a recipe rather than inline cargo.
+[working-directory: 'rust']
+rust-ledger-hw-reconnect:
+    cargo test --no-default-features --features {{ sdkv3_int }},ledger \
+        test_ledger_reconnect_cycle_does_not_crash -- --nocapture --test-threads=1
+
 # What is attached and what does the device say about itself? Read-only
 # diagnostic for a failed connect; needs a device, changes nothing.
 [working-directory: 'rust']

@@ -53,6 +53,8 @@ REPORT="$OUT_DIR/ledger-evidence-${SLUG}-$(uname -s | tr '[:upper:]' '[:lower:]'
 
 PASS=0
 FAIL=0
+CRASH=0
+SKIP=0
 declare -a SUMMARY
 
 log()  { printf '%s\n' "$*" >>"$REPORT"; }
@@ -92,6 +94,20 @@ phase() {
   log ""
   log "Exit status: \`$rc\` after ${elapsed}s."
 
+  # Three outcomes, not two. A signal-terminated process is never "as
+  # expected", even for a phase that expects failure: `rc > 128` means SIGTRAP,
+  # an abort or a kill, and the reconnect phase exists precisely to detect that
+  # crash. Folding it into "nonzero, therefore the expected failure" let the
+  # runbook mark the very regression it was written to catch as a pass.
+  if [[ $rc -gt 128 ]]; then
+    local sig=$((rc - 128))
+    CRASH=$((CRASH+1)); SUMMARY+=("CRASH $name (signal $sig)")
+    log "Result: **CRASHED** — terminated by signal $sig. This is a regression,"
+    log "not an expected failure, however the phase's expectation was written."
+    say "   CRASHED (signal $sig after ${elapsed}s)"
+    return
+  fi
+
   local ok=0
   [[ "$expect" == "pass" && $rc -eq 0 ]] && ok=1
   [[ "$expect" == "fail" && $rc -ne 0 ]] && ok=1
@@ -106,13 +122,16 @@ phase() {
 }
 
 # Run one #[ignore]d hardware test by name.
+# Run one #[ignore]d hardware test by name, through the repository recipe so it
+# gets the same feature set and flags as every other entry point. Raw `cargo`
+# here would drift from the Justfile the moment the feature matrix changes,
+# which is exactly what CLAUDE.md forbids.
 hw_test() {
-  (cd rust && cargo test --no-default-features \
-     --features all,sdk-v3,unsafe-debug,integration-tests,ledger \
-     "$1" -- --ignored --nocapture --test-threads=1)
+  just rust-ledger-hw-test "$1"
 }
 
 skipped() {
+  SKIP=$((SKIP+1))
   SUMMARY+=("SKIP  $1")
   log ""; log "## $1"; log ""; log "_Skipped by the operator._"
   say "   skipped"
@@ -206,22 +225,29 @@ if prompt "Unlock the device and open the Solana app. This runs 20 times and nee
   log ""; log "## 6. Reconnect regression, 20 iterations"; log ""
   log "Expectation: 20 of 20 must **pass**."; log ""; log '```'
   reconnect_fail=0
+  reconnect_crash=0
   for i in $(seq 1 20); do
     printf 'iteration %02d: ' "$i" >>"$REPORT"
-    if (cd rust && cargo test --no-default-features \
-          --features all,sdk-v3,unsafe-debug,integration-tests,ledger \
-          test_ledger_reconnect_cycle_does_not_crash \
-          -- --nocapture --test-threads=1) >/dev/null 2>&1; then
+    just rust-ledger-hw-reconnect >/dev/null 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
       echo "ok" >>"$REPORT"
+    elif [[ $rc -gt 128 ]]; then
+      echo "CRASHED (signal $((rc - 128)))" >>"$REPORT"
+      reconnect_crash=$((reconnect_crash+1))
     else
-      echo "FAILED" >>"$REPORT"; reconnect_fail=$((reconnect_fail+1))
+      echo "FAILED (exit $rc)" >>"$REPORT"; reconnect_fail=$((reconnect_fail+1))
     fi
     printf '.' >&2
   done
   printf '\n' >&2
   log '```'; log ""
-  log "Failures: **$reconnect_fail of 20**."
-  if [[ $reconnect_fail -eq 0 ]]; then
+  log "Failures: **$reconnect_fail of 20**. Signal-terminated: **$reconnect_crash**."
+  if [[ $reconnect_crash -gt 0 ]]; then
+    CRASH=$((CRASH+1))
+    SUMMARY+=("CRASH 6. Reconnect regression x20 ($reconnect_crash crashed)")
+    say "   CRASHED: $reconnect_crash of 20 killed by a signal"
+  elif [[ $reconnect_fail -eq 0 ]]; then
     PASS=$((PASS+1)); SUMMARY+=("PASS  6. Reconnect regression x20"); say "   ok, 20/20"
   else
     FAIL=$((FAIL+1)); SUMMARY+=("FAIL  6. Reconnect regression x20 ($reconnect_fail failed)")
@@ -318,7 +344,17 @@ fi
   printf '%s\n' "${SUMMARY[@]}"
   echo '```'
   echo ""
-  echo "**$PASS as expected, $FAIL not as expected.**"
+  echo "**$PASS as expected, $FAIL not as expected, $CRASH crashed, $SKIP skipped.**"
+  echo ""
+  if [[ $CRASH -gt 0 ]]; then
+    echo "> A phase was terminated by a signal. That is a regression of the"
+    echo "> process-wide device thread, not an expected failure, and this report"
+    echo "> should not be attached as evidence until it is understood."
+  fi
+  if [[ $SKIP -gt 0 ]]; then
+    echo "> $SKIP phase(s) were skipped. Skipped is not passed: the matrix is"
+    echo "> incomplete and the gaps are listed above."
+  fi
   echo ""
   echo "### Matrix coverage"
   echo ""
@@ -330,5 +366,7 @@ fi
 say ""
 say "Report: $REPORT"
 printf '%s\n' "${SUMMARY[@]}" >&2
-say "$PASS as expected, $FAIL not as expected."
-[[ $FAIL -eq 0 ]]
+say "$PASS as expected, $FAIL not as expected, $CRASH crashed, $SKIP skipped."
+# Nonzero on any unexpected outcome or any crash. Skips do not fail the run,
+# because skipping is a legitimate operator choice, but they are reported.
+[[ $FAIL -eq 0 && $CRASH -eq 0 ]]
