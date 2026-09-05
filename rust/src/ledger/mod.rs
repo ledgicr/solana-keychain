@@ -910,6 +910,15 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                     // decision — surface it.
                     if connected.is_err() && auto_open_app {
                         match dashboard::ensure_solana_app_open(host_device_path.as_deref()) {
+                            // The dashboard can identify a locked device exactly
+                            // (APDU 0x5515) where the Solana-app path cannot. When
+                            // it does, prefer that definitive answer over the
+                            // hedged "locked or busy" one the connect produced.
+                            Err(e @ SignerError::NotAvailable(_))
+                                if e.detail_string().contains("is locked") =>
+                            {
+                                return Err(e)
+                            }
                             Ok(_launched) => {
                                 for _ in 0..20 {
                                     std::thread::sleep(std::time::Duration::from_millis(250));
