@@ -672,9 +672,7 @@ fn establish_session(
         .map_err(|e| SignerError::NotAvailable(format!("Ledger HID subsystem unavailable: {e}")))?;
     let count = manager.update_devices().map_err(map_rw_err)?;
     if count == 0 {
-        return Err(SignerError::NotAvailable(
-            "no Ledger device found (plug in, unlock, and open the Solana app)".to_string(),
-        ));
+        return Err(no_ledger_enumerated_error());
     }
 
     // `list_devices` filters to valid Ledger wallets by VID/PID + HID usage,
@@ -703,11 +701,7 @@ fn establish_session(
                 SignerError::NotAvailable(format!("no Ledger device at host path `{want}`"))
             })?,
         None => match ledgers.len() {
-            0 => {
-                return Err(SignerError::NotAvailable(
-                    "no Ledger device found".to_string(),
-                ))
-            }
+            0 => return Err(no_ledger_enumerated_error()),
             1 => ledgers.into_iter().next().expect("len == 1"),
             _ => {
                 // `pretty_path` is the canonical Solana device locator
@@ -736,6 +730,80 @@ fn establish_session(
         .get_pubkey(path, confirm_pubkey_on_device)
         .map_err(map_rw_err)?;
     Ok((ledger, pubkey.to_bytes()))
+}
+
+/// Ledger USB vendor id.
+const LEDGER_VID: u16 = 0x2c97;
+
+/// Product ids the Nano Gen5 presents, added to `solana-remote-wallet` in 4.1.
+///
+/// Duplicated from upstream deliberately, and only to *diagnose*: it lets a
+/// build whose resolved `solana-remote-wallet` predates 4.1 say why the device
+/// in the user's hand is invisible, rather than reporting "no Ledger found"
+/// while one is plugged in. Nothing is selected or driven from this list, so it
+/// drifting behind upstream costs a less specific message and nothing more.
+/// (Source: `solana-remote-wallet` `ledger.rs`, `LEDGER_NANO_GEN5_PIDS`.)
+const GEN5_PIDS: [u16; 33] = [
+    0x0008, 0x8000, 0x8001, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006, 0x8007, 0x8008, 0x8009, 0x800a,
+    0x800b, 0x800c, 0x800d, 0x800e, 0x800f, 0x8010, 0x8011, 0x8012, 0x8013, 0x8014, 0x8015, 0x8016,
+    0x8017, 0x8018, 0x8019, 0x801a, 0x801b, 0x801c, 0x801d, 0x801e, 0x801f,
+];
+
+/// Product ids of Ledger-vendor devices physically attached, as `hidapi` sees
+/// them. Deduplicated, because a Ledger exposes several HID interfaces.
+fn attached_ledger_pids() -> Vec<u16> {
+    let Ok(api) = hidapi::HidApi::new() else {
+        return Vec::new();
+    };
+    let mut pids: Vec<u16> = api
+        .device_list()
+        .filter(|d| d.vendor_id() == LEDGER_VID)
+        .map(|d| d.product_id())
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// The error for "no Ledger enumerated", enriched when one is in fact attached.
+///
+/// This is the silent-fork guard. `solana-remote-wallet` selects devices by a
+/// per-model product-id allowlist, so a model it predates is not rejected with
+/// an explanation -- it simply never appears, and every layer above reports "no
+/// Ledger device found" while the user is holding one that is plugged in,
+/// unlocked and running the app. That is the single most misleading failure this
+/// backend can produce, and it is entirely a function of which
+/// `solana-remote-wallet` the consumer's dependency graph resolved.
+///
+/// So: ask `hidapi` directly. If a Ledger-vendor device is attached that
+/// `solana-remote-wallet` did not enumerate, say so and name the version
+/// requirement instead of blaming the cable.
+fn no_ledger_enumerated_error() -> SignerError {
+    let attached = attached_ledger_pids();
+    if attached.is_empty() {
+        return SignerError::NotAvailable(
+            "no Ledger device found (plug in, unlock, and open the Solana app)".to_string(),
+        );
+    }
+    let pid_list = attached
+        .iter()
+        .map(|p| format!("0x{p:04x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let gen5 = attached.iter().any(|p| GEN5_PIDS.contains(p));
+    let requirement = if gen5 {
+        "This is a Nano Gen5, which requires solana-remote-wallet >= 4.1. A build that \
+         resolved 4.0.x -- which is what the Solana 3.x crate line selects -- cannot see it \
+         at all."
+    } else {
+        "This build's solana-remote-wallet does not recognise that product id, so it never \
+         enumerated the device. A newer solana-remote-wallet is likely required."
+    };
+    SignerError::NotAvailable(format!(
+        "a Ledger device is attached (product id {pid_list}) but this build did not \
+         enumerate it. {requirement} Run `cargo tree -i solana-remote-wallet` to see which \
+         version your graph resolved.{LINUX_UDEV_HINT}"
+    ))
 }
 
 /// A live device session, cached on the device thread between commands.
@@ -924,6 +992,22 @@ fn signature_bytes(sig: impl AsRef<[u8]>) -> [u8; 64] {
     out
 }
 
+/// Appended to HID-layer failures on Linux.
+///
+/// On Linux a Ledger is invisible to a non-root process until udev rules grant
+/// the user access, and the failure surfaces as a plain HID open error that
+/// looks identical to a disconnected cable. Without naming udev, the user is
+/// sent to check hardware that is working fine. Empty on every other platform,
+/// where no such rules exist.
+#[cfg(target_os = "linux")]
+const LINUX_UDEV_HINT: &str = " On Linux this is most often missing udev rules: \
+     without them the device node is not readable by your user. See the \
+     \"Linux: udev rules\" section of the Ledger backend documentation.";
+
+/// Not applicable off Linux.
+#[cfg(not(target_os = "linux"))]
+const LINUX_UDEV_HINT: &str = "";
+
 /// Map `solana-remote-wallet` errors onto [`SignerError`], preserving the
 /// user-rejection and device-absence cases the caller wants to distinguish.
 fn map_rw_err(e: RemoteWalletError) -> SignerError {
@@ -944,11 +1028,12 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
         // script that opened the device and never exited. Naming only the
         // disconnect sends the user to check the cable, which is the one thing
         // that is fine.
-        RemoteWalletError::Hid(_) => SignerError::NotAvailable(
+        RemoteWalletError::Hid(_) => SignerError::NotAvailable(format!(
             "Ledger is not reachable. Either it was disconnected, or another application is \
-             holding the device — quit Ledger Live and any other wallet software, then retry."
-                .to_string(),
-        ),
+             holding the device — quit Ledger Live and any other wallet software, then \
+             retry.{}",
+            LINUX_UDEV_HINT
+        )),
         // An unclassified protocol error means the transport answered but the
         // app-level command did not. Two different states produce it and the
         // error carries nothing that separates them:
@@ -1252,6 +1337,41 @@ mod tests {
         }
     }
 
+    // ── F-6: the silent-fork guard ──
+
+    #[test]
+    fn gen5_pids_are_reported_with_the_version_requirement() {
+        // A build whose solana-remote-wallet predates 4.1 never enumerates a
+        // Gen5, so every layer above says "no Ledger found" while one is
+        // plugged in and unlocked. Verified empirically against the two
+        // versions in this workspace's registry: 4.0.3 defines PID lists for
+        // Nano S / X / S Plus / Stax / Flex only; 4.2.2 adds
+        // LEDGER_NANO_GEN5_PIDS. The message has to name that, or the user goes
+        // looking at cables.
+        assert!(
+            GEN5_PIDS.contains(&0x8000),
+            "0x8000 is the Gen5 PID we tested against"
+        );
+        assert!(GEN5_PIDS.contains(&0x0008));
+    }
+
+    #[test]
+    fn no_device_error_stays_plain_when_nothing_is_attached() {
+        // With no Ledger-vendor device present the message must not speculate
+        // about versions. On a machine with a Ledger attached this asserts the
+        // enriched form instead, which is the branch that matters.
+        let err = no_ledger_enumerated_error();
+        assert!(matches!(err, SignerError::NotAvailable(_)));
+        let detail = err.detail_string();
+        if attached_ledger_pids().is_empty() {
+            assert!(detail.contains("no Ledger device found"), "got: {detail}");
+            assert!(!detail.contains("product id"), "got: {detail}");
+        } else {
+            assert!(detail.contains("product id"), "got: {detail}");
+            assert!(detail.contains("solana-remote-wallet"), "got: {detail}");
+        }
+    }
+
     #[test]
     fn default_derivation_path_is_solana_bip44() {
         let path = DerivationPath::from_absolute_path_str(DEFAULT_DERIVATION_PATH);
@@ -1372,6 +1492,27 @@ mod tests {
             detail.contains("Ledger Live"),
             "the remedy has to name the usual culprit, got: {detail}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hid_error_names_udev_on_linux() {
+        // A missing udev rule and an unplugged cable produce the same HID error,
+        // and only one of them is worth checking the cable for.
+        let err = map_rw_err(RemoteWalletError::Hid("open failed".to_string()));
+        assert!(
+            err.detail_string().contains("udev"),
+            "got: {}",
+            err.detail_string()
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn hid_error_omits_the_udev_hint_off_linux() {
+        // udev does not exist here; offering it would be noise.
+        let err = map_rw_err(RemoteWalletError::Hid("open failed".to_string()));
+        assert!(!err.detail_string().contains("udev"));
     }
 
     #[test]
