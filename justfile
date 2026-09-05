@@ -65,6 +65,13 @@ rust-ledger-open-app:
 rust-test-ledger:
     cargo test --no-default-features --features {{ sdkv3_int }},ledger ledger -- --nocapture --test-threads=1
 
+# Assert our off-chain envelope against LedgerHQ/app-solana's own source.
+# Reaches the network, so it is ignored by default; no device needed.
+[working-directory: 'rust']
+rust-test-ledger-conformance:
+    cargo test --no-default-features --features {{ sdkv3_int }},ledger \
+        test_ledger_envelope_conformance -- --ignored --nocapture
+
 [working-directory: 'rust']
 rust-test-integration:
     #!/usr/bin/env bash
