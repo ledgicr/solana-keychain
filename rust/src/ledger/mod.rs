@@ -1228,6 +1228,32 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
                     .to_string(),
             )
         }
+        // APDU 0x6808. Observed on a Nano Gen5 running Solana app 1.16.0 when
+        // signing an off-chain message whose payload is not printable ASCII: the
+        // app refuses format 1 (LimitedUtf8) unless blind signing is enabled in
+        // its settings. Upstream renders this as "Ledger operation not
+        // supported", which is true and useless -- it names no remedy, and the
+        // remedy is a setting the user can change in ten seconds.
+        //
+        // 0x6808 is a generic BOLOS "not supported", so this does not claim to
+        // be the only cause; it offers the one that is overwhelmingly likely for
+        // a signing call and says so.
+        //
+        // The wording mirrors what the device puts on screen -- "This transaction
+        // cannot be clear-signed", with a "Go to settings" button -- so a user
+        // looking at the device and a developer reading a log see the same words.
+        // It also says the modal must be dismissed, because it stays up and
+        // blocks every subsequent command, which otherwise reads as a hung
+        // device.
+        RemoteWalletError::LedgerError(LedgerError::SdkNotSupported) => SignerError::SigningFailed(
+            "the Ledger could not clear-sign this, and blind signing is disabled in the \
+                 Solana app's settings. The device shows \"This transaction cannot be \
+                 clear-signed\" with a \"Go to settings\" prompt, which has to be dismissed \
+                 before it will answer anything else. Blind signing is required for off-chain \
+                 messages that are not printable ASCII, and for transactions the app cannot \
+                 decode."
+                .to_string(),
+        ),
         other => SignerError::SigningFailed(format!("Ledger device error: {other}")),
     }
 }
@@ -1774,6 +1800,21 @@ mod tests {
         assert_eq!(
             ledger_offchain_envelope(&signer, &at_limit).unwrap().len(),
             1215
+        );
+    }
+
+    #[test]
+    fn unsupported_operation_names_blind_signing() {
+        // Observed on hardware: a non-ASCII off-chain message with blind signing
+        // disabled comes back as APDU 0x6808, which upstream renders as "Ledger
+        // operation not supported". That is accurate and actionable for nobody.
+        use solana_remote_wallet::ledger_error::LedgerError;
+        let err = map_rw_err(RemoteWalletError::LedgerError(LedgerError::SdkNotSupported));
+        assert!(matches!(err, SignerError::SigningFailed(_)));
+        assert!(
+            err.detail_string().contains("blind signing"),
+            "the remedy has to be in the message, got: {}",
+            err.detail_string()
         );
     }
 
