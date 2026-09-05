@@ -28,8 +28,9 @@
 #![cfg(feature = "ledger")]
 
 /// `libsol/include/sol/offchain_message_signing.h` and
-/// `libsol/offchain_message_signing.c` as of 2026-07-01.
-const APP_SOLANA_PIN: &str = "9ca0509720b605346d64800faa63890bb9a81b51";
+/// `libsol/offchain_message_signing.c`, at the commit the source-level audit
+/// reviewed.
+const APP_SOLANA_PIN: &str = "c855c1a0ea12e76406efbfd17203ecf419952e27";
 
 fn raw_url(path: &str) -> String {
     format!("https://raw.githubusercontent.com/LedgerHQ/app-solana/{APP_SOLANA_PIN}/{path}")
