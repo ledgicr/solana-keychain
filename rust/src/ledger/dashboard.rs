@@ -52,6 +52,15 @@ const INS_QUIT_APP: u8 = 0xa7;
 
 const APDU_SUCCESS: u16 = 0x9000;
 
+/// BOLOS status word for a locked device.
+///
+/// Observed on a Nano Gen5: with the device locked but plugged in,
+/// `getAppAndVersion` answers `0x5515` and no app-level command completes. This
+/// is the one signal that separates "locked" from "another process holds the
+/// device" -- the Solana-app APDUs cannot tell them apart, which is why the
+/// error for that case has to name both causes.
+const APDU_DEVICE_LOCKED: u16 = 0x5515;
+
 /// Name of the Solana embedded app as the dashboard reports and launches it.
 pub const SOLANA_APP_NAME: &str = "Solana";
 
@@ -253,6 +262,14 @@ fn reopen_after_reenumerate(
 /// determined. Response layout: `[format][name_len][name…][ver_len][ver…]…`.
 fn current_app(device: &hidapi::HidDevice) -> Result<Option<String>, SignerError> {
     let (payload, status) = exchange(device, CLA_DASHBOARD, INS_GET_APP_AND_VERSION, 0, 0, &[])?;
+    // A locked device is worth reporting exactly, because it is the one cause
+    // the Solana-app APDUs cannot identify. Returning `Ok(None)` here, as this
+    // used to, threw away the only unambiguous evidence we get.
+    if status == APDU_DEVICE_LOCKED {
+        return Err(SignerError::NotAvailable(
+            "the Ledger is locked. Enter your PIN on the device, then retry.".to_string(),
+        ));
+    }
     if status != APDU_SUCCESS || payload.len() < 2 {
         return Ok(None);
     }
