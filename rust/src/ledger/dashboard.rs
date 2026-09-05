@@ -157,6 +157,38 @@ fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
     Some(idx)
 }
 
+/// Which app the device reports running, without changing anything.
+///
+/// Read-only counterpart to [`ensure_solana_app_open`], for diagnosing a failed
+/// connect: the `SignerError` cannot distinguish a locked device from a busy one
+/// from the wrong app being open, and this answers the third case directly.
+pub(super) fn running_app(host_device_path: Option<&str>) -> Result<Option<String>, SignerError> {
+    let api = hidapi::HidApi::new()
+        .map_err(|e| SignerError::NotAvailable(format!("Ledger HID subsystem unavailable: {e}")))?;
+    let device = open_ledger(&api, host_device_path)?;
+    current_app(&device)
+}
+
+/// Send one raw APDU and return `(payload, status_word)`, for diagnostics only.
+///
+/// Exists because `solana-remote-wallet` reports an app-protocol mismatch as an
+/// opaque `Protocol("...")` string with the actual bytes discarded, and knowing
+/// the payload length is the difference between "the device is locked" and "this
+/// app version speaks a protocol the crate does not parse".
+pub(super) fn probe_apdu(
+    host_device_path: Option<&str>,
+    cla: u8,
+    ins: u8,
+    p1: u8,
+    p2: u8,
+    data: &[u8],
+) -> Result<(Vec<u8>, u16), SignerError> {
+    let api = hidapi::HidApi::new()
+        .map_err(|e| SignerError::NotAvailable(format!("Ledger HID subsystem unavailable: {e}")))?;
+    let device = open_ledger(&api, host_device_path)?;
+    exchange(&device, cla, ins, p1, p2, data)
+}
+
 /// Open the Ledger HID device, honoring an explicit host path or requiring a
 /// single connected device.
 fn open_ledger(

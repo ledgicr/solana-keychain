@@ -1179,6 +1179,37 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
         // apart here, the message names both remedies: claiming only "locked"
         // sends anyone with Ledger Live open to re-enter a PIN that was never
         // the problem.
+        // Not every `Protocol(_)` is a device-state problem, and treating them
+        // alike sends the user to unlock a device that is already unlocked.
+        //
+        // This one is an app-protocol incompatibility, confirmed on a Nano Gen5
+        // (PID 0x8000) that was unlocked with the Solana app open and the BOLOS
+        // dashboard answering normally. `GET_APP_CONFIGURATION` (0xe0 0x04)
+        // returns status 0x9000 with a **7-byte** payload,
+        // `00 00 01 10 00 00 00`, while `solana-remote-wallet` 4.2.2 requires
+        // exactly 5 (`ledger.rs:349`, `if config.len() != 5`) and the deprecated
+        // fallback answers 0x6a83. So `update_devices` fails and `list_devices`
+        // returns nothing, on a device that is working perfectly.
+        //
+        // Nothing on this side can fix it: the check runs inside
+        // `update_devices` with no hook to bypass. Naming it is all we can do,
+        // and it is worth a great deal more than "unlock your device".
+        RemoteWalletError::Protocol(detail) if detail.contains("Version packet") => {
+            log::error!(
+                "The Ledger's Solana app returned an app-configuration vector this \
+                 solana-remote-wallet cannot parse. This is an upstream version \
+                 incompatibility, not a device problem: the device is fine and no \
+                 amount of unlocking or replugging will help. Run \
+                 `just rust-ledger-diagnose` to capture the exact bytes."
+            );
+            SignerError::NotAvailable(
+                "the Ledger's Solana app speaks a configuration format this build of \
+                 solana-remote-wallet cannot parse, so it will not enumerate the device. \
+                 The device is not at fault. This needs a newer solana-remote-wallet (or an \
+                 older Solana app); see docs/LEDGER.md."
+                    .to_string(),
+            )
+        }
         RemoteWalletError::Protocol(_) => {
             // `SignerError` Display and Debug are both redacted by design, and
             // `detail_string` is crate-private, so an external caller cannot
@@ -1508,6 +1539,126 @@ mod tests {
         }
     }
 
+    /// Print what is actually attached and what the device says about itself.
+    ///
+    /// Not an assertion, a diagnostic. When a connect fails, the error cannot
+    /// distinguish locked from busy from wrong-app, so this reports the raw
+    /// facts: which product ids `hidapi` can see, whether
+    /// `solana-remote-wallet` enumerated them, and what the BOLOS dashboard
+    /// says is running. Run it with:
+    ///
+    /// ```bash
+    /// just rust-ledger-diagnose
+    /// ```
+    #[test]
+    #[ignore = "diagnostic; needs a device. run via `just rust-ledger-diagnose`"]
+    fn diagnose_attached_ledger() {
+        eprintln!("\n─── hidapi enumeration ───");
+        match hidapi::HidApi::new() {
+            Ok(api) => {
+                let mut found = 0;
+                for d in api.device_list().filter(|d| d.vendor_id() == LEDGER_VID) {
+                    found += 1;
+                    eprintln!(
+                        "  pid=0x{:04x} interface={} usage_page=0x{:04x} product={:?}",
+                        d.product_id(),
+                        d.interface_number(),
+                        d.usage_page(),
+                        d.product_string().unwrap_or("<none>")
+                    );
+                    eprintln!("    path={}", d.path().to_string_lossy());
+                    if GEN5_PIDS.contains(&d.product_id()) {
+                        eprintln!("    -> in the Nano Gen5 PID set (needs remote-wallet >= 4.1)");
+                    }
+                }
+                if found == 0 {
+                    eprintln!("  no device with vendor id 0x2c97");
+                }
+            }
+            Err(e) => eprintln!("  hidapi unavailable: {e}"),
+        }
+
+        eprintln!("\n─── LedgerSigner::is_attached() ───");
+        eprintln!("  {}", LedgerSigner::is_attached());
+
+        eprintln!("\n─── BOLOS dashboard: which app is running? ───");
+        match dashboard::running_app(None) {
+            Ok(Some(app)) => eprintln!("  running app: {app:?}"),
+            Ok(None) => eprintln!("  dashboard answered but named no app"),
+            Err(e) => eprintln!("  dashboard unreachable: {}", e.detail_string()),
+        }
+
+        // The raw `RemoteWalletError`, not our mapped one. `map_rw_err` folds
+        // every `Protocol(_)` into one locked/busy message, and there are three
+        // distinct strings behind it -- "Unknown error", "Version packet size
+        // mismatch" and "Key packet size mismatch" -- which mean entirely
+        // different things. Diagnosing needs the original.
+        // What `solana-remote-wallet` chokes on. It requires the app-config
+        // payload to be exactly 5 bytes (current) or 4 (deprecated) and reports
+        // anything else as an opaque "Version packet size mismatch" with the
+        // bytes discarded. Ask the app directly.
+        eprintln!("\n─── BOLOS getAppAndVersion (raw) ───");
+        match dashboard::probe_apdu(None, 0xb0, 0x01, 0, 0, &[]) {
+            Ok((payload, sw)) => {
+                eprintln!("  status=0x{sw:04x} bytes={:02x?}", payload);
+                // format: 01 | name_len | name | version_len | version | ...
+                if payload.len() > 2 {
+                    let n = payload[1] as usize;
+                    let name = String::from_utf8_lossy(&payload[2..2 + n]);
+                    let vl = payload[2 + n] as usize;
+                    let ver = String::from_utf8_lossy(&payload[3 + n..3 + n + vl]);
+                    eprintln!("  app={name:?} version={ver:?}");
+                }
+            }
+            Err(e) => eprintln!("  {}", e.detail_string()),
+        }
+
+        eprintln!("\n─── Solana app configuration (CLA 0xe0) ───");
+        for (name, ins) in [
+            ("GET_APP_CONFIGURATION 0x04", 0x04u8),
+            ("DEPRECATED 0x01", 0x01u8),
+        ] {
+            match dashboard::probe_apdu(None, 0xe0, ins, 0, 0, &[]) {
+                Ok((payload, sw)) => eprintln!(
+                    "  {name}: status=0x{sw:04x} len={} bytes={:02x?}",
+                    payload.len(),
+                    payload
+                ),
+                Err(e) => eprintln!("  {name}: {}", e.detail_string()),
+            }
+        }
+
+        eprintln!("\n─── solana-remote-wallet, raw errors ───");
+        match initialize_wallet_manager() {
+            Err(e) => eprintln!("  initialize_wallet_manager: {e:?}"),
+            Ok(manager) => {
+                match manager.update_devices() {
+                    Ok(n) => eprintln!("  update_devices: {n} device(s)"),
+                    Err(e) => eprintln!("  update_devices: {e:?}"),
+                }
+                let ledgers: Vec<_> = manager
+                    .list_devices()
+                    .into_iter()
+                    .filter_map(|d| match d.wallet_type {
+                        RemoteWalletType::Ledger(w) => Some(w),
+                        _ => None,
+                    })
+                    .collect();
+                eprintln!("  list_devices: {} ledger(s)", ledgers.len());
+                for wallet in ledgers {
+                    eprintln!("    pretty_path={}", wallet.pretty_path);
+                    let path = DerivationPath::from_absolute_path_str(DEFAULT_DERIVATION_PATH)
+                        .expect("default path parses");
+                    match wallet.get_pubkey(&path, false) {
+                        Ok(pk) => eprintln!("    get_pubkey -> {pk}"),
+                        Err(e) => eprintln!("    get_pubkey -> RAW {e:?}"),
+                    }
+                }
+            }
+        }
+        eprintln!();
+    }
+
     // ── F-6: the silent-fork guard ──
 
     #[test]
@@ -1624,6 +1775,29 @@ mod tests {
             ledger_offchain_envelope(&signer, &at_limit).unwrap().len(),
             1215
         );
+    }
+
+    #[test]
+    fn app_protocol_mismatch_is_not_reported_as_a_locked_device() {
+        // Found on hardware: a Nano Gen5, unlocked, Solana app open, dashboard
+        // answering, still failed to enumerate because the app returns a 7-byte
+        // configuration vector where solana-remote-wallet 4.2.2 demands 5.
+        // Reporting that as "unlock your device" is worse than useless, because
+        // the user does it and nothing changes.
+        let err = map_rw_err(RemoteWalletError::Protocol("Version packet size mismatch"));
+        assert!(matches!(err, SignerError::NotAvailable(_)));
+        let detail = err.detail_string();
+        assert!(
+            !detail.contains("locked"),
+            "must not blame the device state, got: {detail}"
+        );
+        assert!(
+            detail.contains("solana-remote-wallet"),
+            "must name the incompatible component, got: {detail}"
+        );
+        // And the genuinely ambiguous case still says both things.
+        let ambiguous = map_rw_err(RemoteWalletError::Protocol("Unknown error"));
+        assert!(ambiguous.detail_string().contains("locked"));
     }
 
     #[test]
