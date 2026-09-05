@@ -330,6 +330,9 @@ impl LedgerSigner {
         };
 
         let requested_device = host_device_path.clone();
+        // A connect can reach the user too, so it takes the same claim rather
+        // than racing a signature already at the confirm screen.
+        let _claim = DeviceClaim::acquire()?;
         let pubkey_bytes = request_on(device_channel(), timeout, |reply| DeviceCommand::Connect {
             path_str: path_str.clone(),
             confirm_pubkey_on_device,
@@ -419,11 +422,11 @@ impl SolanaSigner for LedgerSigner {
         let path_str = self.path_str.clone();
         let host_device_path = self.host_device_path.clone();
         let timeout = self.signing_timeout;
-        // One process serializes to one on-device confirmation at a time. Fail
-        // now rather than queue behind a prompt that may never be answered.
-        if device_is_busy() {
-            return Err(busy_error());
-        }
+        // One process serializes to one on-device confirmation at a time. Claim
+        // the device before enqueueing, so a racing caller fails fast instead of
+        // waiting out its whole timeout behind someone else's prompt. Held until
+        // this function returns, by any path.
+        let _claim = DeviceClaim::acquire()?;
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
             request_on(device_channel(), timeout, |reply| {
                 DeviceCommand::SignOffchainMessage {
@@ -453,9 +456,11 @@ impl SolanaSigner for LedgerSigner {
         let path_str = self.path_str.clone();
         let host_device_path = self.host_device_path.clone();
         tokio::task::spawn_blocking(move || {
-            if device_is_busy() {
+            // Probe, not an operation: if someone else holds the device, report
+            // "not available" rather than queueing behind their prompt.
+            let Some(_claim) = DeviceClaim::try_acquire() else {
                 return false;
-            }
+            };
             let (reply_tx, reply_rx) = mpsc::channel();
             if device_channel()
                 .send(DeviceCommand::IsAvailable {
@@ -504,11 +509,11 @@ impl TransactionSigner for LedgerSigner {
         let path_str = self.path_str.clone();
         let host_device_path = self.host_device_path.clone();
         let timeout = self.signing_timeout;
-        // One process serializes to one on-device confirmation at a time. Fail
-        // now rather than queue behind a prompt that may never be answered.
-        if device_is_busy() {
-            return Err(busy_error());
-        }
+        // One process serializes to one on-device confirmation at a time. Claim
+        // the device before enqueueing, so a racing caller fails fast instead of
+        // waiting out its whole timeout behind someone else's prompt. Held until
+        // this function returns, by any path.
+        let _claim = DeviceClaim::acquire()?;
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
             request_on(device_channel(), timeout, |reply| {
                 DeviceCommand::SignTransactionMessage {
@@ -643,7 +648,10 @@ pub fn ledger_offchain_envelope(signer: &Pubkey, payload: &[u8]) -> Result<Vec<u
 /// is actually doing rather than what a caller inferred.
 static DEVICE_BUSY: AtomicBool = AtomicBool::new(false);
 
-/// True while the device thread is mid-command.
+/// True while some caller holds the device.
+///
+/// Only meaningful for the cheap probes, which report "not available" rather
+/// than queueing. Anything that touches the device takes a [`DeviceClaim`].
 fn device_is_busy() -> bool {
     DEVICE_BUSY.load(Ordering::SeqCst)
 }
@@ -660,12 +668,52 @@ fn busy_error() -> SignerError {
     )
 }
 
-/// Run `f` with the busy flag raised, clearing it on every exit path.
-fn while_busy<T>(f: impl FnOnce() -> T) -> T {
-    DEVICE_BUSY.store(true, Ordering::SeqCst);
-    let out = f();
-    DEVICE_BUSY.store(false, Ordering::SeqCst);
-    out
+/// An exclusive claim on the device, released when dropped.
+///
+/// ## Why this is not a bool check
+///
+/// It used to be: callers read `DEVICE_BUSY` and returned early if set, and the
+/// *actor* raised the flag once it dequeued a command. That is check-then-act,
+/// and it does not hold. Two callers could both read `false`, both enqueue, and
+/// the second would then wait its entire signing timeout behind the first
+/// caller's confirmation prompt -- which is precisely the stall the flag exists
+/// to prevent, so the fail-fast contract was strongest exactly when it was
+/// needed least.
+///
+/// The claim is taken **before** the command is enqueued, with a single
+/// `compare_exchange`, so exactly one of any number of racing callers wins and
+/// the rest get [`busy_error`] immediately.
+///
+/// Release is `Drop`, so it survives every exit path: a normal reply, a timeout,
+/// an error, or a panic unwinding out of the caller's task. Enforcing this in
+/// the actor instead was the alternative and it does not work: the actor cannot
+/// refuse a command it has not dequeued yet, so a queued second signature would
+/// still sit behind the first, which is the bug.
+struct DeviceClaim;
+
+impl DeviceClaim {
+    /// Take the claim, or report the device busy.
+    fn acquire() -> Result<Self, SignerError> {
+        DEVICE_BUSY
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self)
+            .map_err(|_| busy_error())
+    }
+
+    /// Take the claim, or give up. For probes, which report unavailability
+    /// rather than failing.
+    fn try_acquire() -> Option<Self> {
+        DEVICE_BUSY
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for DeviceClaim {
+    fn drop(&mut self) {
+        DEVICE_BUSY.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Send a command to the device actor and block for its reply, up to `timeout`.
@@ -951,19 +999,17 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                 host_device_path,
                 reply,
             } => {
-                let result = while_busy(|| {
-                    with_session(
-                        &mut session,
-                        &path_str,
-                        host_device_path.as_deref(),
-                        |wallet, path| {
-                            wallet
-                                .sign_message(path, &message)
-                                .map(signature_bytes)
-                                .map_err(map_rw_err)
-                        },
-                    )
-                });
+                let result = with_session(
+                    &mut session,
+                    &path_str,
+                    host_device_path.as_deref(),
+                    |wallet, path| {
+                        wallet
+                            .sign_message(path, &message)
+                            .map(signature_bytes)
+                            .map_err(map_rw_err)
+                    },
+                );
                 let _ = reply.send(result);
             }
 
@@ -973,19 +1019,17 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                 host_device_path,
                 reply,
             } => {
-                let result = while_busy(|| {
-                    with_session(
-                        &mut session,
-                        &path_str,
-                        host_device_path.as_deref(),
-                        |wallet, path| {
-                            wallet
-                                .sign_offchain_message(path, &message)
-                                .map(signature_bytes)
-                                .map_err(map_rw_err)
-                        },
-                    )
-                });
+                let result = with_session(
+                    &mut session,
+                    &path_str,
+                    host_device_path.as_deref(),
+                    |wallet, path| {
+                        wallet
+                            .sign_offchain_message(path, &message)
+                            .map(signature_bytes)
+                            .map_err(map_rw_err)
+                    },
+                );
                 let _ = reply.send(result);
             }
 
@@ -994,14 +1038,12 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                 host_device_path,
                 reply,
             } => {
-                let ok = while_busy(|| {
-                    with_session(
-                        &mut session,
-                        &path_str,
-                        host_device_path.as_deref(),
-                        |wallet, path| wallet.get_pubkey(path, false).map_err(map_rw_err),
-                    )
-                })
+                let ok = with_session(
+                    &mut session,
+                    &path_str,
+                    host_device_path.as_deref(),
+                    |wallet, path| wallet.get_pubkey(path, false).map_err(map_rw_err),
+                )
                 .is_ok();
                 let _ = reply.send(ok);
             }
@@ -1337,19 +1379,80 @@ mod tests {
     }
 
     #[test]
-    fn while_busy_clears_the_flag_on_the_way_out() {
+    fn a_claim_is_exclusive_and_released_on_drop() {
         let _guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         DEVICE_BUSY.store(false, Ordering::SeqCst);
-        assert!(!device_is_busy());
-        let seen = while_busy(|| device_is_busy());
-        assert!(
-            seen,
-            "the flag must be raised for the duration of the command"
-        );
+
+        let claim = DeviceClaim::acquire().expect("idle device must be claimable");
+        assert!(device_is_busy());
+        // A second claim must fail rather than wait.
+        assert!(DeviceClaim::acquire().is_err());
+        assert!(DeviceClaim::try_acquire().is_none());
+        drop(claim);
         assert!(
             !device_is_busy(),
-            "and cleared afterwards, or the device wedges forever"
+            "dropping must release, or the device wedges"
         );
+        assert!(DeviceClaim::acquire().is_ok());
+        DEVICE_BUSY.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn exactly_one_of_many_racing_claims_wins() {
+        // The bug this pins: the check used to be a separate load before the
+        // command was enqueued, and the flag was raised by the actor only once
+        // it dequeued. Two callers could both read `false`, both enqueue, and
+        // the second would then wait its entire signing timeout behind the
+        // first one's confirmation prompt. The fail-fast contract failed exactly
+        // when it mattered.
+        //
+        // Hammer it: many threads, one shared device, repeatedly. If admission
+        // is not atomic, more than one thread holds a claim at the same moment
+        // and `concurrent` climbs above 1.
+        let _guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        DEVICE_BUSY.store(false, Ordering::SeqCst);
+
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc as StdArc;
+        static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+        let max_seen = StdArc::new(AtomicUsize::new(0));
+        let wins = StdArc::new(AtomicUsize::new(0));
+        let start = StdArc::new(std::sync::Barrier::new(8));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let max_seen = StdArc::clone(&max_seen);
+            let wins = StdArc::clone(&wins);
+            let start = StdArc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..500 {
+                    if let Some(claim) = DeviceClaim::try_acquire() {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                        let n = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(n, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                        drop(claim);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("no thread should panic");
+        }
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "two callers held the device at once; admission is not atomic"
+        );
+        assert!(
+            wins.load(Ordering::SeqCst) > 0,
+            "the test proved nothing if nobody ever acquired"
+        );
+        assert!(!device_is_busy(), "every claim must have been released");
+        DEVICE_BUSY.store(false, Ordering::SeqCst);
     }
 
     #[test]
