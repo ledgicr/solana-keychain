@@ -160,7 +160,6 @@ compile_error!(
 );
 
 /// Unified signer enum supporting multiple backends
-#[derive(Debug)]
 pub enum Signer {
     #[cfg(feature = "memory")]
     Memory(MemorySigner),
@@ -413,46 +412,41 @@ impl Signer {
 
     /// Connect to a Ledger hardware wallet over USB-HID.
     ///
-    /// `derivation_path` defaults to `m/44'/501'/0'` when `None` — Ledger Live's
-    /// path, so the address matches the one the user sees and funds there. Set
-    /// `confirm_pubkey_on_device` to display the derived address on-screen for
-    /// the user to verify (use when registering an account, not when signing).
-    /// `host_device_path` selects a specific device when several are attached;
-    /// `None` requires exactly one.
+    /// Everything is on [`LedgerConfig`], and `Default` is the interactive
+    /// case: `m/44'/501'/0'` (Ledger Live's path, so the address matches the one
+    /// the user sees and funds there), no on-device address confirmation, the
+    /// sole attached device, [`DEFAULT_SIGN_TIMEOUT`], and the dashboard
+    /// auto-launch on.
+    ///
+    /// ```no_run
+    /// # use solana_keychain::{Signer, LedgerConfig};
+    /// # async fn f() -> Result<(), solana_keychain::SignerError> {
+    /// // The sole attached device, default path.
+    /// let signer = Signer::from_ledger(LedgerConfig::default()).await?;
+    ///
+    /// // Registering an account: show the address on the device to verify.
+    /// let signer = Signer::from_ledger(LedgerConfig {
+    ///     confirm_pubkey_on_device: true,
+    ///     ..LedgerConfig::default()
+    /// })
+    /// .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The two knobs that matter for unattended use are
+    /// [`LedgerConfig::signing_timeout`] and [`LedgerConfig::auto_open_app`];
+    /// see that type for what each one costs.
     ///
     /// The device must be unlocked. If the Solana app is not open this will try
-    /// to launch it for the user via the BOLOS dashboard.
+    /// to launch it for the user via the BOLOS dashboard, unless
+    /// [`LedgerConfig::auto_open_app`] is off.
     #[cfg(feature = "ledger")]
-    pub async fn from_ledger(
-        derivation_path: Option<&str>,
-        confirm_pubkey_on_device: bool,
-        host_device_path: Option<&str>,
-    ) -> Result<Self, SignerError> {
-        // `LedgerSigner::connect` blocks the calling thread on device I/O,
+    pub async fn from_ledger(config: LedgerConfig) -> Result<Self, SignerError> {
+        // `LedgerSigner::connect_with` blocks the calling thread on device I/O,
         // including waiting for a physical button press when
         // `confirm_pubkey_on_device` is set. Run it on the blocking pool so it
         // never stalls the async runtime.
-        let derivation_path = derivation_path.map(str::to_string);
-        let host_device_path = host_device_path.map(str::to_string);
-        let signer = tokio::task::spawn_blocking(move || {
-            LedgerSigner::connect(
-                derivation_path.as_deref(),
-                confirm_pubkey_on_device,
-                host_device_path.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| SignerError::Other(format!("Ledger connect task failed: {e}")))??;
-        Ok(Self::Ledger(signer))
-    }
-
-    /// Open a Ledger signer with an explicit [`LedgerConfig`].
-    ///
-    /// The knobs that matter for unattended use are
-    /// [`LedgerConfig::signing_timeout`] and [`LedgerConfig::auto_open_app`];
-    /// see that type for what each one costs.
-    #[cfg(feature = "ledger")]
-    pub async fn from_ledger_with(config: LedgerConfig) -> Result<Self, SignerError> {
         let signer = tokio::task::spawn_blocking(move || LedgerSigner::connect_with(config))
             .await
             .map_err(|e| SignerError::Other(format!("Ledger connect task failed: {e}")))??;

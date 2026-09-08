@@ -631,17 +631,22 @@ solana-* crates resolve alongside the selected SDK's rather than having to match
 them.
 
 ```rust
-use solana_keychain::{Signer, SolanaSigner};
+use solana_keychain::{LedgerConfig, Signer, SolanaSigner};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // `None` -> default derivation path m/44'/501'/0', which matches Ledger
-    // Live's Solana accounts (the 4-component m/44'/501'/0'/0' is the older
-    // Solana-CLI style and derives a *different* address).
-    // `true` -> display the address on-device for the user to verify.
-    // Final `None` -> auto-select the sole connected Ledger; pass a host device
-    // path to disambiguate when several are attached.
-    let signer = Signer::from_ledger(None, true, None).await?;
+    // `LedgerConfig::default()` is the interactive case: derivation path
+    // m/44'/501'/0', which matches Ledger Live's Solana accounts (the
+    // 4-component m/44'/501'/0'/0' is the older Solana-CLI style and derives a
+    // *different* address); the sole connected Ledger, with
+    // `host_device_path` there to disambiguate when several are attached; and
+    // the dashboard auto-launch on.
+    // `confirm_pubkey_on_device` displays the address on-device to verify.
+    let signer = Signer::from_ledger(LedgerConfig {
+        confirm_pubkey_on_device: true,
+        ..LedgerConfig::default()
+    })
+    .await?;
     println!("address: {}", signer.pubkey());
     Ok(())
 }
