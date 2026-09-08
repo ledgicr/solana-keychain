@@ -1,4 +1,3 @@
-
 //! Conformance check of our off-chain envelope against `LedgerHQ/app-solana`.
 //!
 //! Why this exists. [`crate::ledger::ledger_offchain_envelope`] hand-builds an

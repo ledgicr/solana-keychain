@@ -308,32 +308,94 @@ mod tests {
     }
 
     /// N6: a non-ASCII off-chain message needs blind signing enabled.
+    ///
+    /// ## Why this takes the setting as an input
+    ///
+    /// It used to `match` the result and `eprintln!` which branch it took,
+    /// asserting nothing. So it passed whether the device signed or refused,
+    /// and the runbook ran it twice -- once with blind signing disabled, once
+    /// enabled -- with both phases expecting a pass. Two green phases that
+    /// could not have gone red, and they are what our published evidence cited
+    /// for this behaviour. A test that passes on both outcomes does not test
+    /// the behaviour, it tests that the call returned.
+    ///
+    /// The behaviour has a direction, so the test needs to know which way round
+    /// the device is set up. `LEDGER_BLIND_SIGNING` says, the runbook sets it
+    /// per phase, and each value asserts the opposite outcome:
+    ///
+    /// - `disabled` — the device must refuse, with the error that names blind
+    ///   signing as the remedy. Signing successfully here means the operator did
+    ///   not actually turn it off, and the phase must fail rather than quietly
+    ///   record a pass against the wrong device state.
+    /// - `enabled` — the device must sign, and the signature must verify against
+    ///   the envelope. A refusal here is the regression this pair exists to
+    ///   catch.
     #[tokio::test]
     #[cfg(feature = "integration-tests")]
     #[ignore = "operator must toggle blind signing; run via the hardware runbook"]
     async fn test_ledger_non_ascii_offchain_message_needs_blind_signing() {
+        let expectation = std::env::var("LEDGER_BLIND_SIGNING").unwrap_or_default();
+        let blind_signing_enabled = match expectation.as_str() {
+            "enabled" => true,
+            "disabled" => false,
+            other => panic!(
+                "set LEDGER_BLIND_SIGNING=disabled or =enabled to say how the device is \
+                 configured; got {other:?}. `just rust-ledger-evidence` sets it per phase. \
+                 Without it this test cannot assert a direction, and a test that passes \
+                 either way is how this one previously backed two runbook phases that \
+                 could not fail."
+            ),
+        };
+
         let Some(signer) = try_connect() else {
             panic!("this test needs a device")
         };
         // Valid UTF-8 that is not printable ASCII, so the envelope carries
         // format 1 (LimitedUtf8), which the app gates behind blind signing.
         let payload = "café ☕ solana-keychain".as_bytes();
-        eprintln!("\n>>> Run this FIRST with blind signing DISABLED (expect a failure),");
-        eprintln!(">>> then again with it ENABLED (expect a prompt to approve).\n");
-        match signer.sign_message(payload).await {
-            Ok(sig) => {
-                eprintln!(
-                    "signed: blind signing was enabled. signature len {}",
-                    sig.as_ref().len()
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "refused, as expected with blind signing disabled: {}",
+        let result = signer.sign_message(payload).await;
+
+        if blind_signing_enabled {
+            eprintln!("\n>>> APPROVE the prompt on the device.\n");
+            let signature = result.unwrap_or_else(|e| {
+                panic!(
+                    "blind signing is enabled, so the device must sign a LimitedUtf8 \
+                     off-chain message. It refused with: {}",
                     e.detail_string()
-                );
-            }
+                )
+            });
+            let envelope = crate::ledger::ledger_offchain_envelope(&signer.pubkey(), payload)
+                .expect("envelope");
+            assert!(
+                signature.verify(&signer.pubkey().to_bytes(), &envelope),
+                "the signature must verify against the envelope the device signed"
+            );
+            eprintln!("signed and verified with blind signing enabled");
+            return;
         }
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "blind signing is disabled, so the device must refuse a LimitedUtf8 \
+                 off-chain message -- it signed instead. Either the setting is still on, \
+                 or the app stopped gating this."
+            ),
+        };
+        // Not merely "an error": the specific one, whose whole point is that it
+        // names the remedy. Upstream renders APDU 0x6808 as "Ledger operation
+        // not supported", which is accurate and actionable for nobody, and a
+        // regression to that wording would leave this phase green.
+        assert!(
+            matches!(err, crate::error::SignerError::SigningFailed(_)),
+            "the refusal is a signing failure, got: {err:?}"
+        );
+        let detail = err.detail_string();
+        assert!(
+            detail.contains("blind signing"),
+            "the refusal must name blind signing as the remedy, got: {detail}"
+        );
+        eprintln!("refused with blind signing disabled, as required: {detail}");
     }
 
     #[tokio::test]

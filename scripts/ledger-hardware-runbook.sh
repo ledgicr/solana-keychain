@@ -318,19 +318,27 @@ fi
 log ""
 log "> A payload that is not printable ASCII goes as format 1 (LimitedUtf8),"
 log "> which the Solana app refuses unless blind signing is enabled."
+# `LEDGER_BLIND_SIGNING` tells the test which way round the device is set up,
+# so it can assert the opposite outcome for each phase. Without it the test
+# refuses to run, deliberately: it used to accept either outcome, which meant
+# both phases below passed whatever the device did.
 if prompt "Leave ONE device attached, unlocked, Solana app open, blind signing DISABLED."; then
+  export LEDGER_BLIND_SIGNING=disabled
   phase "11a. Non-ASCII off-chain message, blind signing disabled" pass \
     hw_test test_ledger_non_ascii_offchain_message_needs_blind_signing
   log ""
-  log "The test reports which branch it took; confirm it says \"refused\" here."
+  log "This phase passes only if the device REFUSED with the blind-signing error."
   if prompt "Now ENABLE blind signing in the Solana app settings."; then
+    export LEDGER_BLIND_SIGNING=enabled
     phase "11b. Non-ASCII off-chain message, blind signing enabled" pass \
       hw_test test_ledger_non_ascii_offchain_message_needs_blind_signing
     log ""
-    log "Confirm it says \"signed\" here. Remember to disable blind signing again."
+    log "This phase passes only if the device SIGNED and the signature verified"
+    log "against the envelope. Remember to disable blind signing again."
   else
     skipped "11b. Non-ASCII off-chain message, blind signing enabled"
   fi
+  unset LEDGER_BLIND_SIGNING
 else
   skipped "11. Blind signing for non-ASCII off-chain messages"
 fi
