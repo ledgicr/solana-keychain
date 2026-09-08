@@ -1088,8 +1088,8 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                     |wallet, path| {
                         wallet
                             .sign_message(path, &message)
-                            .map(signature_bytes)
                             .map_err(map_rw_err)
+                            .and_then(signature_bytes)
                     },
                 );
                 let _ = reply.send(result);
@@ -1109,8 +1109,8 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
                     |wallet, path| {
                         wallet
                             .sign_offchain_message(path, &message)
-                            .map(signature_bytes)
                             .map_err(map_rw_err)
+                            .and_then(signature_bytes)
                     },
                 );
                 let _ = reply.send(result);
@@ -1248,10 +1248,27 @@ fn hid_path(wallet: &LedgerWallet) -> Option<String> {
 /// Taken as `impl AsRef<[u8]>` rather than naming `solana_signature::Signature`:
 /// under `sdk-v4` the `solana-signature` crate is bundled inside `solana-sdk`
 /// and is not a direct dependency to name.
-fn signature_bytes(sig: impl AsRef<[u8]>) -> [u8; 64] {
-    let mut out = [0u8; 64];
-    out.copy_from_slice(sig.as_ref());
-    out
+fn signature_bytes(sig: impl AsRef<[u8]>) -> Result<[u8; 64], SignerError> {
+    let raw = sig.as_ref();
+    // `copy_from_slice` panics on a length mismatch, and this length comes from
+    // the device. An ed25519 signature is always 64 bytes, so a short read here
+    // means the transport handed us a truncated response -- exactly the case
+    // where aborting the caller's process is the wrong answer, and exactly the
+    // case a hardware backend has to expect. Fails closed instead: nothing was
+    // signed that anyone can use.
+    raw.try_into().map_err(|_| {
+        #[cfg(feature = "unsafe-debug")]
+        log::error!(
+            "Ledger returned a {}-byte signature; ed25519 is 64",
+            raw.len()
+        );
+        SignerError::SigningFailed(
+            "the Ledger returned a signature of the wrong length, so the response was \
+             truncated in transit. Nothing was signed. Retry, and if it persists run \
+             `just rust-ledger-diagnose`."
+                .to_string(),
+        )
+    })
 }
 
 /// Appended to HID-layer failures on Linux.
@@ -1794,7 +1811,7 @@ mod tests {
         let good = crate::sdk_adapter::keypair_sign_message(&device, &envelope);
         assert!(crate::signature_util::verify_or_reject(&good, &pubkey, &envelope).is_ok());
 
-        let mut raw = signature_bytes(good);
+        let mut raw = signature_bytes(good).expect("64 bytes");
         raw[0] ^= 0x01;
         let corrupted = Signature::from(raw);
         assert!(
@@ -1813,7 +1830,7 @@ mod tests {
         let good = crate::sdk_adapter::keypair_sign_message(&device, &message);
         assert!(crate::signature_util::verify_or_reject(&good, &pubkey, &message).is_ok());
 
-        let mut raw = signature_bytes(good);
+        let mut raw = signature_bytes(good).expect("64 bytes");
         raw[63] ^= 0x80;
         let corrupted = Signature::from(raw);
         assert!(
@@ -1857,7 +1874,7 @@ mod tests {
                         DeviceCommand::SignOffchainMessage { message, reply, .. }
                         | DeviceCommand::SignTransactionMessage { message, reply, .. } => {
                             let sig = crate::sdk_adapter::keypair_sign_message(&kp, &message);
-                            let mut raw = signature_bytes(sig);
+                            let mut raw = signature_bytes(sig).expect("64 bytes");
                             if corrupt {
                                 raw[0] ^= 0x01;
                             }
@@ -2156,13 +2173,24 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_length_device_signature_is_an_error_not_a_panic() {
+        // `copy_from_slice` used to panic here, on a length that comes from the
+        // device. A truncated transport response would have aborted the
+        // caller's process rather than failing the signature.
+        let err = signature_bytes([0u8; 63].as_slice()).expect_err("63 bytes is not a signature");
+        assert!(matches!(err, SignerError::SigningFailed(_)), "got: {err:?}");
+        assert!(signature_bytes([0u8; 65].as_slice()).is_err());
+        assert!(signature_bytes([0u8; 64].as_slice()).is_ok());
+    }
+
+    #[test]
     fn signature_bytes_roundtrips() {
         // The SDK-selected `Signature` stands in for `solana-remote-wallet`'s:
         // both are `solana-signature` types, and the bridge is byte-level, so
         // this exercises exactly the conversion the device path performs.
         let raw = [7u8; 64];
         let sig = Signature::from(raw);
-        assert_eq!(signature_bytes(sig), raw);
+        assert_eq!(signature_bytes(sig).expect("64 bytes"), raw);
     }
 
     #[test]
