@@ -142,7 +142,7 @@ fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
         let a = a.as_bytes();
         let b = b.as_bytes();
         let common = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
-        const DELIMS: [u8; 4] = [b'/', b':', b'@', b'\\'];
+        const DELIMS: [u8; 4] = *b"/:@\\";
         a[..common]
             .iter()
             .rposition(|byte| DELIMS.contains(byte))
