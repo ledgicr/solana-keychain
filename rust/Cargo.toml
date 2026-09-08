@@ -132,6 +132,10 @@ solana-sdk-v4 = { package = "solana-sdk", version = "=4.0.1", optional = true }
 #
 # Default features pull a hidapi HID backend (linux-static-hidraw on Linux,
 # IOKit on macOS, native on Windows); agave-unstable-api is mandatory from 4.0.
+#
+# This is the only dependency here left as a range rather than pinned, and it is
+# the one driving the device, so the trade-off above is also written up for
+# consumers in docs/SECURITY_MODEL.md rather than living only in this comment.
 solana-remote-wallet = { version = "4", optional = true, features = ["agave-unstable-api"] }
 # DerivationPath type used by the ledger backend (same version remote-wallet pins).
 solana-derivation-path = { version = "3.0.0", optional = true }
