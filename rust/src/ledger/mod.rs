@@ -829,8 +829,15 @@ fn establish_session(
     // not a signing failure — map it to NotAvailable directly rather than
     // letting map_rw_err's catch-all bucket it as SigningFailed (which would
     // also make the no-device unit test panic on CI runners lacking libhidapi).
-    let manager = initialize_wallet_manager()
-        .map_err(|e| SignerError::NotAvailable(format!("Ledger HID subsystem unavailable: {e}")))?;
+    let manager = initialize_wallet_manager().map_err(|_e| {
+        #[cfg(feature = "unsafe-debug")]
+        log::error!("Ledger HID subsystem unavailable: {_e}");
+        SignerError::NotAvailable(
+            "the Ledger HID subsystem is unavailable. On Linux this is usually \
+         missing udev rules; otherwise no HID backend could be initialised."
+                .to_string(),
+        )
+    })?;
     let count = manager.update_devices().map_err(map_rw_err)?;
     if count == 0 {
         return Err(no_ledger_enumerated_error());
@@ -1379,7 +1386,20 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
                  decode."
                 .to_string(),
         ),
-        other => SignerError::SigningFailed(format!("Ledger device error: {other}")),
+        other => {
+            // The catch-all. Whatever upstream put in it is device state at
+            // best and an opaque transport string at worst, so it goes to the
+            // log and the caller gets a stable message.
+            #[cfg(feature = "unsafe-debug")]
+            log::error!("Ledger device error: {other}");
+            #[cfg(not(feature = "unsafe-debug"))]
+            let _ = other;
+            SignerError::SigningFailed(
+                "the Ledger reported an error while signing. Nothing was signed. Run \
+                 `just rust-ledger-diagnose` to capture what the device says about itself."
+                    .to_string(),
+            )
+        }
     }
 }
 

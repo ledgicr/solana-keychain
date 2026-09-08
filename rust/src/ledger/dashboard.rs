@@ -81,8 +81,15 @@ pub const SOLANA_APP_NAME: &str = "Solana";
 /// should retry the subsequent Solana-app connection for a short window), or
 /// `Ok(false)` if the app was already running (no re-enumeration to wait for).
 pub fn ensure_solana_app_open(host_device_path: Option<&str>) -> Result<bool, SignerError> {
-    let api = hidapi::HidApi::new()
-        .map_err(|e| SignerError::NotAvailable(format!("Ledger HID subsystem unavailable: {e}")))?;
+    let api = hidapi::HidApi::new().map_err(|_e| {
+        #[cfg(feature = "unsafe-debug")]
+        log::error!("Ledger HID subsystem unavailable: {_e}");
+        SignerError::NotAvailable(
+            "the Ledger HID subsystem is unavailable. On Linux this is usually \
+                 missing udev rules; otherwise no HID backend could be initialised."
+                .to_string(),
+        )
+    })?;
 
     let device = open_ledger(&api, host_device_path)?;
 
@@ -278,8 +285,15 @@ fn same_device(a: &Candidate<'_>, b: &Candidate<'_>) -> bool {
 /// connect: the `SignerError` cannot distinguish a locked device from a busy one
 /// from the wrong app being open, and this answers the third case directly.
 pub(super) fn running_app(host_device_path: Option<&str>) -> Result<Option<String>, SignerError> {
-    let api = hidapi::HidApi::new()
-        .map_err(|e| SignerError::NotAvailable(format!("Ledger HID subsystem unavailable: {e}")))?;
+    let api = hidapi::HidApi::new().map_err(|_e| {
+        #[cfg(feature = "unsafe-debug")]
+        log::error!("Ledger HID subsystem unavailable: {_e}");
+        SignerError::NotAvailable(
+            "the Ledger HID subsystem is unavailable. On Linux this is usually \
+                 missing udev rules; otherwise no HID backend could be initialised."
+                .to_string(),
+        )
+    })?;
     let device = open_ledger(&api, host_device_path)?;
     current_app(&device)
 }
@@ -299,8 +313,15 @@ pub(super) fn probe_apdu(
     p2: u8,
     data: &[u8],
 ) -> Result<(Vec<u8>, u16), SignerError> {
-    let api = hidapi::HidApi::new()
-        .map_err(|e| SignerError::NotAvailable(format!("Ledger HID subsystem unavailable: {e}")))?;
+    let api = hidapi::HidApi::new().map_err(|_e| {
+        #[cfg(feature = "unsafe-debug")]
+        log::error!("Ledger HID subsystem unavailable: {_e}");
+        SignerError::NotAvailable(
+            "the Ledger HID subsystem is unavailable. On Linux this is usually \
+                 missing udev rules; otherwise no HID backend could be initialised."
+                .to_string(),
+        )
+    })?;
     let device = open_ledger(&api, host_device_path)?;
     exchange(&device, cla, ins, p1, p2, data)
 }
@@ -325,13 +346,25 @@ fn open_ledger(
         Some(want) => {
             let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
             select_ledger(&refs, want).ok_or_else(|| {
-                SignerError::NotAvailable(format!(
+                // The attached paths are host filesystem/IOKit locators, so
+                // they go to the log rather than into the error, per the same
+                // rule as the upstream details above. The count stays: it is
+                // the difference between "nothing is plugged in" and "the one
+                // you named is not the one attached", which is what the caller
+                // acts on.
+                #[cfg(feature = "unsafe-debug")]
+                log::error!(
                     "no Ledger device at host path `{want}`; attached: {}",
                     if refs.is_empty() {
                         "none".to_string()
                     } else {
                         refs.join(", ")
                     }
+                );
+                SignerError::NotAvailable(format!(
+                    "no Ledger device at the requested host path; {} Ledger interface(s) \
+                     attached. Run `just rust-ledger-diagnose` to list them.",
+                    refs.len()
                 ))
             })?
         }
@@ -349,9 +382,15 @@ fn open_ledger(
         }
     };
 
-    ledgers[idx]
-        .open_device(api)
-        .map_err(|e| SignerError::NotAvailable(format!("cannot open Ledger: {e}")))
+    ledgers[idx].open_device(api).map_err(|_e| {
+        #[cfg(feature = "unsafe-debug")]
+        log::error!("cannot open Ledger at `{}`: {_e}", paths[idx]);
+        SignerError::NotAvailable(
+            "cannot open the Ledger. Another application may be holding it -- quit \
+                 Ledger Live and any other wallet software, then retry."
+                .to_string(),
+        )
+    })
 }
 
 /// Re-enumerate and re-open after an app switch triggers USB re-enumeration.
@@ -475,9 +514,15 @@ fn write_apdu(
         }
         let n = std::cmp::min(HID_PACKET_SIZE - pos, total - offset);
         packet[pos..pos + n].copy_from_slice(&apdu[offset..offset + n]);
-        device
-            .write(&packet)
-            .map_err(|e| SignerError::NotAvailable(format!("Ledger HID write failed: {e}")))?;
+        device.write(&packet).map_err(|_e| {
+            #[cfg(feature = "unsafe-debug")]
+            log::error!("Ledger HID write failed: {_e}");
+            SignerError::NotAvailable(
+                "writing to the Ledger failed. Either it was disconnected, or another \
+                     application is holding the device."
+                    .to_string(),
+            )
+        })?;
         offset += n;
         seq += 1;
         if seq == 0xffff {
@@ -492,9 +537,15 @@ fn read_apdu(device: &hidapi::HidDevice) -> Result<(Vec<u8>, u16), SignerError> 
     let mut message_size = 0usize;
     for chunk_index in 0..0xffffu16 {
         let mut chunk = [0u8; HID_PACKET_SIZE];
-        let size = device
-            .read_timeout(&mut chunk, 30_000)
-            .map_err(|e| SignerError::NotAvailable(format!("Ledger HID read failed: {e}")))?;
+        let size = device.read_timeout(&mut chunk, 30_000).map_err(|_e| {
+            #[cfg(feature = "unsafe-debug")]
+            log::error!("Ledger HID read failed: {_e}");
+            SignerError::NotAvailable(
+                "reading from the Ledger failed. Either it was disconnected, or another \
+                     application is holding the device."
+                    .to_string(),
+            )
+        })?;
         if size == 0 {
             return Err(SignerError::NotAvailable(
                 "Ledger HID read timed out".to_string(),
