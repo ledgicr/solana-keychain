@@ -131,37 +131,15 @@ fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
         return Some(exact);
     }
 
-    /// Length of the shared prefix, truncated back to the last delimiter so a
-    /// coincidental partial component does not count as a match.
-    fn shared_prefix_len(a: &str, b: &str) -> usize {
-        // Bytes throughout, never a string slice. HID paths arrive via
-        // `to_string_lossy` and can hold multibyte characters; if two paths
-        // first differ *inside* one, the matching-byte count is not a char
-        // boundary and `a[..common]` panics. Explicit device selection must
-        // return an error in that case, never abort the process.
-        let a = a.as_bytes();
-        let b = b.as_bytes();
-        let common = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
-        const DELIMS: [u8; 4] = *b"/:@\\";
-        a[..common]
-            .iter()
-            .rposition(|byte| DELIMS.contains(byte))
-            .map_or(0, |i| i + 1)
-    }
-
     let best = available
         .iter()
         .map(|p| shared_prefix_len(p, want))
         .max()
         .unwrap_or(0);
     // The prefix must be nearly the whole path, so that what differs is a
-    // trailing interface identifier and nothing more. A weak rule is worse than
-    // no rule here: on Linux two *different* Ledgers appear as `/dev/hidraw2`
-    // and `/dev/hidraw3`, which share `/dev/`, so anything that accepts a short
-    // common prefix reintroduces exactly the wrong-device bug this replaces.
-    // Requiring 80% means `/dev/` (5 of 12) is refused while a macOS
-    // `IOService:/.../IOUSBHostInterface@0` vs `@1` pair (66 of 67) is accepted.
-    if best * 5 < want.len() * 4 {
+    // trailing interface identifier and nothing more. See
+    // [`is_sibling_interface`] for why the threshold is what it is.
+    if !meets_sibling_threshold(best, want) {
         return None;
     }
     let mut matching = available
@@ -173,6 +151,124 @@ fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
         return None; // ambiguous; never guess
     }
     Some(idx)
+}
+
+/// Length of the shared prefix, truncated back to the last delimiter so a
+/// coincidental partial component does not count as a match.
+fn shared_prefix_len(a: &str, b: &str) -> usize {
+    // Bytes throughout, never a string slice. HID paths arrive via
+    // `to_string_lossy` and can hold multibyte characters; if two paths
+    // first differ *inside* one, the matching-byte count is not a char
+    // boundary and `a[..common]` panics. Explicit device selection must
+    // return an error in that case, never abort the process.
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let common = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+    const DELIMS: [u8; 4] = *b"/:@\\";
+    a[..common]
+        .iter()
+        .rposition(|byte| DELIMS.contains(byte))
+        .map_or(0, |i| i + 1)
+}
+
+/// Is a shared prefix of `len` bytes enough to call two paths interfaces of one
+/// device?
+///
+/// A weak rule is worse than no rule here: on Linux two *different* Ledgers
+/// appear as `/dev/hidraw2` and `/dev/hidraw3`, which share `/dev/`, so
+/// anything that accepts a short common prefix reintroduces exactly the
+/// wrong-device bug this guards. Requiring 80% means `/dev/` (5 of 12) is
+/// refused while a macOS `IOService:/.../IOUSBHostInterface@0` vs `@1` pair
+/// (66 of 67) is accepted.
+fn meets_sibling_threshold(len: usize, path: &str) -> bool {
+    len * 5 >= path.len() * 4
+}
+
+/// Do two paths look like two interfaces of the same physical device?
+///
+/// Symmetric, because neither path is the one being asked for: it takes the
+/// stricter of the two ratios so `sole_ledger` cannot get a different answer
+/// depending on enumeration order.
+fn is_sibling_interface(a: &str, b: &str) -> bool {
+    let shared = shared_prefix_len(a, b);
+    meets_sibling_threshold(shared, a) && meets_sibling_threshold(shared, b)
+}
+
+/// One attached Ledger APDU interface, as [`sole_ledger`] compares them.
+#[derive(Clone, Copy)]
+struct Candidate<'a> {
+    path: &'a str,
+    /// USB serial number, when the platform reports one. This is the only
+    /// direct evidence that two interfaces belong to the same physical device.
+    serial: Option<&'a str>,
+}
+
+/// Which device to use when the caller named none: exactly one, or an error.
+///
+/// This used to be `ledgers.first()`. That is the same defect
+/// [`select_ledger`] exists to prevent, just on the other arm of the match:
+/// with two Ledgers attached and no explicit path, `ensure_solana_app_open`
+/// would quit whatever app was running on whichever device the OS happened to
+/// enumerate first and launch Solana there. Enumeration order is not stable
+/// across re-plugs, so the device it wrote app-management APDUs to was
+/// effectively arbitrary. `LedgerSigner::connect` already refuses this case and
+/// says so; the dashboard path has to agree, or the auto-launch reaches a
+/// device the connect that follows it will then refuse to talk to.
+///
+/// ## Interfaces are not devices
+///
+/// The caller filters on [`is_apdu_interface`], which is an `||`, so one
+/// physical Ledger can contribute more than one candidate. Counting candidates
+/// would therefore report "multiple devices" for a single attached Ledger,
+/// which is the common case and must not break. Two groupings, in order of how
+/// much they actually prove:
+///
+/// 1. **Serial number**, when the platform gives one. Interfaces of one device
+///    share it, and two devices do not.
+/// 2. **Path adjacency**, otherwise: the same near-total-prefix rule
+///    [`select_ledger`] uses, which accepts `IOUSBHostInterface@0` and `@1` as
+///    one device and keeps `/dev/hidraw2` and `/dev/hidraw3` apart.
+fn sole_ledger(candidates: &[Candidate<'_>]) -> Result<usize, SignerError> {
+    if candidates.is_empty() {
+        return Err(SignerError::NotAvailable(
+            "no Ledger device found (plug in and unlock)".to_string(),
+        ));
+    }
+
+    // Representative index per physical device, in enumeration order.
+    let mut devices: Vec<usize> = Vec::new();
+    for (i, c) in candidates.iter().enumerate() {
+        let same_device_as = devices.iter().any(|&j| same_device(c, &candidates[j]));
+        if !same_device_as {
+            devices.push(i);
+        }
+    }
+
+    match devices.len() {
+        1 => Ok(devices[0]),
+        _ => {
+            let list = devices
+                .iter()
+                .map(|&i| format!("  {}", candidates[i].path))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(SignerError::NotAvailable(format!(
+                "multiple Ledger devices connected; pass host_device_path to select one:\n{list}"
+            )))
+        }
+    }
+}
+
+/// Do two candidates belong to one physical device? See [`sole_ledger`].
+fn same_device(a: &Candidate<'_>, b: &Candidate<'_>) -> bool {
+    match (a.serial, b.serial) {
+        // A serial the platform actually filled in settles it either way.
+        (Some(x), Some(y)) if !x.is_empty() && !y.is_empty() => x == y,
+        // No serial to compare: fall back to the path rule. Deliberately the
+        // same threshold as `select_ledger`, so the two arms of the match
+        // cannot disagree about what counts as one device.
+        _ => is_sibling_interface(a.path, b.path),
+    }
 }
 
 #[cfg(test)]
@@ -220,14 +316,15 @@ fn open_ledger(
         .filter(|d| d.vendor_id() == LEDGER_VID && is_apdu_interface(d))
         .collect();
 
-    match host_device_path {
+    let paths: Vec<String> = ledgers
+        .iter()
+        .map(|d| d.path().to_string_lossy().into_owned())
+        .collect();
+
+    let idx = match host_device_path {
         Some(want) => {
-            let paths: Vec<String> = ledgers
-                .iter()
-                .map(|d| d.path().to_string_lossy().into_owned())
-                .collect();
             let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-            let idx = select_ledger(&refs, want).ok_or_else(|| {
+            select_ledger(&refs, want).ok_or_else(|| {
                 SignerError::NotAvailable(format!(
                     "no Ledger device at host path `{want}`; attached: {}",
                     if refs.is_empty() {
@@ -236,19 +333,25 @@ fn open_ledger(
                         refs.join(", ")
                     }
                 ))
-            })?;
-            ledgers[idx]
-                .open_device(api)
-                .map_err(|e| SignerError::NotAvailable(format!("cannot open Ledger: {e}")))
-        }
-        None => ledgers
-            .first()
-            .ok_or_else(|| {
-                SignerError::NotAvailable("no Ledger device found (plug in and unlock)".to_string())
             })?
-            .open_device(api)
-            .map_err(|e| SignerError::NotAvailable(format!("cannot open Ledger: {e}"))),
-    }
+        }
+        // Never `.first()`. See `sole_ledger`.
+        None => {
+            let candidates: Vec<Candidate<'_>> = ledgers
+                .iter()
+                .zip(paths.iter())
+                .map(|(d, path)| Candidate {
+                    path: path.as_str(),
+                    serial: d.serial_number(),
+                })
+                .collect();
+            sole_ledger(&candidates)?
+        }
+    };
+
+    ledgers[idx]
+        .open_device(api)
+        .map_err(|e| SignerError::NotAvailable(format!("cannot open Ledger: {e}")))
 }
 
 /// Re-enumerate and re-open after an app switch triggers USB re-enumeration.
@@ -519,6 +622,164 @@ mod tests {
     }
 
     use super::*;
+
+    // -- F-3c, other arm: never open a device the caller did not name, and when
+    //    the caller named none, never guess which of several it meant --
+
+    fn candidate<'a>(path: &'a str, serial: Option<&'a str>) -> Candidate<'a> {
+        Candidate { path, serial }
+    }
+
+    #[test]
+    fn one_attached_ledger_is_used_without_an_explicit_path() {
+        let c = [candidate("/dev/hidraw2", Some("0001"))];
+        assert_eq!(sole_ledger(&c).unwrap(), 0);
+    }
+
+    #[test]
+    fn several_interfaces_of_one_device_are_still_one_device() {
+        // The common case, and the reason this cannot just count candidates:
+        // `is_apdu_interface` is an `||`, so one physical Ledger can pass the
+        // filter more than once. A serial number the platform filled in is
+        // direct evidence they are the same device.
+        let c = [
+            candidate(
+                "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@0",
+                Some("0001"),
+            ),
+            candidate(
+                "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@1",
+                Some("0001"),
+            ),
+        ];
+        assert_eq!(
+            sole_ledger(&c).unwrap(),
+            0,
+            "two interfaces on one device must not read as two devices"
+        );
+    }
+
+    #[test]
+    fn several_interfaces_of_one_device_are_grouped_without_a_serial() {
+        // Same case with no serial reported, which is possible on Linux. The
+        // path rule has to carry it, and it is the same threshold
+        // `select_ledger` uses.
+        let c = [
+            candidate(
+                "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@0",
+                None,
+            ),
+            candidate(
+                "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@1",
+                None,
+            ),
+        ];
+        assert_eq!(sole_ledger(&c).unwrap(), 0);
+    }
+
+    #[test]
+    fn two_attached_devices_are_refused_rather_than_picked_between() {
+        // The defect: this arm was `ledgers.first()`. With two Ledgers attached
+        // and no explicit path, `ensure_solana_app_open` would quit the running
+        // app and launch Solana on whichever device the OS enumerated first --
+        // app-management APDUs written to an arbitrary security device.
+        let c = [
+            candidate("/dev/hidraw2", Some("0001")),
+            candidate("/dev/hidraw3", Some("0002")),
+        ];
+        let err = sole_ledger(&c).expect_err("two devices must not resolve to one of them");
+        let msg = err.detail_string();
+        assert!(
+            msg.contains("multiple Ledger devices connected"),
+            "the error must say why, got: {msg}"
+        );
+        assert!(
+            msg.contains("host_device_path"),
+            "and must name the remedy, got: {msg}"
+        );
+        assert!(msg.contains("/dev/hidraw2") && msg.contains("/dev/hidraw3"));
+    }
+
+    #[test]
+    fn two_attached_devices_are_refused_without_serials_too() {
+        // Distinct Linux hidraw nodes share only `/dev/`, which is far below
+        // the sibling threshold, so they stay two devices.
+        let c = [
+            candidate("/dev/hidraw2", None),
+            candidate("/dev/hidraw3", None),
+        ];
+        assert!(sole_ledger(&c).is_err());
+    }
+
+    #[test]
+    fn an_empty_serial_is_not_evidence_of_anything() {
+        // Some platforms report an empty string rather than `None`. Treating
+        // that as a match would fuse two genuinely different devices into one
+        // and hand back the first -- the exact bug, via the fallback.
+        let c = [
+            candidate("/dev/hidraw2", Some("")),
+            candidate("/dev/hidraw3", Some("")),
+        ];
+        assert!(
+            sole_ledger(&c).is_err(),
+            "an empty serial must fall through to the path rule, not match"
+        );
+    }
+
+    #[test]
+    fn nothing_attached_says_so_plainly() {
+        let err = sole_ledger(&[]).expect_err("no devices is an error");
+        assert!(err.detail_string().contains("no Ledger device found"));
+    }
+
+    #[test]
+    fn two_devices_each_with_two_interfaces_are_two_devices() {
+        // Grouping must survive interleaved enumeration order.
+        let c = [
+            candidate(
+                "IOService:/usb/ledger@01100000/IOUSBHostInterface@0",
+                Some("0001"),
+            ),
+            candidate(
+                "IOService:/usb/ledger@01200000/IOUSBHostInterface@0",
+                Some("0002"),
+            ),
+            candidate(
+                "IOService:/usb/ledger@01100000/IOUSBHostInterface@1",
+                Some("0001"),
+            ),
+            candidate(
+                "IOService:/usb/ledger@01200000/IOUSBHostInterface@1",
+                Some("0002"),
+            ),
+        ];
+        let err = sole_ledger(&c).expect_err("still two devices");
+        let msg = err.detail_string();
+        assert!(msg.contains("ledger@01100000") && msg.contains("ledger@01200000"));
+        // One line per device, not per interface.
+        assert_eq!(
+            msg.lines()
+                .filter(|l| l.trim_start().starts_with("IOService:"))
+                .count(),
+            2,
+            "the list must name devices, not interfaces: {msg}"
+        );
+    }
+
+    #[test]
+    fn sibling_grouping_is_symmetric() {
+        // `select_ledger` compares every candidate against one requested path,
+        // so its ratio has a fixed denominator. `sole_ledger` compares
+        // candidates against each other, where a long path next to a short one
+        // must not read as a sibling just because the comparison ran one way.
+        let long = "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@0";
+        let short = "IOService:/A";
+        assert_eq!(
+            is_sibling_interface(long, short),
+            is_sibling_interface(short, long)
+        );
+        assert!(!is_sibling_interface(long, short));
+    }
 
     #[test]
     fn status_rejection_maps_to_user_rejected() {
