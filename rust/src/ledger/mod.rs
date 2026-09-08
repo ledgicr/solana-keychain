@@ -954,25 +954,77 @@ fn no_ledger_enumerated_error() -> SignerError {
     if attached.is_empty() {
         return SignerError::NotAvailable(NO_DEVICE_DETAIL.to_string());
     }
+    SignerError::NotAvailable(unenumerated_detail(&attached, RESOLVED_REMOTE_WALLET))
+}
+
+/// Which `solana-remote-wallet` this build actually resolved, or `unknown`.
+///
+/// Set by `build.rs` from the lockfile governing the build. `unknown` is a real
+/// answer, not a failure: a consumer pulling this crate from crates.io has its
+/// lockfile somewhere we cannot see, and the message below has to be honest
+/// about that rather than assert a version.
+const RESOLVED_REMOTE_WALLET: &str = env!("SOLANA_REMOTE_WALLET_VERSION");
+
+/// The message for "a Ledger is attached and this build did not enumerate it".
+///
+/// ## Why this stopped naming a cause
+///
+/// It used to say, whenever the attached device was a Gen5: "This is a Nano
+/// Gen5, which requires solana-remote-wallet >= 4.1. A build that resolved
+/// 4.0.x [...] cannot see it at all." That is a diagnosis, and it was asserted
+/// without checking the one fact it rests on. Observed on 2026-09-08 against a
+/// build that had resolved **4.2.2**, where the requirement was met and the
+/// real cause was another process holding the device: the message sent the
+/// reader to audit a dependency that was fine. Same failure as the "locked or
+/// busy" hedge this backend already fixed -- naming the cause you thought of
+/// rather than the one you checked.
+///
+/// So the version is reported rather than inferred, the 4.0.x diagnosis is made
+/// only when the build really did resolve 4.0.x, and otherwise both remaining
+/// causes are offered without ranking them. The closing sentence is the part
+/// that actually separates them, and it comes from watching both happen on
+/// hardware: they differ in whether a raw HID open succeeds.
+fn unenumerated_detail(attached: &[u16], resolved: &str) -> String {
     let pid_list = attached
         .iter()
         .map(|p| format!("0x{p:04x}"))
         .collect::<Vec<_>>()
         .join(", ");
     let gen5 = attached.iter().any(|p| GEN5_PIDS.contains(p));
-    let requirement = if gen5 {
-        "This is a Nano Gen5, which requires solana-remote-wallet >= 4.1. A build that \
-         resolved 4.0.x -- which is what the Solana 3.x crate line selects -- cannot see it \
-         at all."
+
+    let cause = if gen5 && resolved.starts_with("4.0.") {
+        // The one case where the version is the answer, and it is checked.
+        format!(
+            "This is a Nano Gen5, and this build resolved solana-remote-wallet {resolved}, \
+             which predates the Gen5 product ids added in 4.1 and therefore cannot see the \
+             device at all. 4.0.x is what the Solana 3.x crate line selects."
+        )
+    } else if gen5 {
+        format!(
+            "This is a Nano Gen5, and this build resolved solana-remote-wallet {resolved}, \
+             which does carry the Gen5 product ids, so the crate version is not the cause. \
+             Two causes remain and this layer cannot tell them apart. Either the Solana \
+             app's configuration format: app 1.16.0 answers GET_APP_CONFIGURATION with \
+             seven bytes where solana-remote-wallet requires exactly five, which is \
+             https://github.com/anza-xyz/agave/pull/15100 and needs that fix or an older \
+             app. Or another application is holding the device, in which case quit Ledger \
+             Live and any other wallet software."
+        )
     } else {
-        "This build's solana-remote-wallet does not recognise that product id, so it never \
-         enumerated the device. A newer solana-remote-wallet is likely required."
+        format!(
+            "This build resolved solana-remote-wallet {resolved}, which does not recognise \
+             that product id, so it never enumerated the device. A newer \
+             solana-remote-wallet may be required."
+        )
     };
-    SignerError::NotAvailable(format!(
+
+    format!(
         "a Ledger device is attached (product id {pid_list}) but this build did not \
-         enumerate it. {requirement} Run `just rust-which-remote-wallet` to see which \
-         version your graph resolved.{LINUX_UDEV_HINT}"
-    ))
+         enumerate it. {cause} Run `just rust-ledger-diagnose` to separate them: an \
+         app-configuration mismatch leaves the BOLOS dashboard answering normally and only \
+         enumeration failing, while a process holding the device fails even a raw HID \
+         open.{LINUX_UDEV_HINT}"
+    )
 }
 
 /// A live device session, cached on the device thread between commands.
@@ -2123,6 +2175,93 @@ mod tests {
     }
 
     // ── F-6: the silent-fork guard ──
+
+    #[test]
+    fn the_enumeration_guard_reports_the_version_it_resolved() {
+        // The defect: this message asserted "requires solana-remote-wallet >=
+        // 4.1" whenever a Gen5 was attached and unenumerated, without checking
+        // what the build had resolved. Seen on hardware against a build that
+        // had resolved 4.2.2, where the version was fine and another process
+        // held the device -- so it sent the reader to audit a dependency that
+        // was not the problem.
+        let gen5 = [0x8000u16];
+
+        // Resolved 4.0.x: the version really is the cause, and saying so is
+        // now a checked claim rather than an assumed one.
+        let old = unenumerated_detail(&gen5, "4.0.3");
+        assert!(old.contains("4.0.3"), "must report what it resolved: {old}");
+        assert!(
+            old.contains("predates the Gen5 product ids"),
+            "the one case where the version is the answer: {old}"
+        );
+
+        // Resolved 4.2.2: the version is not the cause and must not be blamed.
+        let current = unenumerated_detail(&gen5, "4.2.2");
+        assert!(
+            current.contains("4.2.2"),
+            "must report what it resolved: {current}"
+        );
+        assert!(
+            current.contains("not the cause"),
+            "must clear the version rather than blame it: {current}"
+        );
+        assert!(
+            !current.contains("predates"),
+            "must not claim the 4.0.x diagnosis on a 4.2.x build: {current}"
+        );
+        // Both remaining causes, neither ranked above the other.
+        assert!(
+            current.contains("agave/pull/15100"),
+            "must name the app-config incompatibility: {current}"
+        );
+        assert!(
+            current.contains("holding the device"),
+            "must name the contention cause: {current}"
+        );
+
+        // And the way to tell them apart, which is the actionable part.
+        for m in [&old, &current] {
+            assert!(
+                m.contains("rust-ledger-diagnose") && m.contains("raw HID open"),
+                "must say how to separate the causes: {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_resolved_version_claims_nothing() {
+        // `unknown` is what a crates.io consumer gets, because its lockfile is
+        // not reachable from our manifest. The message must be able to say so
+        // instead of falling back to the diagnosis it used to assert.
+        let detail = unenumerated_detail(&[0x8000], "unknown");
+        assert!(detail.contains("unknown"), "got: {detail}");
+        assert!(
+            !detail.contains("predates"),
+            "an unknown version is not evidence of 4.0.x: {detail}"
+        );
+        assert!(detail.contains("agave/pull/15100") && detail.contains("holding the device"));
+    }
+
+    #[test]
+    fn a_non_gen5_product_id_is_not_given_the_gen5_diagnosis() {
+        let detail = unenumerated_detail(&[0x0001], "4.2.2");
+        assert!(
+            detail.contains("does not recognise that product id"),
+            "got: {detail}"
+        );
+        assert!(!detail.contains("Nano Gen5"), "got: {detail}");
+    }
+
+    #[test]
+    fn the_resolved_version_is_baked_in_by_the_build_script() {
+        // If this ever reads `unknown` in this repo, the lockfile walk in
+        // build.rs has broken and every message above silently stops naming a
+        // version.
+        assert_eq!(
+            RESOLVED_REMOTE_WALLET, "4.2.2",
+            "build.rs should have read this out of rust/Cargo.lock"
+        );
+    }
 
     #[test]
     fn gen5_pids_are_reported_with_the_version_requirement() {
