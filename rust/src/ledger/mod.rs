@@ -670,6 +670,7 @@ static DEVICE_BUSY: AtomicBool = AtomicBool::new(false);
 ///
 /// Only meaningful for the cheap probes, which report "not available" rather
 /// than queueing. Anything that touches the device takes a [`DeviceClaim`].
+///
 fn device_is_busy() -> bool {
     DEVICE_BUSY.load(Ordering::SeqCst)
 }
@@ -681,10 +682,31 @@ fn device_is_busy() -> bool {
 /// with someone. Reusing `NotAvailable` rather than adding a variant keeps the
 /// cross-language error contract intact; the message carries the distinction.
 fn busy_error() -> SignerError {
-    SignerError::NotAvailable(
-        "Ledger is busy with another operation or awaiting on-device confirmation".to_string(),
-    )
+    SignerError::NotAvailable(BUSY_DETAIL.to_string())
 }
+
+/// The exact detail [`busy_error`] carries.
+///
+/// A constant because it is load-bearing: `SignerError` has one `NotAvailable`
+/// variant for every availability cause (adding variants would break the
+/// cross-language error contract), so this message *is* the discriminator that
+/// separates "the device is held" from "there is no device". Both the unit
+/// tests and the hardware suite classify on it, and the hardware suite's
+/// decision to skip or fail turns on getting that right, so neither may drift
+/// from the message by editing a string literal.
+pub(crate) const BUSY_DETAIL: &str =
+    "Ledger is busy with another operation or awaiting on-device confirmation";
+
+/// The detail carried when `hidapi` saw no Ledger-vendor device at all.
+///
+/// The one failure that proves there is no hardware, as opposed to hardware
+/// that cannot be used: every other availability cause -- held, locked, wrong
+/// app, attached but not enumerated -- is raised with a device present. A
+/// constant for the same reason as [`BUSY_DETAIL`]: the hardware suite's
+/// decision to skip rather than fail rests on it, and `SignerError` has no
+/// variant to carry the distinction.
+pub(crate) const NO_DEVICE_DETAIL: &str =
+    "no Ledger device found (plug in, unlock, and open the Solana app)";
 
 /// An exclusive claim on the device, released when dropped.
 ///
@@ -900,9 +922,7 @@ fn attached_ledger_pids() -> Vec<u16> {
 fn no_ledger_enumerated_error() -> SignerError {
     let attached = attached_ledger_pids();
     if attached.is_empty() {
-        return SignerError::NotAvailable(
-            "no Ledger device found (plug in, unlock, and open the Solana app)".to_string(),
-        );
+        return SignerError::NotAvailable(NO_DEVICE_DETAIL.to_string());
     }
     let pid_list = attached
         .iter()
@@ -1931,6 +1951,20 @@ mod tests {
             "0x8000 is the Gen5 PID we tested against"
         );
         assert!(GEN5_PIDS.contains(&0x0008));
+    }
+
+    #[test]
+    fn the_two_availability_details_cannot_be_confused() {
+        // The hardware suite skips on one of these and fails on the other, and
+        // `SignerError` has a single `NotAvailable` variant for both, so the
+        // messages are the discriminator. If one ever became a substring of the
+        // other, a held device would start reading as an absent one and the
+        // suite would go back to reporting success against a device it never
+        // spoke to.
+        assert!(!BUSY_DETAIL.contains(NO_DEVICE_DETAIL));
+        assert!(!NO_DEVICE_DETAIL.contains(BUSY_DETAIL));
+        assert!(busy_error().detail_string().contains(BUSY_DETAIL));
+        assert!(!busy_error().detail_string().contains(NO_DEVICE_DETAIL));
     }
 
     #[test]

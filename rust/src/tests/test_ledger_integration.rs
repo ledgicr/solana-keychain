@@ -10,6 +10,12 @@
 //! ```bash
 //! just rust-test-ledger
 //! ```
+//!
+//! Use that recipe, not a bare `cargo test`. It passes `--test-threads=1`,
+//! and it has to: there is one device, one process-wide device actor and one
+//! `DeviceClaim`, so tests run in parallel contend for all three. Run in
+//! parallel these fail rather than skip, naming the busy state -- which is the
+//! honest outcome, since a test that cannot reach the device has not passed.
 
 #[cfg(feature = "ledger")]
 #[cfg(test)]
@@ -25,22 +31,71 @@ mod tests {
     /// holding it — that is an operator problem, and panicking is the honest
     /// outcome. Reporting it as a pass is how a locked Gen5 previously made this
     /// whole suite look green while testing nothing.
+    /// ## Why the busy case is checked before `is_attached`
+    ///
+    /// This used to be `Err(e) if !LedgerSigner::is_attached()`, and that reads
+    /// the wrong way round on the two states where it matters most.
+    /// `is_attached` returns `false` when it *cannot answer* as well as when
+    /// nothing is attached: it short-circuits while the device is mid-command,
+    /// and it reports `false` when the device thread does not answer inside
+    /// `OPS_TIMEOUT`. A connect that timed out is exactly the case where both
+    /// are true, so an attached-but-held device took the skip branch and the
+    /// whole suite reported success against a device it never spoke to. Same
+    /// class of hole as the locked Gen5, reached by a different route.
+    ///
+    /// So the busy detail is ruled out first, from the error itself. That is
+    /// the discriminator the timeout tier already produces -- a caller-side
+    /// timeout in `request_on` returns `busy_error()`, not a no-device error --
+    /// and it is the one state in which `is_attached`'s `false` means nothing.
+    /// Once it is ruled out, `is_attached` is trustworthy and the remaining two
+    /// answers mean what they say.
+    /// Connect, or skip when there is genuinely no device.
+    ///
+    /// Skipping is deliberate: CI has no Ledger and these tests must not fail
+    /// there. But it is only legitimate when no device is attached. If one *is*
+    /// attached and we still cannot connect — locked, wrong app, another process
+    /// holding it — that is an operator problem, and panicking is the honest
+    /// outcome. Reporting it as a pass is how a locked Gen5 previously made this
+    /// whole suite look green while testing nothing.
+    ///
+    /// ## Why this reads the error and not `is_attached()`
+    ///
+    /// It used to be `Err(e) if !LedgerSigner::is_attached()`, which is the
+    /// wrong way round on the two states where it matters most. `is_attached`
+    /// returns `false` when it *cannot answer* as well as when nothing is
+    /// attached: it short-circuits while the device is mid-command, and it
+    /// answers `false` when the device thread does not reply inside
+    /// `OPS_TIMEOUT`. A connect that timed out is exactly the case where both
+    /// hold — `request_on` returns the busy error on a caller-side timeout — so
+    /// an attached-but-held device took the skip branch and the suite reported
+    /// success against a device it never spoke to. Same class of hole as the
+    /// locked Gen5, reached by a different route.
+    ///
+    /// The connect error already carries the distinction, because the module
+    /// that raises it is the one that asked `hidapi`. Only
+    /// [`crate::ledger::NO_DEVICE_DETAIL`] means no hardware; every other
+    /// availability cause is raised with a device present. So that is the sole
+    /// skip condition, and everything else fails.
+    ///
+    /// Reading the error also means this probes nothing of its own. That is not
+    /// incidental: `is_attached()` re-initialises the HID stack, and enough of
+    /// those in one process aborts the test binary on macOS — the lifecycle
+    /// failure `test_ledger_reconnect_cycle_does_not_crash` exists to catch.
     fn try_connect() -> Option<LedgerSigner> {
-        match LedgerSigner::connect(None, false, None) {
-            Ok(signer) => Some(signer),
-            Err(e) if !LedgerSigner::is_attached() => {
-                eprintln!(
-                    "skipping Ledger hardware test -- no device attached: {}",
-                    e.detail_string()
-                );
-                None
-            }
-            Err(e) => panic!(
-                "a Ledger is attached but unusable, so this is a real failure \
-                 rather than a skip: {}",
-                e.detail_string()
-            ),
+        let e = match LedgerSigner::connect(None, false, None) {
+            Ok(signer) => return Some(signer),
+            Err(e) => e,
+        };
+        let detail = e.detail_string();
+
+        if detail.contains(crate::ledger::NO_DEVICE_DETAIL) {
+            eprintln!("skipping Ledger hardware test -- no device attached: {detail}");
+            return None;
         }
+        panic!(
+            "a Ledger is attached but unusable, or the connect could not tell, so this \
+             is a real failure rather than a skip: {detail}"
+        );
     }
 
     /// Regression test: connect, drop, reconnect — repeatedly, in one process.
