@@ -229,6 +229,26 @@ static DEVICE_THREAD: std::sync::OnceLock<Sender<DeviceCommand>> = std::sync::On
 ///
 /// Everything that touches `hidapi` must go through here; calling
 /// `HidApi::new()` from any other thread is what crashes. See [`DEVICE_THREAD`].
+/// The channel every command goes out on.
+///
+/// In production this is always [`device_channel`]. Under `cfg(test)` a test can
+/// point it at a fake actor, which is the only way to drive `sign_message` and
+/// `sign_transaction` end to end without hardware -- and therefore the only way
+/// to assert that those paths verify what the device hands back, rather than
+/// asserting it against this file's own source text.
+fn command_channel() -> Sender<DeviceCommand> {
+    #[cfg(test)]
+    {
+        let over = tests::CHANNEL_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = over.as_ref() {
+            return tx.clone();
+        }
+    }
+    device_channel().clone()
+}
+
 fn device_channel() -> &'static Sender<DeviceCommand> {
     DEVICE_THREAD.get_or_init(|| {
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -345,7 +365,7 @@ impl LedgerSigner {
         // A connect can reach the user too, so it takes the same claim rather
         // than racing a signature already at the confirm screen.
         let claim = DeviceClaim::acquire()?;
-        let pubkey_bytes = request_on(device_channel(), timeout, claim, |claim, reply| {
+        let pubkey_bytes = request_on(&command_channel(), timeout, claim, |claim, reply| {
             DeviceCommand::Connect {
                 claim,
                 path_str: path_str.clone(),
@@ -443,7 +463,7 @@ impl SolanaSigner for LedgerSigner {
         // this function returns, by any path.
         let claim = DeviceClaim::acquire()?;
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
-            request_on(device_channel(), timeout, claim, |claim, reply| {
+            request_on(&command_channel(), timeout, claim, |claim, reply| {
                 DeviceCommand::SignOffchainMessage {
                     claim,
                     path_str,
@@ -478,7 +498,7 @@ impl SolanaSigner for LedgerSigner {
                 return false;
             };
             let (reply_tx, reply_rx) = mpsc::channel();
-            if device_channel()
+            if command_channel()
                 .send(DeviceCommand::IsAvailable {
                     claim,
                     path_str,
@@ -532,7 +552,7 @@ impl TransactionSigner for LedgerSigner {
         // this function returns, by any path.
         let claim = DeviceClaim::acquire()?;
         let sig_bytes: [u8; 64] = tokio::task::spawn_blocking(move || {
-            request_on(device_channel(), timeout, claim, |claim, reply| {
+            request_on(&command_channel(), timeout, claim, |claim, reply| {
                 DeviceCommand::SignTransactionMessage {
                     claim,
                     path_str,
@@ -1780,39 +1800,162 @@ mod tests {
         );
     }
 
-    #[test]
-    fn both_signing_paths_verify_before_returning() {
-        // The tests above prove the predicate rejects bad signatures. They
-        // cannot prove the signing paths still *call* it, and that is the
-        // failure that would actually ship: a refactor dropping the check leaves
-        // every test above green. So assert it against the source.
-        //
-        // Neither call is behind a `cfg`, and no other code path returns a
-        // signature: the dashboard is reachable only from `Connect`, which
-        // returns a pubkey.
-        let src = include_str!("mod.rs");
-        // Split off this test module first: its own source mentions the call,
-        // and counting that would let the guard satisfy itself.
-        let production = src
-            .split("#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("module has a test section");
-        let verify_calls = production
-            .matches("verify_or_reject(&signature, &self.pubkey")
-            .count();
-        assert_eq!(
-            verify_calls, 2,
-            "expected exactly one verify_or_reject in sign_message and one in \
-             sign_transaction; found {verify_calls}"
-        );
-        for path in ["async fn sign_message", "async fn sign_transaction"] {
-            let body = production.split(path).nth(1).expect("signing fn present");
-            let end = body.find("\n    }").expect("fn body terminates");
-            assert!(
-                body[..end].contains("verify_or_reject"),
-                "{path} must verify the device signature before returning it"
-            );
+    /// Test-only override for [`command_channel`], so the signing paths can be
+    /// driven against a device we control. `None` in production, and there is
+    /// no production code that can set it.
+    pub(super) static CHANNEL_OVERRIDE: std::sync::Mutex<Option<Sender<DeviceCommand>>> =
+        std::sync::Mutex::new(None);
+
+    /// A fake Ledger, and the signing paths pointed at it.
+    ///
+    /// Answers the two signing commands the way a device does -- signing the
+    /// exact bytes it was handed -- and optionally flips one bit of the result,
+    /// which is what transport corruption or a swapped device looks like from
+    /// the host. Clears the override and drains the actor on drop, by every exit
+    /// path including a panicking assertion, so one failing test cannot leak a
+    /// fake device into the rest of the suite.
+    struct FakeDevice {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeDevice {
+        fn attach(seed: u8, corrupt: bool) -> (Self, Pubkey) {
+            let guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            DEVICE_BUSY.store(false, Ordering::SeqCst);
+
+            let (kp, pubkey) = device_key(seed);
+            let (tx, rx) = mpsc::channel::<DeviceCommand>();
+            let thread = std::thread::spawn(move || {
+                // One command at a time, exactly like the real actor. Each
+                // command is dropped at the end of its iteration, which is what
+                // releases the `DeviceClaim`.
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        DeviceCommand::SignOffchainMessage { message, reply, .. }
+                        | DeviceCommand::SignTransactionMessage { message, reply, .. } => {
+                            let sig = crate::sdk_adapter::keypair_sign_message(&kp, &message);
+                            let mut raw = signature_bytes(sig);
+                            if corrupt {
+                                raw[0] ^= 0x01;
+                            }
+                            let _ = reply.send(Ok(raw));
+                        }
+                        DeviceCommand::Connect { reply, .. } => {
+                            let _ = reply.send(Ok(pubkey.to_bytes()));
+                        }
+                        DeviceCommand::IsAvailable { reply, .. } => {
+                            let _ = reply.send(true);
+                        }
+                        DeviceCommand::IsAttached { reply } => {
+                            let _ = reply.send(true);
+                        }
+                    }
+                }
+            });
+
+            *CHANNEL_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+            (
+                Self {
+                    _guard: guard,
+                    thread: Some(thread),
+                },
+                pubkey,
+            )
         }
+    }
+
+    impl Drop for FakeDevice {
+        fn drop(&mut self) {
+            // Dropping the sender ends the actor loop.
+            *CHANNEL_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+            DEVICE_BUSY.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn signer_for(pubkey: Pubkey) -> LedgerSigner {
+        LedgerSigner {
+            pubkey,
+            path_str: DEFAULT_DERIVATION_PATH.to_string(),
+            host_device_path: None,
+            signing_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// A device whose signature does not verify must be refused, on the
+    /// off-chain path, through the real `sign_message`.
+    ///
+    /// This replaces a test that read this file's own source and counted
+    /// `verify_or_reject` call sites. Jo's objection to that was that it breaks
+    /// on the next reformat, and he is right, but the deeper problem is that it
+    /// proved the wrong thing: it asserted the source contains a call, not that
+    /// the path makes one. Signing against a device we control tests the
+    /// behaviour, and it fails for the right reason if the check is ever
+    /// removed -- a corrupted signature comes back to the caller as `Ok`.
+    #[tokio::test]
+    async fn a_corrupted_device_signature_is_refused_by_sign_message() {
+        let (_device, pubkey) = FakeDevice::attach(11, true);
+        let signer = signer_for(pubkey);
+        let err = signer
+            .sign_message(b"pay 1 SOL")
+            .await
+            .expect_err("a signature that does not verify must never be returned");
+        assert!(matches!(err, SignerError::SigningFailed(_)), "got: {err:?}");
+    }
+
+    /// The control for the test above: the same path, the same fake device, an
+    /// uncorrupted signature. Without this, a `sign_message` that failed for any
+    /// unrelated reason would satisfy the assertion above.
+    #[tokio::test]
+    async fn an_honest_device_signature_is_returned_by_sign_message() {
+        let (_device, pubkey) = FakeDevice::attach(12, false);
+        let signer = signer_for(pubkey);
+        let signature = signer
+            .sign_message(b"pay 1 SOL")
+            .await
+            .expect("an honest signature must be returned");
+        // And it covers the envelope, which is the contract this path has.
+        let envelope = ledger_offchain_envelope(&pubkey, b"pay 1 SOL").unwrap();
+        assert!(crate::signature_util::verify_or_reject(&signature, &pubkey, &envelope).is_ok());
+    }
+
+    /// Same guarantee on the transaction path.
+    #[tokio::test]
+    async fn a_corrupted_device_signature_is_refused_by_sign_transaction() {
+        let (_device, pubkey) = FakeDevice::attach(13, true);
+        let signer = signer_for(pubkey);
+        let mut tx = crate::test_util::create_test_transaction(&pubkey);
+        let err = signer
+            .sign_transaction(&mut tx)
+            .await
+            .expect_err("a signature that does not verify must never be attached");
+        assert!(matches!(err, SignerError::SigningFailed(_)), "got: {err:?}");
+        // And nothing was attached to the caller's transaction on the way out.
+        assert!(
+            tx.signatures.iter().all(|s| *s == Signature::default()),
+            "a rejected signature must not be written into the transaction"
+        );
+    }
+
+    /// Control for the transaction path.
+    #[tokio::test]
+    async fn an_honest_device_signature_is_attached_by_sign_transaction() {
+        let (_device, pubkey) = FakeDevice::attach(14, false);
+        let signer = signer_for(pubkey);
+        let mut tx = crate::test_util::create_test_transaction(&pubkey);
+        // Captured before signing: these are the bytes that cross to the
+        // device, and the ones the returned signature must cover.
+        let message = tx.message.serialize();
+        let result = signer
+            .sign_transaction(&mut tx)
+            .await
+            .expect("an honest signature must be attached");
+        let (_serialized, signature) = result.into_signed_transaction();
+        assert_eq!(tx.signatures[0], signature);
+        assert!(crate::signature_util::verify_or_reject(&signature, &pubkey, &message).is_ok());
     }
 
     /// Print what is actually attached and what the device says about itself.
