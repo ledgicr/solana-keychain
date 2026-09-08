@@ -266,15 +266,36 @@ fn sole_ledger(candidates: &[Candidate<'_>]) -> Result<usize, SignerError> {
 }
 
 /// Do two candidates belong to one physical device? See [`sole_ledger`].
+///
+/// Requires **both** signals to agree, and errs toward "two devices" whenever
+/// they do not. Getting this wrong in the permissive direction fuses two
+/// attached Ledgers into one and hands back an arbitrary one of them, which is
+/// the defect [`sole_ledger`] exists to prevent; getting it wrong in the strict
+/// direction costs the caller an explicit `host_device_path`. Those are not
+/// comparable, so this fails closed.
+///
+/// Neither signal is sufficient alone:
+///
+/// - **The serial is not an identity.** A Nano Gen5 reports `"0001"` on every
+///   interface, and it is a fixed value rather than a per-unit one, so two
+///   different devices report the same thing. Equality therefore proves
+///   nothing. *In*equality still proves they are different devices, and that is
+///   the only direction it can be trusted in.
+/// - **Path adjacency is platform-dependent.** macOS reports
+///   `DevSrvsID:4294981010`-style IOKit registry ids, which share only
+///   `DevSrvsID:` once truncated to a delimiter, so the rule reads two
+///   interfaces of one device as unrelated. It works on the `IOService:/…`
+///   form and on Linux `hidraw` siblings. Where it is weak it is weak toward
+///   "different", which is the safe direction.
 fn same_device(a: &Candidate<'_>, b: &Candidate<'_>) -> bool {
-    match (a.serial, b.serial) {
-        // A serial the platform actually filled in settles it either way.
-        (Some(x), Some(y)) if !x.is_empty() && !y.is_empty() => x == y,
-        // No serial to compare: fall back to the path rule. Deliberately the
-        // same threshold as `select_ledger`, so the two arms of the match
-        // cannot disagree about what counts as one device.
-        _ => is_sibling_interface(a.path, b.path),
+    // A filled-in serial that differs is proof of two devices, whatever the
+    // paths look like.
+    if let (Some(x), Some(y)) = (a.serial, b.serial) {
+        if !x.is_empty() && !y.is_empty() && x != y {
+            return false;
+        }
     }
+    is_sibling_interface(a.path, b.path)
 }
 
 #[cfg(test)]
@@ -710,10 +731,83 @@ mod tests {
     }
 
     #[test]
+    fn a_ledger_serial_is_not_an_identity() {
+        // Measured on a Nano Gen5, macOS, Solana app 1.16.0: both HID
+        // interfaces report serial "0001", and it is a fixed value rather than
+        // a per-unit one. So two *different* Ledgers report the same serial,
+        // and equality cannot mean "same device".
+        //
+        // This is the defect the test exists to pin. An earlier version of
+        // `same_device` returned `x == y` for equal serials, which fused two
+        // attached devices into one group -- so `sole_ledger` saw a single
+        // device and handed back the first of them, which is precisely the
+        // wrong-device bug it was written to prevent. The unit tests missed it
+        // because they invented distinct serials ("0001"/"0002"); the hardware
+        // does not.
+        let two_devices = [
+            candidate("DevSrvsID:4294981014", Some("0001")),
+            candidate("/dev/hidraw7", Some("0001")),
+        ];
+        assert!(
+            sole_ledger(&two_devices).is_err(),
+            "equal serials on unrelated paths must not fuse two devices into one"
+        );
+
+        // Inequality is still trusted, in the one direction it can be:
+        // different serials mean different devices even on adjacent paths.
+        let adjacent_but_distinct = [
+            candidate(
+                "IOService:/usb/ledger@01100000/IOUSBHostInterface@0",
+                Some("0001"),
+            ),
+            candidate(
+                "IOService:/usb/ledger@01100000/IOUSBHostInterface@1",
+                Some("0002"),
+            ),
+        ];
+        assert!(
+            sole_ledger(&adjacent_but_distinct).is_err(),
+            "a differing serial is proof of two devices whatever the paths say"
+        );
+    }
+
+    #[test]
+    fn real_macos_paths_fail_closed_rather_than_guessing() {
+        // The paths this platform actually reports, measured on the same Gen5:
+        // `DevSrvsID:4294981010` and `DevSrvsID:4294981014`, one physical
+        // device. Truncated to the last delimiter they share only
+        // `DevSrvsID:`, 10 of 20 bytes, so the adjacency rule reads them as
+        // unrelated and `sole_ledger` refuses rather than picking one.
+        //
+        // That is the intended direction of failure, not a passing grade: the
+        // cost is an explicit `host_device_path`, where guessing costs
+        // app-management APDUs on the wrong security device. It does not bite
+        // in practice because only one of these two interfaces passes
+        // `is_apdu_interface` -- interface 0, via the interface-number arm,
+        // since neither usage page is 0xFF00 exactly (they are 0xffa0 and
+        // 0xf1d0).
+        let one_device_two_interfaces = [
+            candidate("DevSrvsID:4294981010", Some("0001")),
+            candidate("DevSrvsID:4294981014", Some("0001")),
+        ];
+        let err = sole_ledger(&one_device_two_interfaces)
+            .expect_err("this platform's paths carry no proof of a shared device");
+        assert!(err
+            .detail_string()
+            .contains("multiple Ledger devices connected"));
+
+        // The single candidate that actually reaches it on this hardware.
+        let as_filtered = [candidate("DevSrvsID:4294981014", Some("0001"))];
+        assert_eq!(sole_ledger(&as_filtered).unwrap(), 0);
+    }
+
+    #[test]
     fn several_interfaces_of_one_device_are_grouped_without_a_serial() {
         // Same case with no serial reported, which is possible on Linux. The
         // path rule has to carry it, and it is the same threshold
-        // `select_ledger` uses.
+        // `select_ledger` uses. Note these are `IOService:/…` paths, where that
+        // rule works; see `real_macos_paths_fail_closed_rather_than_guessing`
+        // for the form this platform actually reports, where it does not.
         let c = [
             candidate(
                 "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@0",
@@ -733,9 +827,11 @@ mod tests {
         // and no explicit path, `ensure_solana_app_open` would quit the running
         // app and launch Solana on whichever device the OS enumerated first --
         // app-management APDUs written to an arbitrary security device.
+        // Equal serials on purpose: that is what real devices report, so the
+        // path rule has to be what separates them here.
         let c = [
             candidate("/dev/hidraw2", Some("0001")),
-            candidate("/dev/hidraw3", Some("0002")),
+            candidate("/dev/hidraw3", Some("0001")),
         ];
         let err = sole_ledger(&c).expect_err("two devices must not resolve to one of them");
         let msg = err.detail_string();

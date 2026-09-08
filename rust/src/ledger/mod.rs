@@ -2025,6 +2025,11 @@ mod tests {
                         d.product_string().unwrap_or("<none>")
                     );
                     eprintln!("    path={}", d.path().to_string_lossy());
+                    // The primary key `sole_ledger` groups interfaces by. Worth
+                    // printing: when it is absent, that grouping falls back to
+                    // path adjacency, and whether the fallback works at all
+                    // depends on what the platform's paths look like.
+                    eprintln!("    serial={:?}", d.serial_number());
                     if GEN5_PIDS.contains(&d.product_id()) {
                         eprintln!("    -> in the Nano Gen5 PID set (needs remote-wallet >= 4.1)");
                     }
