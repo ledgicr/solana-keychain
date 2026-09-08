@@ -38,9 +38,18 @@ had a confirmation time out minutes earlier than promised.
 `docs_quote_the_real_timeout_constants` now fails if the prose and the code drift
 apart again.
 
-Two minutes is long enough for a deliberate read-and-approve and short enough
-that an abandoned prompt does not hold the device for the rest of the process's
-life.
+Two minutes is long enough for a deliberate read-and-approve, and it is short
+enough that a caller waiting on an abandoned prompt gets its thread back rather
+than blocking forever.
+
+What it does **not** do is free the device. The timeout bounds the caller's
+wait, not the device's occupancy: the actor is still inside an untimed HID read
+that nothing on the host can interrupt, and the claim stays held until that read
+finishes, which for an abandoned prompt means when the *device* gives up -- its
+own auto-lock, not any deadline set here. So the window in which a Ledger is
+unusable after a prompt is walked away from is set by the hardware. During it,
+later callers fail fast with the busy error instead of queueing, which is the
+next section and the reason it is a claim rather than a timeout.
 
 **Why a timeout alone is not the whole story.** The device thread is a single
 serialized actor, and the read it blocks in has no timeout of its own:
@@ -228,14 +237,33 @@ still parses; adopting V1 would be a real envelope change.
 
 ## Testing
 
+This backend's recipes live in `justfile` beside this file, so
+`just --list ledger` shows them all. The root justfile keeps forwarders under
+the original `rust-*` names, which is what the hardware runbook calls and what
+the table below uses.
+
 | Command | Needs a device | What it covers |
 |---|---|---|
 | `just rust-test` | no | Full matrix including the backend's unit tests |
+| `just ledger::lint` | no | Clippy over sdk-v2/v3/v4 **with this backend enabled** |
 | `just rust-test-ledger` | optional | Hardware suite; skips cleanly when nothing is attached |
 | `just rust-test-ledger-conformance` | no (network) | Envelope layout against upstream app source |
 | `just rust-ledger-open-app` | yes | Dashboard auto-launch by hand |
+| `just rust-ledger-diagnose` | yes | What is attached, and what the device says about itself |
 
-The hardware suite skips only when **no device is attached**. If one is attached
-and unusable (locked, wrong app, held by another process) it fails, because
-reporting that as a pass is how a locked device once made the whole suite look
-green while testing nothing.
+`just ledger::lint` is not redundant with `just rust-fmt`. That recipe lints the
+`all` feature set, and `all` deliberately omits `ledger` because it pulls
+`hidapi` and a C toolchain — so it never compiles this module, while CI's lint
+job does. Run the backend's own lint before pushing, or find out from CI.
+
+The hardware suite skips only when **no device is attached**, which it decides
+from the connect error rather than from a probe: only the no-device message
+means there is no hardware, and every other availability cause — held, locked,
+wrong app, attached but not enumerated — is raised with a device present and
+fails. Reporting any of those as a pass is how a locked device once made the
+whole suite look green while testing nothing.
+
+Run it through the recipe. It passes `--test-threads=1`, and that is required
+rather than preferred: there is one device, one process-wide actor and one
+claim, so tests running in parallel contend for all three and fail rather than
+skip.

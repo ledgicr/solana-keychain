@@ -25,9 +25,8 @@
 //! the caller must tolerate a brief window before the Solana app answers.
 
 use crate::error::SignerError;
-
-/// Ledger USB vendor id.
-const LEDGER_VID: u16 = 0x2c97;
+// One definition, in the parent module. See `super::LEDGER_VID`.
+use super::LEDGER_VID;
 
 /// APDU-over-HID transport framing constants (mirror `solana-remote-wallet`).
 const APDU_TAG: u8 = 0x05;

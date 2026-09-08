@@ -307,6 +307,48 @@ mod tests {
         let _ = signing.await;
     }
 
+    /// N5: the Solana app is launched from the dashboard, not demanded of the
+    /// user.
+    ///
+    /// Set the device up **unlocked, on the dashboard, with the Solana app
+    /// closed**. The point is that connecting launches the app rather than
+    /// failing with "open the Solana app". Also worth running with the app
+    /// already open (a silent no-op) and with a *different* app open (quit to
+    /// dashboard, then launch).
+    ///
+    /// This was `examples/ledger_open_app.rs`. It is a test rather than an
+    /// example because it asserts a behaviour on hardware and reports a real
+    /// exit status, which is what the runbook grades -- an example that printed
+    /// and exited was neither compiled by the test matrix nor gradeable.
+    #[tokio::test]
+    #[cfg(feature = "integration-tests")]
+    #[ignore = "operator must close the Solana app; run via the hardware runbook"]
+    async fn test_ledger_integration_open_app() {
+        eprintln!("\n>>> Device must be UNLOCKED, on the DASHBOARD, Solana app CLOSED.");
+        eprintln!(">>> CONFIRM the open-app prompt when it appears.\n");
+
+        // Deliberately not `try_connect`: this test must fail rather than skip
+        // when the auto-launch does not happen, and the whole behaviour under
+        // test is the connect itself.
+        let signer = LedgerSigner::connect_with(crate::ledger::LedgerConfig::default())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "connect must launch the Solana app from the dashboard rather than \
+                     failing: {}",
+                    e.detail_string()
+                )
+            });
+        assert_ne!(
+            signer.pubkey(),
+            Default::default(),
+            "a launched app must derive a real address"
+        );
+        eprintln!(
+            "Solana app running; address (m/44'/501'/0'): {}",
+            signer.pubkey()
+        );
+    }
+
     /// N6: a non-ASCII off-chain message needs blind signing enabled.
     ///
     /// ## Why this takes the setting as an input

@@ -611,7 +611,7 @@ the Solana app (and, on Linux, Ledger's [`udev` rules](https://github.com/Ledger
 raw APDU bytes at `TRACE`, which includes transaction and message content, and
 prints approval prompts to stdout.
 
-See [docs/LEDGER.md](../docs/LEDGER.md) for timeouts, the auto-launch opt-out and
+See [the backend README](src/ledger/README.md) for timeouts, the auto-launch opt-out and
 troubleshooting.
 
 Supported devices are whatever `solana-remote-wallet` enumerates: Nano S,

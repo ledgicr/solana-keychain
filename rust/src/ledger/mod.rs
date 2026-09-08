@@ -901,6 +901,9 @@ fn establish_session(
 }
 
 /// Ledger USB vendor id.
+///
+/// The one definition. It was three -- here, inline in the `IsAttached` arm,
+/// and again in `dashboard` -- which is three chances for a copy to rot.
 const LEDGER_VID: u16 = 0x2c97;
 
 /// Product ids the Nano Gen5 presents, added to `solana-remote-wallet` in 4.1.
@@ -967,7 +970,7 @@ fn no_ledger_enumerated_error() -> SignerError {
     };
     SignerError::NotAvailable(format!(
         "a Ledger device is attached (product id {pid_list}) but this build did not \
-         enumerate it. {requirement} Run `cargo tree -i solana-remote-wallet` to see which \
+         enumerate it. {requirement} Run `just rust-which-remote-wallet` to see which \
          version your graph resolved.{LINUX_UDEV_HINT}"
     ))
 }
@@ -1130,7 +1133,6 @@ fn device_thread(cmd_rx: Receiver<DeviceCommand>) {
             }
 
             DeviceCommand::IsAttached { reply } => {
-                const LEDGER_VID: u16 = 0x2c97;
                 let attached = hidapi::HidApi::new()
                     .map(|api| api.device_list().any(|d| d.vendor_id() == LEDGER_VID))
                     .unwrap_or(false);
@@ -1338,7 +1340,7 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
                 "the Ledger's Solana app speaks a configuration format this build of \
                  solana-remote-wallet cannot parse, so it will not enumerate the device. \
                  The device is not at fault. This needs a newer solana-remote-wallet (or an \
-                 older Solana app); see docs/LEDGER.md."
+                 older Solana app); see the backend README."
                     .to_string(),
             )
         }
@@ -1681,13 +1683,13 @@ mod tests {
 
     #[test]
     fn docs_quote_the_real_timeout_constants() {
-        // docs/LEDGER.md said "5-minute" and "300s" for a while after
+        // This README said "5-minute" and "300s" for a while after
         // DEFAULT_SIGN_TIMEOUT was retuned to 120s. A reader trusting the prose
         // would have had a confirmation time out three minutes early. The doc
         // now names the constants instead of restating their values, and this
         // pins that: no bare duration may appear in the timeout table, and the
         // constants it names must be the ones that exist.
-        let doc = include_str!("../../../docs/LEDGER.md");
+        let doc = include_str!("README.md");
         // `cargo ` is here because CLAUDE.md requires Rust commands to be
         // exposed through Just: the recipes carry flags a hand-written command
         // gets wrong. Two separate reviews caught this doc reintroducing raw
@@ -1700,13 +1702,13 @@ mod tests {
         ] {
             assert!(
                 !doc.contains(stale),
-                "docs/LEDGER.md still contains `{stale}`, which no longer matches the code"
+                "rust/src/ledger/README.md still contains `{stale}`, which no longer matches the code"
             );
         }
         for named in ["OPS_TIMEOUT", "DEFAULT_SIGN_TIMEOUT"] {
             assert!(
                 doc.contains(named),
-                "docs/LEDGER.md should name `{named}` rather than restate its value"
+                "rust/src/ledger/README.md should name `{named}` rather than restate its value"
             );
         }
         // And the constants the doc names really are the public ones.

@@ -1,0 +1,88 @@
+# Ledger hardware-wallet backend recipes.
+#
+# Lives next to the code it drives rather than in the root justfile, which was
+# accumulating a backend's worth of hardware recipes. Reached from the root as
+# `just ledger::<recipe>`, and the root also keeps thin `rust-*-ledger*`
+# forwarders under the old names, because the hardware runbook and the backend
+# docs refer to those and an operator mid-session should not have to relearn
+# them.
+#
+# `[working-directory]` is relative to this file, so '../../..' is the repo root
+# and '../..' is the Rust crate. Recipes run cargo from the crate, exactly as
+# the root justfile does.
+
+# Every ledger recipe needs the full integration feature set rather than a bare
+# `memory,ledger`: the shared `tests::rpc_util` helper that `integration-tests`
+# pulls in needs reqwest, so the set has to include a remote backend.
+features := "all,sdk-v3,unsafe-debug,integration-tests,ledger"
+
+default:
+    @just --list ledger
+
+# Ledger hardware integration tests. They self-skip when no device is
+# connected, so this is safe to run without one.
+#
+# `--test-threads=1` is required, not a preference: there is one device, one
+# process-wide actor and one claim, so parallel tests contend for all three and
+# fail rather than skip.
+[working-directory: '../..']
+test:
+    cargo test --no-default-features --features {{ features }} ledger -- --nocapture --test-threads=1
+
+# Lint this backend. The root `rust-fmt` uses the `all` feature, which
+# deliberately omits `ledger` (it pulls hidapi and a C toolchain), so that
+# recipe never compiles this module -- while CI's lint job does. This is that
+# gap closed: run it before pushing anything here.
+[working-directory: '../..']
+lint:
+    cargo clippy --all-targets --no-default-features --features all,sdk-v2,unsafe-debug,integration-tests,ledger -- -D warnings
+    cargo clippy --all-targets --no-default-features --features all,sdk-v3,unsafe-debug,integration-tests,ledger -- -D warnings
+    cargo clippy --all-targets --no-default-features --features all,sdk-v4,unsafe-debug,integration-tests,ledger -- -D warnings
+
+# Which solana-remote-wallet did this graph resolve? Device support depends on
+# it, so the backend's error messages and troubleshooting docs point here rather
+# than at a raw cargo command.
+#
+# `--features ledger` is required, not tidiness: the crate is an optional
+# dependency, so without it `cargo tree -i` reports that the package matched
+# nothing at all. The backend's "attached but not enumerated" error tells users
+# to run this, so it has to answer.
+[working-directory: '../..']
+which-remote-wallet:
+    cargo tree -i solana-remote-wallet --no-default-features --features {{ features }}
+
+# Run one #[ignore]d Ledger hardware test by name. Used by the evidence runbook
+# so it does not hand-roll cargo flags that drift from this file.
+[working-directory: '../..']
+hw-test name:
+    cargo test --no-default-features --features {{ features }} \
+        {{ name }} -- --ignored --nocapture --test-threads=1
+
+# Launch the Solana app on a connected Ledger over the BOLOS dashboard.
+# Requires a plugged-in, unlocked device sitting on the dashboard.
+open-app: (hw-test "test_ledger_integration_open_app")
+
+# One iteration of the reconnect regression. The runbook loops this and checks
+# for signal termination, which is why it is a recipe rather than inline cargo.
+[working-directory: '../..']
+hw-reconnect:
+    cargo test --no-default-features --features {{ features }} \
+        test_ledger_reconnect_cycle_does_not_crash -- --nocapture --test-threads=1
+
+# What is attached and what does the device say about itself? Read-only
+# diagnostic for a failed connect; needs a device, changes nothing.
+diagnose: (hw-test "diagnose_attached_ledger")
+
+# Assert our off-chain envelope against LedgerHQ/app-solana's own source.
+# Reaches the network, so it is ignored by default; no device needed.
+[working-directory: '../..']
+test-conformance:
+    cargo test --no-default-features --features {{ features }} \
+        test_ledger_envelope_conformance -- --ignored --nocapture
+
+# Ledger hardware evidence pack. Interactive: it walks the operator through the
+# device states unit tests cannot reach and writes a timestamped markdown
+# transcript for attaching to a PR. Run once per device in the matrix.
+[working-directory: '../../..']
+evidence model:
+    ./scripts/ledger-hardware-runbook.sh --model "{{ model }}"
