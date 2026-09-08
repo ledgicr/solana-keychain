@@ -43,11 +43,8 @@
 //! `verify_or_reject` rather than being attached. It is safe, but it is not
 //! usable. Sequential use of one device at a time is the supported shape.
 //!
-//! TODO: replace the single `Option<Session>` with a map keyed by host device
-//! path, so concurrent devices each keep their own handle. Deliberately not done
-//! alongside the re-establish logic in [`with_session`]: the interaction between
-//! "rebuild a missing session" and "which of several sessions is missing" is
-//! subtle enough to want its own change.
+//! Tracked as solana-foundation/solana-keychain#307, which carries the design
+//! and the two constraints on it, rather than as a comment here.
 //!
 //! Works under any of `sdk-v2`/`sdk-v3`/`sdk-v4`. The backend needs
 //! `solana-remote-wallet` 4.x — the first line carrying the Nano Gen5 product
