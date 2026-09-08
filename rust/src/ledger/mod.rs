@@ -965,6 +965,43 @@ fn no_ledger_enumerated_error() -> SignerError {
 /// about that rather than assert a version.
 const RESOLVED_REMOTE_WALLET: &str = env!("SOLANA_REMOTE_WALLET_VERSION");
 
+/// Whether the resolved `solana-remote-wallet` carries the Nano Gen5 product
+/// ids, as far as we can actually tell.
+///
+/// Three states, because two would force a guess. The Gen5 ids arrived in 4.1,
+/// so 4.0.x demonstrably cannot see the device and 4.1+ demonstrably can -- but
+/// [`RESOLVED_REMOTE_WALLET`] is `unknown` whenever the lockfile was out of
+/// reach, and an unknown version is evidence of neither. Collapsing it into
+/// either definite answer is how a diagnostic starts asserting things it never
+/// read, in whichever direction the collapse happens to fall.
+#[derive(Debug, PartialEq, Eq)]
+enum Gen5Support {
+    /// Read a version, and it predates 4.1.
+    Absent,
+    /// Read a version, and it is 4.1 or later.
+    Present,
+    /// No version to read, or one that does not parse.
+    Unknown,
+}
+
+/// Classify [`RESOLVED_REMOTE_WALLET`]-shaped strings. See [`Gen5Support`].
+fn gen5_support(resolved: &str) -> Gen5Support {
+    let mut parts = resolved.split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        return Gen5Support::Unknown;
+    };
+    let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+        return Gen5Support::Unknown;
+    };
+    match (major, minor) {
+        // Below the 4.x line entirely: the backend does not build against it,
+        // but classify honestly rather than pretending it is 4.1+.
+        (0..=3, _) => Gen5Support::Absent,
+        (4, 0) => Gen5Support::Absent,
+        _ => Gen5Support::Present,
+    }
+}
+
 /// The message for "a Ledger is attached and this build did not enumerate it".
 ///
 /// ## Why this stopped naming a cause
@@ -992,30 +1029,51 @@ fn unenumerated_detail(attached: &[u16], resolved: &str) -> String {
         .join(", ");
     let gen5 = attached.iter().any(|p| GEN5_PIDS.contains(p));
 
-    let cause = if gen5 && resolved.starts_with("4.0.") {
-        // The one case where the version is the answer, and it is checked.
-        format!(
+    // The two remaining causes, shared by the branches that cannot rule the
+    // version in or out.
+    const OTHER_CAUSES: &str = "the Solana app's configuration format -- app 1.16.0 answers \
+         GET_APP_CONFIGURATION with seven bytes where solana-remote-wallet requires exactly \
+         five, which is https://github.com/anza-xyz/agave/pull/15100 and needs that fix or \
+         an older app; or another application holding the device, in which case quit Ledger \
+         Live and any other wallet software";
+
+    let cause = match (gen5, gen5_support(resolved)) {
+        // The version is the answer, and it has been read rather than assumed.
+        (true, Gen5Support::Absent) => format!(
             "This is a Nano Gen5, and this build resolved solana-remote-wallet {resolved}, \
              which predates the Gen5 product ids added in 4.1 and therefore cannot see the \
              device at all. 4.0.x is what the Solana 3.x crate line selects."
-        )
-    } else if gen5 {
-        format!(
+        ),
+        // Ruling the version out is also a claim, and this is the only branch
+        // entitled to make it: a version was read and it is 4.1 or later.
+        (true, Gen5Support::Present) => format!(
             "This is a Nano Gen5, and this build resolved solana-remote-wallet {resolved}, \
              which does carry the Gen5 product ids, so the crate version is not the cause. \
-             Two causes remain and this layer cannot tell them apart. Either the Solana \
-             app's configuration format: app 1.16.0 answers GET_APP_CONFIGURATION with \
-             seven bytes where solana-remote-wallet requires exactly five, which is \
-             https://github.com/anza-xyz/agave/pull/15100 and needs that fix or an older \
-             app. Or another application is holding the device, in which case quit Ledger \
-             Live and any other wallet software."
-        )
-    } else {
-        format!(
+             Two causes remain and this layer cannot tell them apart: {OTHER_CAUSES}."
+        ),
+        // Nothing was read, so nothing is ruled in or out. Saying "the version
+        // is not the cause" here would send a consumer who really did resolve
+        // 4.0.x chasing the wrong two causes -- the same mistake as blaming a
+        // version unread, pointing the other way.
+        (true, Gen5Support::Unknown) => format!(
+            "This is a Nano Gen5, and this build's solana-remote-wallet version could not \
+             be determined ({resolved}), so the version cannot be ruled out. Check it with \
+             `just rust-which-remote-wallet`, or `cargo tree -i solana-remote-wallet` \
+             outside this repository. If it is 4.0.x it cannot see this device at all and \
+             that is the whole problem. If it is 4.1 or later, two causes remain: \
+             {OTHER_CAUSES}."
+        ),
+        (false, Gen5Support::Unknown) => format!(
+            "This build's solana-remote-wallet version could not be determined \
+             ({resolved}), and whichever one it is did not recognise that product id, so it \
+             never enumerated the device. A newer solana-remote-wallet may be required; \
+             check which one you have with `just rust-which-remote-wallet`."
+        ),
+        (false, _) => format!(
             "This build resolved solana-remote-wallet {resolved}, which does not recognise \
              that product id, so it never enumerated the device. A newer \
              solana-remote-wallet may be required."
-        )
+        ),
     };
 
     format!(
@@ -2229,17 +2287,81 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_resolved_version_claims_nothing() {
+    fn an_unknown_resolved_version_rules_nothing_in_or_out() {
         // `unknown` is what a crates.io consumer gets, because its lockfile is
-        // not reachable from our manifest. The message must be able to say so
-        // instead of falling back to the diagnosis it used to assert.
-        let detail = unenumerated_detail(&[0x8000], "unknown");
-        assert!(detail.contains("unknown"), "got: {detail}");
-        assert!(
-            !detail.contains("predates"),
-            "an unknown version is not evidence of 4.0.x: {detail}"
+        // not reachable from our manifest.
+        //
+        // Greptile caught the first version of this on #301, and it was a real
+        // defect: `unknown` fell into the 4.1+ branch, so the message asserted
+        // that the resolved crate carries the Gen5 ids and that the version was
+        // "not the cause". A consumer who had in fact resolved 4.0.x would have
+        // been sent to chase app-format and contention while the actual fix was
+        // a dependency bump. That is the same error this function was written
+        // to remove -- claiming what you have not read -- pointing the other
+        // way, and my own test missed it by asserting only that the message
+        // avoids the 4.0.x wording.
+        for unknowable in ["unknown", "not-in-graph", "", "4", "four.two.two"] {
+            let detail = unenumerated_detail(&[0x8000], unknowable);
+            assert!(
+                !detail.contains("not the cause"),
+                "must not exonerate an unread version ({unknowable}): {detail}"
+            );
+            assert!(
+                !detail.contains("does carry the Gen5 product ids"),
+                "must not assert a capability it did not read ({unknowable}): {detail}"
+            );
+            assert!(
+                !detail.contains("predates"),
+                "nor blame one it did not read ({unknowable}): {detail}"
+            );
+            assert!(
+                detail.contains("could not be determined")
+                    && detail.contains("cannot be ruled out"),
+                "must say it does not know ({unknowable}): {detail}"
+            );
+            assert!(
+                detail.contains("rust-which-remote-wallet"),
+                "must say how to find out ({unknowable}): {detail}"
+            );
+            // Both possibilities still offered, including the one the buggy
+            // version silently dropped.
+            assert!(
+                detail.contains("4.0.x it cannot see this device"),
+                "must keep the version cause on the table ({unknowable}): {detail}"
+            );
+            assert!(detail.contains("agave/pull/15100") && detail.contains("holding the device"));
+        }
+    }
+
+    #[test]
+    fn the_version_classifier_only_answers_when_it_knows() {
+        assert_eq!(gen5_support("4.0.3"), Gen5Support::Absent);
+        assert_eq!(gen5_support("4.0.0"), Gen5Support::Absent);
+        assert_eq!(gen5_support("3.1.14"), Gen5Support::Absent);
+        assert_eq!(gen5_support("4.1.0"), Gen5Support::Present);
+        assert_eq!(gen5_support("4.2.2"), Gen5Support::Present);
+        assert_eq!(
+            gen5_support("4.10.0"),
+            Gen5Support::Present,
+            "10 > 1, not \"1.0\""
         );
-        assert!(detail.contains("agave/pull/15100") && detail.contains("holding the device"));
+        assert_eq!(gen5_support("5.0.0"), Gen5Support::Present);
+        for bad in ["unknown", "not-in-graph", "", "4", "4.x", "four.two"] {
+            assert_eq!(gen5_support(bad), Gen5Support::Unknown, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_known_4_1_version_is_the_only_thing_that_rules_the_version_out() {
+        // The claim "the crate version is not the cause" is a claim, and only a
+        // version that was actually read and is 4.1+ earns it.
+        for known_good in ["4.1.0", "4.2.2", "5.0.0"] {
+            let detail = unenumerated_detail(&[0x8000], known_good);
+            assert!(
+                detail.contains("not the cause") && detail.contains(known_good),
+                "got: {detail}"
+            );
+        }
     }
 
     #[test]
