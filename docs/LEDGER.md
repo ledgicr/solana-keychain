@@ -89,8 +89,9 @@ used to repeat it. That fetches a *mutable branch* and hands the response to
 at the moment you run it gets root on your machine. The content is nine lines of
 static udev rules. There is no reason to execute it at all.
 
-The rules, verbatim, as of `LedgerHQ/udev-rules` commit
-[`6d9b0257`](https://github.com/LedgerHQ/udev-rules/commit/6d9b02572ce3ba3cddcbabdb6f625a8cf333e592):
+The rules below are `LedgerHQ/udev-rules` commit
+[`6d9b0257`](https://github.com/LedgerHQ/udev-rules/commit/6d9b02572ce3ba3cddcbabdb6f625a8cf333e592)
+with **one deliberate change to the third rule**, described under it:
 
 ```
 # HW.1, Nano
@@ -99,9 +100,28 @@ SUBSYSTEMS=="usb", ATTRS{idVendor}=="2581", ATTRS{idProduct}=="1b7c|2b7c|3b7c|4b
 # Blue, NanoS, Aramis, HW.2, Nano X, NanoSP, Stax, Ledger Test,
 SUBSYSTEMS=="usb", ATTRS{idVendor}=="2c97", TAG+="uaccess", TAG+="udev-acl"
 
-# Same, but with hidraw-based library (instead of libusb)
-KERNEL=="hidraw*", ATTRS{idVendor}=="2c97", MODE="0666"
+# Same, but with hidraw-based library (instead of libusb).
+# Upstream writes MODE="0666" here; see the note below for why this does not.
+KERNEL=="hidraw*", ATTRS{idVendor}=="2c97", TAG+="uaccess", GROUP="plugdev", MODE="0660"
 ```
+
+**Why the third rule differs from upstream.** `MODE="0666"` makes the device
+node world-readable and world-writable, so every local account — every service
+account, every other user on a shared box, anything running in a namespace that
+can see `/dev` — can talk to the hardware wallet. It cannot extract the seed;
+the PIN and the on-device confirmation are hardware invariants and no host-side
+access changes that. What it can do is enumerate the device, read public keys
+and derivation paths, and put signing prompts on the screen, and the first two
+are a privacy leak while the third is a phishing primitive: a prompt the user
+did not initiate, appearing while they are using their wallet.
+
+`TAG+="uaccess"` grants the device to the user on the active local seat, which
+is who is actually holding it, and matches what the first two rules already do.
+`GROUP="plugdev", MODE="0660"` is the fallback for the case where `uaccess` does
+not apply — no local seat, so headless boxes, SSH sessions and containers — and
+there it grants one named group rather than everyone. If your distribution has
+no `plugdev`, substitute a group you create for this and add only the accounts
+that need the device.
 
 Save that as `/etc/udev/rules.d/20-hw1.rules`, then reload:
 
@@ -110,8 +130,8 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-If you would rather fetch it than paste it, pin the revision and check the
-digest **before** it goes anywhere near `sudo`:
+If you would rather fetch upstream's file than paste this one, pin the revision
+and check the digest **before** it goes anywhere near `sudo`:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/LedgerHQ/udev-rules/6d9b0257/20-hw1.rules
@@ -121,6 +141,11 @@ sudo install -m 0644 20-hw1.rules /etc/udev/rules.d/20-hw1.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
+That gives you upstream's third rule, `MODE="0666"`, and the digest above is
+for that file. If you take this route, edit that one line afterwards — the
+backend works either way, so nothing here forces the tighter rule and nothing
+will tell you it is missing.
+
 Read the file before installing it either way. It is short, and it is granting
 device access on your machine.
 
@@ -129,12 +154,13 @@ Two things worth knowing:
 - **The third rule is the one this backend depends on.** We reach the device
   through `hidapi`, which uses `hidraw` on Linux. Rules that grant only the
   `usb` subsystem are not enough.
-- **No group membership is required.** The modern rules use `TAG+="uaccess"`,
-  which grants access to the user on the active seat. The older `plugdev`-group
-  approach is not what Ledger ships today, so adding yourself to `plugdev` is
-  neither necessary nor sufficient. If you are on a headless box, over SSH, or
-  in a container, `uaccess` does not apply because there is no local seat: that
-  is the case where you need an explicit `MODE`/`GROUP` rule of your own.
+- **Group membership matters only where `uaccess` does not apply.** On a normal
+  desktop login, `TAG+="uaccess"` grants the device to the user on the active
+  seat and the group is irrelevant — you do not need to join `plugdev`. On a
+  headless box, over SSH, or in a container there is no local seat, `uaccess`
+  grants nothing, and the `GROUP="plugdev", MODE="0660"` half is what applies:
+  there you do need to be in that group, or to point the rule at one you create
+  for the purpose.
 
 After installing, unplug and replug the device.
 
