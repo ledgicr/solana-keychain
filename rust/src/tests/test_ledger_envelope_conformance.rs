@@ -17,13 +17,9 @@
 //!
 //! ## Why a commit SHA and not a tag
 //!
-//! Off-chain message signing is not in any released tag: `v1.0.2`, the newest,
-//! returns 404 for the file, and it exists only on `develop`, which is the
-//! repository's default branch. Pinning `develop` would mean this test's meaning
-//! changes under us without a commit here, which is the same supply-chain
-//! failure mode as following a moving branch in someone else's repository. So it
-//! pins a SHA. When it fails because upstream moved, read the diff, decide
-//! whether our layout must change, and bump the pin deliberately.
+//! Off-chain signing exists only on `develop`, not in any released tag. Pinning
+//! a SHA prevents the test's meaning changing without a commit. When it fails from
+//! upstream changes, read the diff and update the pin deliberately.
 
 /// `libsol/include/sol/offchain_message_signing.h` and
 /// `libsol/offchain_message_signing.c`, at the commit the source-level audit

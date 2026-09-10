@@ -25,62 +25,13 @@ mod tests {
 
     /// Connect, or skip when there is genuinely no device.
     ///
-    /// Skipping is deliberate: CI has no Ledger and these tests must not fail
-    /// there. But it is only legitimate when no device is attached. If one *is*
-    /// attached and we still cannot connect — locked, wrong app, another process
-    /// holding it — that is an operator problem, and panicking is the honest
-    /// outcome. Reporting it as a pass is how a locked Gen5 previously made this
-    /// whole suite look green while testing nothing.
-    /// ## Why the busy case is checked before `is_attached`
-    ///
-    /// This used to be `Err(e) if !LedgerSigner::is_attached()`, and that reads
-    /// the wrong way round on the two states where it matters most.
-    /// `is_attached` returns `false` when it *cannot answer* as well as when
-    /// nothing is attached: it short-circuits while the device is mid-command,
-    /// and it reports `false` when the device thread does not answer inside
-    /// `OPS_TIMEOUT`. A connect that timed out is exactly the case where both
-    /// are true, so an attached-but-held device took the skip branch and the
-    /// whole suite reported success against a device it never spoke to. Same
-    /// class of hole as the locked Gen5, reached by a different route.
-    ///
-    /// So the busy detail is ruled out first, from the error itself. That is
-    /// the discriminator the timeout tier already produces -- a caller-side
-    /// timeout in `request_on` returns `busy_error()`, not a no-device error --
-    /// and it is the one state in which `is_attached`'s `false` means nothing.
-    /// Once it is ruled out, `is_attached` is trustworthy and the remaining two
-    /// answers mean what they say.
-    /// Connect, or skip when there is genuinely no device.
-    ///
-    /// Skipping is deliberate: CI has no Ledger and these tests must not fail
-    /// there. But it is only legitimate when no device is attached. If one *is*
-    /// attached and we still cannot connect — locked, wrong app, another process
-    /// holding it — that is an operator problem, and panicking is the honest
-    /// outcome. Reporting it as a pass is how a locked Gen5 previously made this
-    /// whole suite look green while testing nothing.
-    ///
-    /// ## Why this reads the error and not `is_attached()`
-    ///
-    /// It used to be `Err(e) if !LedgerSigner::is_attached()`, which is the
-    /// wrong way round on the two states where it matters most. `is_attached`
-    /// returns `false` when it *cannot answer* as well as when nothing is
-    /// attached: it short-circuits while the device is mid-command, and it
-    /// answers `false` when the device thread does not reply inside
-    /// `OPS_TIMEOUT`. A connect that timed out is exactly the case where both
-    /// hold — `request_on` returns the busy error on a caller-side timeout — so
-    /// an attached-but-held device took the skip branch and the suite reported
-    /// success against a device it never spoke to. Same class of hole as the
-    /// locked Gen5, reached by a different route.
-    ///
-    /// The connect error already carries the distinction, because the module
-    /// that raises it is the one that asked `hidapi`. Only
-    /// [`crate::ledger::NO_DEVICE_DETAIL`] means no hardware; every other
-    /// availability cause is raised with a device present. So that is the sole
-    /// skip condition, and everything else fails.
-    ///
-    /// Reading the error also means this probes nothing of its own. That is not
-    /// incidental: `is_attached()` re-initialises the HID stack, and enough of
-    /// those in one process aborts the test binary on macOS — the lifecycle
-    /// failure `test_ledger_reconnect_cycle_does_not_crash` exists to catch.
+    /// Skip only when the connect error contains [`crate::ledger::NO_DEVICE_DETAIL`].
+    /// Any other error means a device is present but unusable (locked, wrong app,
+    /// held by another process), which is an operator problem and must fail.
+    /// `is_attached()` is not used because it returns `false` for both "cannot tell"
+    /// (device mid-command, timed out) and "nothing attached", making it unreliable
+    /// to discriminate. Additionally, `is_attached()` re-initializes the HID stack,
+    /// and enough of those in one process aborts the test binary on macOS.
     fn try_connect() -> Option<LedgerSigner> {
         let e = match LedgerSigner::connect(None, false, None) {
             Ok(signer) => return Some(signer),
@@ -98,13 +49,10 @@ mod tests {
         );
     }
 
-    /// Regression test: connect, drop, reconnect — repeatedly, in one process.
-    ///
-    /// This is the shape that used to abort the whole test binary with SIGTRAP
-    /// inside macOS's HID stack. Dropping a signer returned while its device
-    /// actor still owned the `hidapi` handle, so the next `connect` initialised
-    /// HID concurrently with that teardown. Every operation passed in isolation,
-    /// which is precisely why it read as a flaky test instead of a lifecycle bug.
+    /// Connect, drop, reconnect repeatedly in one process. On macOS, HID
+    /// re-initialisation across thread lifecycles aborts the process with
+    /// SIGTRAP unless the device thread is a singleton; single operations
+    /// never show it.
     ///
     /// It needs no button press, and a crash here fails the run rather than
     /// producing a confusing partial pass.
@@ -173,18 +121,8 @@ mod tests {
         );
     }
 
-    // ── Operator-driven regressions ──
-    //
-    // These need a human to do something to the device mid-test, so they are
-    // `#[ignore]`d and driven by `scripts/ledger-hardware-runbook.sh`. Running
-    // them unattended would hang or fail meaninglessly.
-
-    /// F-14: declining a transaction must not destroy the session.
-    ///
-    /// The defect this pins: `with_session` dropped the session on any error,
-    /// `UserRejected` included, and nothing but `connect` could rebuild one. So
-    /// declining once made every later signature fail with "no Ledger session;
-    /// connect first" on a device that was working perfectly.
+    /// Declining a transaction is an app-level answer over a healthy
+    /// transport, so the session must survive it.
     #[tokio::test]
     #[cfg(feature = "integration-tests")]
     #[ignore = "operator must reject on the device; run via the hardware runbook"]
@@ -210,7 +148,7 @@ mod tests {
             .expect("the session must survive a rejection");
     }
 
-    /// F-14: the same signer instance must recover from an unplug/replug.
+    /// The same signer instance must recover from an unplug/replug.
     ///
     /// A transport error correctly drops the session; before the re-establish
     /// logic, nothing could ever rebuild it, so the signer stayed dead even once
@@ -311,15 +249,9 @@ mod tests {
     /// user.
     ///
     /// Set the device up **unlocked, on the dashboard, with the Solana app
-    /// closed**. The point is that connecting launches the app rather than
-    /// failing with "open the Solana app". Also worth running with the app
-    /// already open (a silent no-op) and with a *different* app open (quit to
-    /// dashboard, then launch).
-    ///
-    /// This was `examples/ledger_open_app.rs`. It is a test rather than an
-    /// example because it asserts a behaviour on hardware and reports a real
-    /// exit status, which is what the runbook grades -- an example that printed
-    /// and exited was neither compiled by the test matrix nor gradeable.
+    /// closed**. Connecting must launch the app automatically. Also worth running
+    /// with the app already open (silent no-op) and with a different app open
+    /// (quit to dashboard, then launch).
     #[tokio::test]
     #[cfg(feature = "integration-tests")]
     #[ignore = "operator must close the Solana app; run via the hardware runbook"]
@@ -351,27 +283,9 @@ mod tests {
 
     /// N6: a non-ASCII off-chain message needs blind signing enabled.
     ///
-    /// ## Why this takes the setting as an input
-    ///
-    /// It used to `match` the result and `eprintln!` which branch it took,
-    /// asserting nothing. So it passed whether the device signed or refused,
-    /// and the runbook ran it twice -- once with blind signing disabled, once
-    /// enabled -- with both phases expecting a pass. Two green phases that
-    /// could not have gone red, and they are what our published evidence cited
-    /// for this behaviour. A test that passes on both outcomes does not test
-    /// the behaviour, it tests that the call returned.
-    ///
-    /// The behaviour has a direction, so the test needs to know which way round
-    /// the device is set up. `LEDGER_BLIND_SIGNING` says, the runbook sets it
-    /// per phase, and each value asserts the opposite outcome:
-    ///
-    /// - `disabled` — the device must refuse, with the error that names blind
-    ///   signing as the remedy. Signing successfully here means the operator did
-    ///   not actually turn it off, and the phase must fail rather than quietly
-    ///   record a pass against the wrong device state.
-    /// - `enabled` — the device must sign, and the signature must verify against
-    ///   the envelope. A refusal here is the regression this pair exists to
-    ///   catch.
+    /// `LEDGER_BLIND_SIGNING` environment variable directs the test:
+    /// - `disabled` - device must refuse with blind signing error
+    /// - `enabled` - device must sign and signature must verify against envelope
     #[tokio::test]
     #[cfg(feature = "integration-tests")]
     #[ignore = "operator must toggle blind signing; run via the hardware runbook"]

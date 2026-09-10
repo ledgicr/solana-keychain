@@ -58,10 +58,7 @@ rust-test:
 # Reach them directly as `just ledger::test`, `just ledger::diagnose` and so
 # on; `just --list ledger` shows them all.
 #
-# The forwarders below keep the original names working, because the hardware
-# runbook and the backend README refer to them and an operator halfway through
-# a device session should not have to relearn the commands. They are one line
-# each and delegate, so there is one place to edit a cargo flag.
+# The forwarders below keep the original command names working.
 
 rust-test-ledger:
     @just ledger::test

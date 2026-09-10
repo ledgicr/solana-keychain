@@ -1,22 +1,7 @@
 #!/usr/bin/env bash
-# Ledger hardware evidence pack.
-#
-# Drives the hardware suite through the device states that unit tests cannot
-# reach, and writes a timestamped markdown transcript suitable for attaching to
-# a PR as review evidence.
-#
-# This is deliberately interactive. Every phase that needs the device in a
-# particular state stops and tells the operator what to do, because the whole
-# point is to exercise states a machine cannot put the device into.
-#
-#   ./scripts/ledger-hardware-runbook.sh --model "Nano Gen5" \
-#       --firmware 1.3.0 --app-version 1.9.2
-#
-# Run it once per device in the target matrix:
-#   Nano Gen5, plus one of Nano S Plus / Nano X, on macOS and on Linux.
-#
-# Exit status is 0 if every phase produced its expected outcome. A phase whose
-# expectation is "this must fail" passes when it fails.
+# Ledger hardware evidence pack: drive device states unit tests cannot reach,
+# write markdown transcript for PR. Interactive: operator sets device states,
+# script exercises each phase. Exit status 0 if all phases match expectations.
 
 set -uo pipefail
 
@@ -94,11 +79,8 @@ phase() {
   log ""
   log "Exit status: \`$rc\` after ${elapsed}s."
 
-  # Three outcomes, not two. A signal-terminated process is never "as
-  # expected", even for a phase that expects failure: `rc > 128` means SIGTRAP,
-  # an abort or a kill, and the reconnect phase exists precisely to detect that
-  # crash. Folding it into "nonzero, therefore the expected failure" let the
-  # runbook mark the very regression it was written to catch as a pass.
+  # Signal-terminated process (rc > 128) is not "expected failure": crash is
+  # a regression even if expectation was "fail". Reconnect phase detects crashes.
   if [[ $rc -gt 128 ]]; then
     local sig=$((rc - 128))
     CRASH=$((CRASH+1)); SUMMARY+=("CRASH $name (signal $sig)")
@@ -121,11 +103,8 @@ phase() {
   fi
 }
 
-# Run one #[ignore]d hardware test by name.
-# Run one #[ignore]d hardware test by name, through the repository recipe so it
-# gets the same feature set and flags as every other entry point. Raw `cargo`
-# here would drift from the Justfile the moment the feature matrix changes,
-# which is exactly what CLAUDE.md forbids.
+# Run #[ignore]d hardware test through the recipe: gets the same feature set
+# and flags as the Justfile, preventing cargo drift as feature matrix changes.
 hw_test() {
   just rust-ledger-hw-test "$1"
 }
@@ -318,10 +297,8 @@ fi
 log ""
 log "> A payload that is not printable ASCII goes as format 1 (LimitedUtf8),"
 log "> which the Solana app refuses unless blind signing is enabled."
-# `LEDGER_BLIND_SIGNING` tells the test which way round the device is set up,
-# so it can assert the opposite outcome for each phase. Without it the test
-# refuses to run, deliberately: it used to accept either outcome, which meant
-# both phases below passed whatever the device did.
+# LEDGER_BLIND_SIGNING tells test device config, asserting opposite outcome per phase.
+# Test refuses to run without it, deliberately.
 if prompt "Leave ONE device attached, unlocked, Solana app open, blind signing DISABLED."; then
   export LEDGER_BLIND_SIGNING=disabled
   phase "11a. Non-ASCII off-chain message, blind signing disabled" pass \
@@ -375,6 +352,6 @@ say ""
 say "Report: $REPORT"
 printf '%s\n' "${SUMMARY[@]}" >&2
 say "$PASS as expected, $FAIL not as expected, $CRASH crashed, $SKIP skipped."
-# Nonzero on any unexpected outcome or any crash. Skips do not fail the run,
-# because skipping is a legitimate operator choice, but they are reported.
+# Nonzero on any unexpected outcome or crash. Skips don't fail; they're
+# legitimate operator choices but are reported.
 [[ $FAIL -eq 0 && $CRASH -eq 0 ]]

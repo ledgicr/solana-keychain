@@ -1,13 +1,9 @@
-/// Which `solana-remote-wallet` this build resolved, for the ledger backend's
-/// enumeration error to report instead of guessing.
+/// Resolved `solana-remote-wallet` version for ledger error reporting.
 ///
-/// Cargo exposes no environment variable for a dependency's resolved version, so
-/// this reads the lockfile that governs the build, walking up from the manifest
-/// directory. That works for a workspace build and for a path dependency, and it
-/// does **not** work when this crate is itself pulled from crates.io: the
-/// consumer's lockfile is nowhere near our manifest. That case reports
-/// `unknown`, which is the point -- the error message must be able to say it
-/// does not know, rather than assert a version it never checked.
+/// Cargo exposes no env var for dependency versions. This reads the governing
+/// lockfile, walking up from the manifest. Works for workspace and path deps.
+/// When pulled from crates.io, consumer's lockfile is unreachable, returning
+/// `unknown`; when a lockfile is found without the crate, returns `not-in-graph`.
 fn resolved_remote_wallet_version() -> String {
     let manifest = match std::env::var("CARGO_MANIFEST_DIR") {
         Ok(dir) => std::path::PathBuf::from(dir),

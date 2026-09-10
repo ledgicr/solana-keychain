@@ -24,9 +24,8 @@
 //! running) Solana app. Opening an app makes the device re-enumerate on USB, so
 //! the caller must tolerate a brief window before the Solana app answers.
 
-use crate::error::SignerError;
-// One definition, in the parent module. See `super::LEDGER_VID`.
 use super::LEDGER_VID;
+use crate::error::SignerError;
 
 /// APDU-over-HID transport framing constants (mirror `solana-remote-wallet`).
 const APDU_TAG: u8 = 0x05;
@@ -51,13 +50,8 @@ const INS_QUIT_APP: u8 = 0xa7;
 
 const APDU_SUCCESS: u16 = 0x9000;
 
-/// BOLOS status word for a locked device.
-///
-/// Observed on a Nano Gen5: with the device locked but plugged in,
-/// `getAppAndVersion` answers `0x5515` and no app-level command completes. This
-/// is the one signal that separates "locked" from "another process holds the
-/// device" -- the Solana-app APDUs cannot tell them apart, which is why the
-/// error for that case has to name both causes.
+/// Locked device answers 0x5515; Solana-app APDUs cannot distinguish this from
+/// device-held-by-process, so error must name both causes.
 const APDU_DEVICE_LOCKED: u16 = 0x5515;
 
 /// Name of the Solana embedded app as the dashboard reports and launches it.
@@ -93,14 +87,12 @@ pub fn ensure_solana_app_open(host_device_path: Option<&str>) -> Result<bool, Si
     let device = open_ledger(&api, host_device_path)?;
 
     match current_app(&device)? {
-        Some(app) if app == SOLANA_APP_NAME => Ok(false), // already there
+        Some(app) if app == SOLANA_APP_NAME => Ok(false),
         Some(app) if app == "BOLOS" || app.is_empty() => {
             open_app(&device, SOLANA_APP_NAME)?;
             Ok(true)
         }
         Some(_other) => {
-            // A different app is open; return to the dashboard, then launch.
-            // quitApp drops the connection, so re-open before launching.
             quit_app(&device)?;
             drop(device);
             let device = reopen_after_reenumerate(host_device_path)?;
@@ -116,22 +108,9 @@ pub fn ensure_solana_app_open(host_device_path: Option<&str>) -> Result<bool, Si
 
 /// Pick the device matching `want`, or nothing.
 ///
-/// The Solana-app host path and this dashboard path are both HID paths on the
-/// same physical device, but may name different *interfaces*, so an exact match
-/// is not guaranteed even when the right device is attached. Hence the prefix
-/// step.
-///
-/// What this must never do is fall back to an arbitrary device, which is what it
-/// used to do: an exact-match miss selected `ledgers.first()`. With two Ledgers
-/// attached that meant `ensure_solana_app_open` could quit the running app and
-/// launch Solana on the device the caller did *not* name -- writing
-/// app-management APDUs to the wrong security device, silently. Returning
-/// `None` and letting the caller error is the only safe answer.
-///
-/// The prefix step is deliberately conservative: it takes the candidates sharing
-/// the longest common prefix with `want` that ends on a path delimiter, and
-/// accepts only if exactly one candidate does. Ambiguity resolves to `None`,
-/// because guessing between two devices is the bug being fixed.
+/// Paths may name different interfaces of the same device. Prefix matching
+/// requires 80% common prefix ending on delimiter, accepting only if exactly
+/// one matches. Ambiguity returns `None`, never an arbitrary device.
 fn select_ledger(available: &[&str], want: &str) -> Option<usize> {
     if let Some(exact) = available.iter().position(|p| *p == want) {
         return Some(exact);
@@ -211,29 +190,10 @@ struct Candidate<'a> {
 
 /// Which device to use when the caller named none: exactly one, or an error.
 ///
-/// This used to be `ledgers.first()`. That is the same defect
-/// [`select_ledger`] exists to prevent, just on the other arm of the match:
-/// with two Ledgers attached and no explicit path, `ensure_solana_app_open`
-/// would quit whatever app was running on whichever device the OS happened to
-/// enumerate first and launch Solana there. Enumeration order is not stable
-/// across re-plugs, so the device it wrote app-management APDUs to was
-/// effectively arbitrary. `LedgerSigner::connect` already refuses this case and
-/// says so; the dashboard path has to agree, or the auto-launch reaches a
-/// device the connect that follows it will then refuse to talk to.
-///
-/// ## Interfaces are not devices
-///
-/// The caller filters on [`is_apdu_interface`], which is an `||`, so one
-/// physical Ledger can contribute more than one candidate. Counting candidates
-/// would therefore report "multiple devices" for a single attached Ledger,
-/// which is the common case and must not break. Two groupings, in order of how
-/// much they actually prove:
-///
-/// 1. **Serial number**, when the platform gives one. Interfaces of one device
-///    share it, and two devices do not.
-/// 2. **Path adjacency**, otherwise: the same near-total-prefix rule
-///    [`select_ledger`] uses, which accepts `IOUSBHostInterface@0` and `@1` as
-///    one device and keeps `/dev/hidraw2` and `/dev/hidraw3` apart.
+/// One physical Ledger can pass [`is_apdu_interface`] filter multiple times
+/// (multiple interfaces). Grouping by: (1) serial number when available (shared
+/// by interfaces of one device, unique per device), or (2) path adjacency
+/// (accepts IOUSBHostInterface@0/@1, rejects /dev/hidraw2/@3).
 fn sole_ledger(candidates: &[Candidate<'_>]) -> Result<usize, SignerError> {
     if candidates.is_empty() {
         return Err(SignerError::NotAvailable(
@@ -241,7 +201,6 @@ fn sole_ledger(candidates: &[Candidate<'_>]) -> Result<usize, SignerError> {
         ));
     }
 
-    // Representative index per physical device, in enumeration order.
     let mut devices: Vec<usize> = Vec::new();
     for (i, c) in candidates.iter().enumerate() {
         let same_device_as = devices.iter().any(|&j| same_device(c, &candidates[j]));
@@ -265,28 +224,10 @@ fn sole_ledger(candidates: &[Candidate<'_>]) -> Result<usize, SignerError> {
     }
 }
 
-/// Do two candidates belong to one physical device? See [`sole_ledger`].
-///
-/// Requires **both** signals to agree, and errs toward "two devices" whenever
-/// they do not. Getting this wrong in the permissive direction fuses two
-/// attached Ledgers into one and hands back an arbitrary one of them, which is
-/// the defect [`sole_ledger`] exists to prevent; getting it wrong in the strict
-/// direction costs the caller an explicit `host_device_path`. Those are not
-/// comparable, so this fails closed.
-///
-/// Neither signal is sufficient alone:
-///
-/// - **The serial is not an identity.** A Nano Gen5 reports `"0001"` on every
-///   interface, and it is a fixed value rather than a per-unit one, so two
-///   different devices report the same thing. Equality therefore proves
-///   nothing. *In*equality still proves they are different devices, and that is
-///   the only direction it can be trusted in.
-/// - **Path adjacency is platform-dependent.** macOS reports
-///   `DevSrvsID:4294981010`-style IOKit registry ids, which share only
-///   `DevSrvsID:` once truncated to a delimiter, so the rule reads two
-///   interfaces of one device as unrelated. It works on the `IOService:/…`
-///   form and on Linux `hidraw` siblings. Where it is weak it is weak toward
-///   "different", which is the safe direction.
+/// Do two candidates belong to one physical device? Requires both signals to
+/// agree; fails closed. Serial: Nano Gen5 reports "0001" on all interfaces
+/// (fixed per model), so equality doesn't prove same device, only inequality.
+/// Path adjacency: platform-dependent, weak toward "different" (safe).
 fn same_device(a: &Candidate<'_>, b: &Candidate<'_>) -> bool {
     // A filled-in serial that differs is proof of two devices, whatever the
     // paths look like.
@@ -301,9 +242,8 @@ fn same_device(a: &Candidate<'_>, b: &Candidate<'_>) -> bool {
 #[cfg(test)]
 /// Which app the device reports running, without changing anything.
 ///
-/// Read-only counterpart to [`ensure_solana_app_open`], for diagnosing a failed
-/// connect: the `SignerError` cannot distinguish a locked device from a busy one
-/// from the wrong app being open, and this answers the third case directly.
+/// Diagnostic read-only counterpart: SignerError cannot distinguish locked from
+/// busy from wrong-app, this answers the third directly.
 pub(super) fn running_app(host_device_path: Option<&str>) -> Result<Option<String>, SignerError> {
     let api = hidapi::HidApi::new().map_err(|_e| {
         #[cfg(feature = "unsafe-debug")]
@@ -321,10 +261,8 @@ pub(super) fn running_app(host_device_path: Option<&str>) -> Result<Option<Strin
 #[cfg(test)]
 /// Send one raw APDU and return `(payload, status_word)`, for diagnostics only.
 ///
-/// Exists because `solana-remote-wallet` reports an app-protocol mismatch as an
-/// opaque `Protocol("...")` string with the actual bytes discarded, and knowing
-/// the payload length is the difference between "the device is locked" and "this
-/// app version speaks a protocol the crate does not parse".
+/// `solana-remote-wallet` discards response bytes; payload length here
+/// distinguishes device-locked from unsupported-protocol.
 pub(super) fn probe_apdu(
     host_device_path: Option<&str>,
     cla: u8,
@@ -366,12 +304,8 @@ fn open_ledger(
         Some(want) => {
             let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
             select_ledger(&refs, want).ok_or_else(|| {
-                // The attached paths are host filesystem/IOKit locators, so
-                // they go to the log rather than into the error, per the same
-                // rule as the upstream details above. The count stays: it is
-                // the difference between "nothing is plugged in" and "the one
-                // you named is not the one attached", which is what the caller
-                // acts on.
+                // Paths go to log (filesystem/IOKit locators), count to error:
+                // it tells the caller "nothing plugged in" vs "wrong path".
                 #[cfg(feature = "unsafe-debug")]
                 log::error!(
                     "no Ledger device at host path `{want}`; attached: {}",
@@ -435,9 +369,8 @@ fn reopen_after_reenumerate(
 /// determined. Response layout: `[format][name_len][name…][ver_len][ver…]…`.
 fn current_app(device: &hidapi::HidDevice) -> Result<Option<String>, SignerError> {
     let (payload, status) = exchange(device, CLA_DASHBOARD, INS_GET_APP_AND_VERSION, 0, 0, &[])?;
-    // A locked device is worth reporting exactly, because it is the one cause
-    // the Solana-app APDUs cannot identify. Returning `Ok(None)` here, as this
-    // used to, threw away the only unambiguous evidence we get.
+    // Locked device warrant exact reporting; it's the one state Solana-app APDUs
+    // cannot distinguish.
     if status == APDU_DEVICE_LOCKED {
         return Err(SignerError::NotAvailable(
             "the Ledger is locked. Enter your PIN on the device, then retry.".to_string(),
@@ -455,12 +388,9 @@ fn current_app(device: &hidapi::HidDevice) -> Result<Option<String>, SignerError
 
 /// `openApp` — launch a named app from the dashboard.
 ///
-/// Launching an installed app makes the device re-enumerate on USB the instant
-/// it switches, which usually kills the response read before the `0x9000` comes
-/// back. That is the normal, successful case — the caller confirms the launch by
-/// reconnecting to the (now running) app. So a failed/absent response read here
-/// is treated as success; only a clean on-device **rejection** (`0x6985`) or a
-/// definite error status is surfaced.
+/// Device re-enumerates on launch, usually killing the response read. That is
+/// normal; caller confirms launch by reconnecting. Response read failure here
+/// is success; only on-device rejection (0x6985) or definite error is reported.
 fn open_app(device: &hidapi::HidDevice, name: &str) -> Result<(), SignerError> {
     write_apdu(device, CLA_BOLOS, INS_OPEN_APP, 0, 0, name.as_bytes())?;
     match read_apdu(device) {
@@ -612,8 +542,6 @@ fn read_apdu(device: &hidapi::HidDevice) -> Result<(Vec<u8>, u16), SignerError> 
 mod tests {
     use super::select_ledger;
 
-    // ── F-3c: never open a device the caller did not name ──
-
     #[test]
     fn an_exact_path_wins() {
         let devices = ["/dev/hidraw2", "/dev/hidraw3"];
@@ -622,9 +550,7 @@ mod tests {
 
     #[test]
     fn a_missing_path_is_never_substituted_by_another_device() {
-        // The defect: an exact-match miss used to select `ledgers.first()`. With
-        // two Ledgers attached that meant quitting an app and launching Solana
-        // on the device the caller did not name.
+        // Must never substitute an unmatched path with another device.
         let devices = ["/dev/hidraw2", "/dev/hidraw3"];
         assert_eq!(
             select_ledger(&devices, "/dev/hidraw9"),
@@ -657,11 +583,8 @@ mod tests {
 
     #[test]
     fn a_multibyte_path_does_not_panic() {
-        // The defect: `shared_prefix_len` counted matching *bytes* and then
-        // sliced the string by that count. Two paths differing inside a
-        // multibyte character gave a non-boundary index, so explicit device
-        // selection panicked instead of returning an error. These pairs differ
-        // mid-character on purpose.
+        // Multibyte path differences must not panic; these pairs differ mid-
+        // character on purpose to test that.
         let cases: [(&str, &str); 4] = [
             ("/dev/ledger-é", "/dev/ledger-è"),
             ("IOService:/usb/ledger@café", "IOService:/usb/ledger@cafè"),
@@ -694,9 +617,6 @@ mod tests {
 
     use super::*;
 
-    // -- F-3c, other arm: never open a device the caller did not name, and when
-    //    the caller named none, never guess which of several it meant --
-
     fn candidate<'a>(path: &'a str, serial: Option<&'a str>) -> Candidate<'a> {
         Candidate { path, serial }
     }
@@ -709,10 +629,8 @@ mod tests {
 
     #[test]
     fn several_interfaces_of_one_device_are_still_one_device() {
-        // The common case, and the reason this cannot just count candidates:
-        // `is_apdu_interface` is an `||`, so one physical Ledger can pass the
-        // filter more than once. A serial number the platform filled in is
-        // direct evidence they are the same device.
+        // One physical Ledger passes filter multiple times; platform-provided
+        // serial is direct evidence they are the same device.
         let c = [
             candidate(
                 "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@0",
@@ -732,18 +650,9 @@ mod tests {
 
     #[test]
     fn a_ledger_serial_is_not_an_identity() {
-        // Measured on a Nano Gen5, macOS, Solana app 1.16.0: both HID
-        // interfaces report serial "0001", and it is a fixed value rather than
-        // a per-unit one. So two *different* Ledgers report the same serial,
-        // and equality cannot mean "same device".
-        //
-        // This is the defect the test exists to pin. An earlier version of
-        // `same_device` returned `x == y` for equal serials, which fused two
-        // attached devices into one group -- so `sole_ledger` saw a single
-        // device and handed back the first of them, which is precisely the
-        // wrong-device bug it was written to prevent. The unit tests missed it
-        // because they invented distinct serials ("0001"/"0002"); the hardware
-        // does not.
+        // Nano Gen5 reports "0001" on all interfaces (fixed per model, not per
+        // unit); two different Ledgers report same serial, so equality cannot
+        // prove same device.
         let two_devices = [
             candidate("DevSrvsID:4294981014", Some("0001")),
             candidate("/dev/hidraw7", Some("0001")),
@@ -773,19 +682,11 @@ mod tests {
 
     #[test]
     fn real_macos_paths_fail_closed_rather_than_guessing() {
-        // The paths this platform actually reports, measured on the same Gen5:
-        // `DevSrvsID:4294981010` and `DevSrvsID:4294981014`, one physical
-        // device. Truncated to the last delimiter they share only
-        // `DevSrvsID:`, 10 of 20 bytes, so the adjacency rule reads them as
-        // unrelated and `sole_ledger` refuses rather than picking one.
-        //
-        // That is the intended direction of failure, not a passing grade: the
-        // cost is an explicit `host_device_path`, where guessing costs
-        // app-management APDUs on the wrong security device. It does not bite
-        // in practice because only one of these two interfaces passes
-        // `is_apdu_interface` -- interface 0, via the interface-number arm,
-        // since neither usage page is 0xFF00 exactly (they are 0xffa0 and
-        // 0xf1d0).
+        // Platform reports DevSrvsID:4294981010 and :4294981014 for one device.
+        // They share only "DevSrvsID:" (10 of 20 bytes), below threshold, so
+        // adjacency rule refuses rather than guesses. Only one passes
+        // is_apdu_interface (interface 0, via interface-number, usage pages are
+        // 0xffa0 and 0xf1d0, not 0xFF00).
         let one_device_two_interfaces = [
             candidate("DevSrvsID:4294981010", Some("0001")),
             candidate("DevSrvsID:4294981014", Some("0001")),
@@ -803,11 +704,9 @@ mod tests {
 
     #[test]
     fn several_interfaces_of_one_device_are_grouped_without_a_serial() {
-        // Same case with no serial reported, which is possible on Linux. The
-        // path rule has to carry it, and it is the same threshold
-        // `select_ledger` uses. Note these are `IOService:/…` paths, where that
-        // rule works; see `real_macos_paths_fail_closed_rather_than_guessing`
-        // for the form this platform actually reports, where it does not.
+        // No serial; path rule carries it with same threshold as select_ledger.
+        // IOService:/… form works; see real_macos_paths for the form this
+        // platform reports.
         let c = [
             candidate(
                 "IOService:/AppleT8103/usb-drd0/ledger@01100000/IOUSBHostInterface@0",
@@ -823,12 +722,8 @@ mod tests {
 
     #[test]
     fn two_attached_devices_are_refused_rather_than_picked_between() {
-        // The defect: this arm was `ledgers.first()`. With two Ledgers attached
-        // and no explicit path, `ensure_solana_app_open` would quit the running
-        // app and launch Solana on whichever device the OS enumerated first --
-        // app-management APDUs written to an arbitrary security device.
-        // Equal serials on purpose: that is what real devices report, so the
-        // path rule has to be what separates them here.
+        // Equal serials on purpose: that is what real devices report, so path
+        // rule must separate them.
         let c = [
             candidate("/dev/hidraw2", Some("0001")),
             candidate("/dev/hidraw3", Some("0001")),
@@ -859,9 +754,7 @@ mod tests {
 
     #[test]
     fn an_empty_serial_is_not_evidence_of_anything() {
-        // Some platforms report an empty string rather than `None`. Treating
-        // that as a match would fuse two genuinely different devices into one
-        // and hand back the first -- the exact bug, via the fallback.
+        // Empty serial must fall through to path rule, not match and fuse devices.
         let c = [
             candidate("/dev/hidraw2", Some("")),
             candidate("/dev/hidraw3", Some("")),

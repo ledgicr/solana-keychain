@@ -212,14 +212,10 @@ enum DeviceCommand {
 /// dies with SIGTRAP inside CoreFoundation's `__CFCheckCFInfoPACSignature`.
 ///
 /// So a per-signer device thread cannot work: any create/drop/reconnect cycle
-/// crashes the process. Single operations always looked fine, which is exactly
-/// what made this read as a flaky test rather than a lifecycle bug. Confirmed
-/// from the crash report -- the faulting frames are the chain above.
-///
-/// One thread that never exits keeps every HID source scheduled on a run loop
-/// that stays alive, which is the only arrangement IOKit tolerates. It is also
-/// the right shape anyway: a Ledger services one APDU exchange at a time, so
-/// serialising through a single thread costs nothing.
+/// crashes the process. One thread that never exits keeps every HID source
+/// scheduled on a run loop that stays alive, which is the only arrangement IOKit
+/// tolerates. It is also the right shape anyway: a Ledger services one APDU
+/// exchange at a time, so serialising through a single thread costs nothing.
 static DEVICE_THREAD: std::sync::OnceLock<Sender<DeviceCommand>> = std::sync::OnceLock::new();
 
 /// Channel to the device thread, starting it if this is the first call.
@@ -596,11 +592,8 @@ const OFFCHAIN_HEADER_LEN_ONE_SIGNER: usize = 16 + 1 + 32 + 1 + 1 + 32 + 2;
 
 /// Build the off-chain message envelope the **Ledger Solana app** expects.
 ///
-/// This deliberately does not use `solana_offchain_message`, because that crate
-/// and the Ledger app implement different layouts and the crate's output is
-/// rejected outright. Verified against a real Nano Gen5: the crate's envelope
-/// returns APDU `SolanaInvalidMessageHeader`, exactly as raw unwrapped bytes do,
-/// which is why simply "wrapping the payload" did not fix off-chain signing.
+/// Cannot use `solana_offchain_message`: different layout, output rejected as
+/// `SolanaInvalidMessageHeader` (verified on Nano Gen5).
 ///
 /// What the crate emits (20-byte header):
 ///   signing domain (16) ‖ version (1) ‖ format (1) ‖ length (2) ‖ message
@@ -735,16 +728,6 @@ pub(crate) const NO_DEVICE_DETAIL: &str =
 /// running, waiting out its own full timeout instead of failing fast, which is
 /// the exact stall the claim exists to prevent. So ownership crosses the channel
 /// and the release happens when the device work actually finishes.
-///
-/// ## Why this is not a bool check
-///
-/// It used to be: callers read `DEVICE_BUSY` and returned early if set, and the
-/// *actor* raised the flag once it dequeued a command. That is check-then-act,
-/// and it does not hold. Two callers could both read `false`, both enqueue, and
-/// the second would then wait its entire signing timeout behind the first
-/// caller's confirmation prompt -- which is precisely the stall the flag exists
-/// to prevent, so the fail-fast contract was strongest exactly when it was
-/// needed least.
 ///
 /// The claim is taken **before** the command is enqueued, with a single
 /// `compare_exchange`, so exactly one of any number of racing callers wins and
@@ -897,10 +880,7 @@ fn establish_session(
     Ok((ledger, pubkey.to_bytes()))
 }
 
-/// Ledger USB vendor id.
-///
-/// The one definition. It was three -- here, inline in the `IsAttached` arm,
-/// and again in `dashboard` -- which is three chances for a copy to rot.
+/// Ledger USB vendor id. Single definition to prevent copy rot.
 const LEDGER_VID: u16 = 0x2c97;
 
 /// Product ids the Nano Gen5 presents, added to `solana-remote-wallet` in 4.1.
@@ -1000,24 +980,9 @@ fn gen5_support(resolved: &str) -> Gen5Support {
 }
 
 /// The message for "a Ledger is attached and this build did not enumerate it".
-///
-/// ## Why this stopped naming a cause
-///
-/// It used to say, whenever the attached device was a Gen5: "This is a Nano
-/// Gen5, which requires solana-remote-wallet >= 4.1. A build that resolved
-/// 4.0.x [...] cannot see it at all." That is a diagnosis, and it was asserted
-/// without checking the one fact it rests on. Observed on 2026-09-08 against a
-/// build that had resolved **4.2.2**, where the requirement was met and the
-/// real cause was another process holding the device: the message sent the
-/// reader to audit a dependency that was fine. Same failure as the "locked or
-/// busy" hedge this backend already fixed -- naming the cause you thought of
-/// rather than the one you checked.
-///
-/// So the version is reported rather than inferred, the 4.0.x diagnosis is made
-/// only when the build really did resolve 4.0.x, and otherwise both remaining
-/// causes are offered without ranking them. The closing sentence is the part
-/// that actually separates them, and it comes from watching both happen on
-/// hardware: they differ in whether a raw HID open succeeds.
+/// Reports the version rather than inferring the cause, only making the 4.0.x
+/// diagnosis when it is actually resolved. Otherwise both causes are offered
+/// without ranking: they differ in whether a raw HID open succeeds.
 fn unenumerated_detail(attached: &[u16], resolved: &str) -> String {
     let pid_list = attached
         .iter()
@@ -1260,17 +1225,10 @@ enum SessionAction {
 
 /// Decide whether an error should cost us the session.
 ///
-/// The bug this fixes: the old code dropped the session on *any* error, which
-/// included [`SignerError::UserRejected`]. But a rejection is an app-level
-/// answer over a perfectly healthy transport -- the user read the screen and
-/// pressed no. Throwing the session away made the very next signature fail with
-/// "no Ledger session; connect first", so declining one transaction bricked the
-/// signer until the caller built a new one. Rejecting a transaction is a normal
-/// thing a user does, not a fault.
-///
-/// Only availability and signing faults, which is what `map_rw_err` produces for
-/// a device that is gone, locked, held by another process or off in a different
-/// app, mean the handle is worthless.
+/// Rejections are app-level answers over a healthy transport and must not
+/// discard the session. Only availability and signing faults mean the handle
+/// is worthless (device gone, locked, held by another process, or in a
+/// different app).
 fn session_action(error: &SignerError) -> SessionAction {
     match error {
         SignerError::NotAvailable(_) | SignerError::SigningFailed(_) => SessionAction::Drop,
@@ -1281,24 +1239,11 @@ fn session_action(error: &SignerError) -> SessionAction {
 
 /// Run `f` against the cached session, re-establishing it if it is gone.
 ///
-/// Two behaviours, both of which used to be missing.
-///
-/// It re-establishes. Only the `connect` constructor ever created a session, so
-/// once one was dropped, every later command on an existing signer failed with
-/// "no Ledger session; connect first" forever -- the signer could not recover
-/// from an unplug/replug even though the device was back. Now a missing session
-/// is rebuilt against the host path this signer was opened with.
-///
-/// That is safe because it cannot silently move to a different device: the
-/// pubkey cached at connect is what every returned signature is verified
-/// against, so a re-established session on the wrong Ledger fails closed at
-/// `verify_or_reject` rather than signing with an unexpected key. The explicit
-/// host-path check below turns most of those into a legible error first.
-///
-/// It re-establishes *without* the dashboard auto-launch. `establish_session`
-/// does not launch anything; only the `Connect` arm does. Signing is not the
-/// moment to start writing app-management APDUs to a device on its own
-/// initiative.
+/// Re-establishes against the host path this signer was opened with, which is
+/// safe because the cached pubkey verifies every signature. A re-established
+/// session on the wrong device fails closed at verification, not with a
+/// wrong-key signature. Re-establishes without dashboard auto-launch: signing
+/// is not the moment to drive app management.
 fn with_session<T>(
     session: &mut Option<Session>,
     path_str: &str,
@@ -1336,13 +1281,8 @@ fn with_session<T>(
     result
 }
 
-/// The OS HID path of a Ledger wallet's own device handle.
-///
-/// `solana-remote-wallet` 4.x makes `Device::path` and `Device::info`
-/// crate-private, so the value that used to be read as
-/// `Device::host_device_path` is recovered from the wallet's own `hidapi`
-/// handle instead. Same string, same format — and the same one
-/// [`dashboard::ensure_solana_app_open`] matches against.
+/// The OS HID path of a Ledger wallet's own device handle. Recovered from the
+/// wallet's `hidapi` handle, matching what [`dashboard::ensure_solana_app_open`] uses.
 fn hid_path(wallet: &LedgerWallet) -> Option<String> {
     let info = wallet.device.get_device_info().ok()?;
     info.path().to_str().ok().map(str::to_string)
@@ -1420,38 +1360,10 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
              retry.{}",
             LINUX_UDEV_HINT
         )),
-        // An unclassified protocol error means the transport answered but the
-        // app-level command did not. Two different states produce it and the
-        // error carries nothing that separates them:
-        //
-        //   1. The device is locked. Observed on a Nano Gen5 that auto-locked
-        //      between operations: every call failed as `Protocol("Unknown error")`.
-        //   2. Another process holds the device. Observed on a Nano Gen5 with
-        //      Ledger Live running: enumeration succeeds, so this is not
-        //      `NoDeviceFound`, and the handle opens, so it is not `Hid`, but no
-        //      app-level command completes.
-        //
-        // Reporting either as a *signing* failure is misleading — nothing was
-        // signed and nothing is wrong with the transaction. It is `NotAvailable`
-        // for the same reason "no device" is. Since we cannot tell the two
-        // apart here, the message names both remedies: claiming only "locked"
-        // sends anyone with Ledger Live open to re-enter a PIN that was never
-        // the problem.
-        // Not every `Protocol(_)` is a device-state problem, and treating them
-        // alike sends the user to unlock a device that is already unlocked.
-        //
-        // This one is an app-protocol incompatibility, confirmed on a Nano Gen5
-        // (PID 0x8000) that was unlocked with the Solana app open and the BOLOS
-        // dashboard answering normally. `GET_APP_CONFIGURATION` (0xe0 0x04)
-        // returns status 0x9000 with a **7-byte** payload,
-        // `00 00 01 10 00 00 00`, while `solana-remote-wallet` 4.2.2 requires
-        // exactly 5 (`ledger.rs:349`, `if config.len() != 5`) and the deprecated
-        // fallback answers 0x6a83. So `update_devices` fails and `list_devices`
-        // returns nothing, on a device that is working perfectly.
-        //
-        // Nothing on this side can fix it: the check runs inside
-        // `update_devices` with no hook to bypass. Naming it is all we can do,
-        // and it is worth a great deal more than "unlock your device".
+        // Protocol error: device is locked or another process holds it (both on Nano Gen5
+        // produce `Protocol("Unknown error")`), or app-protocol incompatibility
+        // (GET_APP_CONFIGURATION returns 7 bytes vs. 5 expected). Cannot distinguish here;
+        // must name both causes to avoid sending users to unlock already-unlocked devices.
         RemoteWalletError::Protocol(detail) if detail.contains("Version packet") => {
             log::error!(
                 "The Ledger's Solana app returned an app-configuration vector this \
@@ -1486,23 +1398,10 @@ fn map_rw_err(e: RemoteWalletError) -> SignerError {
                     .to_string(),
             )
         }
-        // APDU 0x6808. Observed on a Nano Gen5 running Solana app 1.16.0 when
-        // signing an off-chain message whose payload is not printable ASCII: the
-        // app refuses format 1 (LimitedUtf8) unless blind signing is enabled in
-        // its settings. Upstream renders this as "Ledger operation not
-        // supported", which is true and useless -- it names no remedy, and the
-        // remedy is a setting the user can change in ten seconds.
-        //
-        // 0x6808 is a generic BOLOS "not supported", so this does not claim to
-        // be the only cause; it offers the one that is overwhelmingly likely for
-        // a signing call and says so.
-        //
-        // The wording mirrors what the device puts on screen -- "This transaction
-        // cannot be clear-signed", with a "Go to settings" button -- so a user
-        // looking at the device and a developer reading a log see the same words.
-        // It also says the modal must be dismissed, because it stays up and
-        // blocks every subsequent command, which otherwise reads as a hung
-        // device.
+        // APDU 0x6808 (Nano Gen5 with Solana app 1.16.0): off-chain message with
+        // non-ASCII payload when blind signing is disabled. Mirrors the device's
+        // "This transaction cannot be clear-signed" prompt; the modal must be
+        // dismissed before the device answers anything else.
         RemoteWalletError::LedgerError(LedgerError::SdkNotSupported) => SignerError::SigningFailed(
             "the Ledger could not clear-sign this, and blind signing is disabled in the \
                  Solana app's settings. The device shows \"This transaction cannot be \
@@ -1558,16 +1457,11 @@ mod tests {
         }
     }
 
-    // ── F-1: the actor cannot stall a caller indefinitely ──
-
     #[test]
     fn a_command_times_out_at_its_tier_deadline() {
         let _guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         DEVICE_BUSY.store(false, Ordering::SeqCst);
         // The receiver is held so `send` succeeds, but nothing ever serves it.
-        // Before the deadline existed this never returned: the reply channel
-        // used a plain blocking `recv()`, and the HID read the real actor sits
-        // in has no timeout of its own.
         let (tx, _rx) = wedged_actor();
         let start = Instant::now();
         let err = request_on(
@@ -1629,16 +1523,8 @@ mod tests {
 
     #[test]
     fn exactly_one_of_many_racing_claims_wins() {
-        // The bug this pins: the check used to be a separate load before the
-        // command was enqueued, and the flag was raised by the actor only once
-        // it dequeued. Two callers could both read `false`, both enqueue, and
-        // the second would then wait its entire signing timeout behind the
-        // first one's confirmation prompt. The fail-fast contract failed exactly
-        // when it mattered.
-        //
-        // Hammer it: many threads, one shared device, repeatedly. If admission
-        // is not atomic, more than one thread holds a claim at the same moment
-        // and `concurrent` climbs above 1.
+        // Many threads, one shared device, repeatedly. If admission is not
+        // atomic, more than one thread holds a claim simultaneously.
         let _guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         DEVICE_BUSY.store(false, Ordering::SeqCst);
 
@@ -1687,16 +1573,8 @@ mod tests {
 
     #[test]
     fn a_caller_timeout_does_not_release_the_device() {
-        // The second-round defect. The claim was a caller-held guard, so it was
-        // released when the caller returned -- including when it returned from a
-        // *timeout*. But the actor can still be blocked in the untimed HID read
-        // at that point, so the next caller would acquire, enqueue behind an
-        // operation that is still running, and wait out its own full timeout.
-        // The fail-fast promise quietly became a second full stall.
-        //
-        // Ownership now crosses the channel: the claim is moved into the command
-        // and dropped by the actor when the work finishes. A wedged actor never
-        // drops it, so it stays held.
+        // The claim is moved into the command and dropped by the actor when the
+        // work finishes. A wedged actor never drops it, so it stays held.
         let _guard = BUSY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         DEVICE_BUSY.store(false, Ordering::SeqCst);
 
@@ -1735,14 +1613,10 @@ mod tests {
         let _ = reply_tx.send(Ok(true));
     }
 
-    // ── F-14: a rejection must not kill the session ──
-
     #[test]
     fn a_rejection_keeps_the_session_and_a_transport_fault_drops_it() {
-        // The defect: the old code dropped the session on any error, so
-        // declining one transaction on the device made the next signature fail
-        // with "no Ledger session; connect first". Rejecting is a normal thing
-        // a user does over a perfectly healthy transport.
+        // A rejection is an app-level answer over a healthy transport and must
+        // not discard the session.
         assert_eq!(
             session_action(&SignerError::UserRejected("declined".into())),
             SessionAction::Keep,
@@ -1807,17 +1681,8 @@ mod tests {
 
     #[test]
     fn docs_quote_the_real_timeout_constants() {
-        // This README said "5-minute" and "300s" for a while after
-        // DEFAULT_SIGN_TIMEOUT was retuned to 120s. A reader trusting the prose
-        // would have had a confirmation time out three minutes early. The doc
-        // now names the constants instead of restating their values, and this
-        // pins that: no bare duration may appear in the timeout table, and the
-        // constants it names must be the ones that exist.
+        // Doc must reference constants, not hardcoded values; no bare cargo commands.
         let doc = include_str!("README.md");
-        // `cargo ` is here because CLAUDE.md requires Rust commands to be
-        // exposed through Just: the recipes carry flags a hand-written command
-        // gets wrong. Two separate reviews caught this doc reintroducing raw
-        // cargo, so it is now a test rather than a habit.
         for stale in [
             "5-minute signing timeout",
             "300s",
@@ -1870,8 +1735,6 @@ mod tests {
     // NOTE: signing paths require a physical device and are covered by the
     // hardware integration test (see `tests/test_ledger_integration.rs`), not
     // here — these unit tests only cover the pure logic that needs no device.
-
-    // ── F-3: signature binding is what closes the device-swap race ──
 
     /// Two distinct keys, standing in for two physically different Ledgers.
     fn device_key(seed: u8) -> (crate::sdk_adapter::Keypair, Pubkey) {
@@ -2031,16 +1894,8 @@ mod tests {
         }
     }
 
-    /// A device whose signature does not verify must be refused, on the
-    /// off-chain path, through the real `sign_message`.
-    ///
-    /// This replaces a test that read this file's own source and counted
-    /// `verify_or_reject` call sites. Jo's objection to that was that it breaks
-    /// on the next reformat, and he is right, but the deeper problem is that it
-    /// proved the wrong thing: it asserted the source contains a call, not that
-    /// the path makes one. Signing against a device we control tests the
-    /// behaviour, and it fails for the right reason if the check is ever
-    /// removed -- a corrupted signature comes back to the caller as `Ok`.
+    /// A device whose signature does not verify must be refused on the off-chain
+    /// path. Tests against a controlled device that corruption is caught.
     #[tokio::test]
     async fn a_corrupted_device_signature_is_refused_by_sign_message() {
         let (_device, pubkey) = FakeDevice::attach(11, true);
@@ -2229,16 +2084,10 @@ mod tests {
         eprintln!();
     }
 
-    // ── F-6: the silent-fork guard ──
-
     #[test]
     fn the_enumeration_guard_reports_the_version_it_resolved() {
-        // The defect: this message asserted "requires solana-remote-wallet >=
-        // 4.1" whenever a Gen5 was attached and unenumerated, without checking
-        // what the build had resolved. Seen on hardware against a build that
-        // had resolved 4.2.2, where the version was fine and another process
-        // held the device -- so it sent the reader to audit a dependency that
-        // was not the problem.
+        // The version claim must rest on the version actually resolved: a
+        // 4.2.2 build with a held device is not a dependency problem.
         let gen5 = [0x8000u16];
 
         // Resolved 4.0.x: the version really is the cause, and saying so is
@@ -2285,18 +2134,7 @@ mod tests {
 
     #[test]
     fn an_unknown_resolved_version_rules_nothing_in_or_out() {
-        // `unknown` is what a crates.io consumer gets, because its lockfile is
-        // not reachable from our manifest.
-        //
-        // Greptile caught the first version of this on #301, and it was a real
-        // defect: `unknown` fell into the 4.1+ branch, so the message asserted
-        // that the resolved crate carries the Gen5 ids and that the version was
-        // "not the cause". A consumer who had in fact resolved 4.0.x would have
-        // been sent to chase app-format and contention while the actual fix was
-        // a dependency bump. That is the same error this function was written
-        // to remove -- claiming what you have not read -- pointing the other
-        // way, and my own test missed it by asserting only that the message
-        // avoids the 4.0.x wording.
+        // Unknown version must not assert "not the cause"; must not claim unread facts.
         for unknowable in ["unknown", "not-in-graph", "", "4", "four.two.two"] {
             let detail = unenumerated_detail(&[0x8000], unknowable);
             assert!(
@@ -2437,9 +2275,8 @@ mod tests {
 
     #[test]
     fn a_wrong_length_device_signature_is_an_error_not_a_panic() {
-        // `copy_from_slice` used to panic here, on a length that comes from the
-        // device. A truncated transport response would have aborted the
-        // caller's process rather than failing the signature.
+        // The length comes from the device; a truncated response must fail
+        // the signature, not abort the process.
         let err = signature_bytes([0u8; 63].as_slice()).expect_err("63 bytes is not a signature");
         assert!(matches!(err, SignerError::SigningFailed(_)), "got: {err:?}");
         assert!(signature_bytes([0u8; 65].as_slice()).is_err());
@@ -2525,9 +2362,7 @@ mod tests {
 
     #[test]
     fn unsupported_operation_names_blind_signing() {
-        // Observed on hardware: a non-ASCII off-chain message with blind signing
-        // disabled comes back as APDU 0x6808, which upstream renders as "Ledger
-        // operation not supported". That is accurate and actionable for nobody.
+        // APDU 0x6808: non-ASCII off-chain message with blind signing disabled.
         use solana_remote_wallet::ledger_error::LedgerError;
         let err = map_rw_err(RemoteWalletError::LedgerError(LedgerError::SdkNotSupported));
         assert!(matches!(err, SignerError::SigningFailed(_)));
@@ -2540,11 +2375,8 @@ mod tests {
 
     #[test]
     fn app_protocol_mismatch_is_not_reported_as_a_locked_device() {
-        // Found on hardware: a Nano Gen5, unlocked, Solana app open, dashboard
-        // answering, still failed to enumerate because the app returns a 7-byte
-        // configuration vector where solana-remote-wallet 4.2.2 demands 5.
-        // Reporting that as "unlock your device" is worse than useless, because
-        // the user does it and nothing changes.
+        // Nano Gen5 with app returning 7-byte config when 5 bytes expected: must not
+        // report as device state fault (locked), but as version incompatibility.
         let err = map_rw_err(RemoteWalletError::Protocol("Version packet size mismatch"));
         assert!(matches!(err, SignerError::NotAvailable(_)));
         let detail = err.detail_string();
@@ -2563,10 +2395,8 @@ mod tests {
 
     #[test]
     fn locked_device_maps_to_not_available_and_says_so() {
-        // What a locked device actually produces, observed on a Nano Gen5 that
-        // auto-locked mid-session: the transport answers, the app-level command
-        // does not, and it arrives as an unclassified protocol error. It must not
-        // be reported as a signing failure — nothing was signed.
+        // Locked device (Nano Gen5): transport answers but app-level command does not,
+        // arriving as unclassified protocol error. Must not report as signing failure.
         let err = map_rw_err(RemoteWalletError::Protocol("Unknown error"));
         assert!(matches!(err, SignerError::NotAvailable(_)));
         // The caller cannot see the device screen, so the remedy has to be in
@@ -2580,14 +2410,9 @@ mod tests {
 
     #[test]
     fn unclassified_protocol_error_also_names_the_busy_device() {
-        // The same `Protocol(_)` arm fires when another process holds the device
-        // — observed on a Nano Gen5 with Ledger Live running, and again with a
-        // stray script that had opened the device and not exited. Enumeration
-        // succeeds and the handle opens, so neither `NoDeviceFound` nor `Hid`
-        // catches it, and nothing in the error separates it from a locked
-        // device. A message that offers only "unlock it" therefore sends the
-        // user to re-enter a PIN that was never the problem, which is exactly
-        // the loop this arm has to break.
+        // Protocol(_) when another process holds device (Nano Gen5 with Ledger Live,
+        // stray script): enumeration succeeds, handle opens. Must offer busy device
+        // as a cause, not just "unlock it".
         let err = map_rw_err(RemoteWalletError::Protocol("Unknown error"));
         let detail = err.detail_string();
         assert!(
