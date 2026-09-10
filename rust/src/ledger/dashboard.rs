@@ -211,15 +211,17 @@ fn sole_ledger(candidates: &[Candidate<'_>]) -> Result<usize, SignerError> {
 
     match devices.len() {
         1 => Ok(devices[0]),
-        _ => {
-            let list = devices
-                .iter()
-                .map(|&i| format!("  {}", candidates[i].path))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(SignerError::NotAvailable(format!(
-                "multiple Ledger devices connected; pass host_device_path to select one:\n{list}"
-            )))
+        n => {
+            #[cfg(feature = "unsafe-debug")]
+            log::error!(
+                "multiple Ledger devices attached: {}",
+                devices
+                    .iter()
+                    .map(|&i| candidates[i].path)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            Err(super::multiple_devices_error(n))
         }
     }
 }
@@ -693,9 +695,7 @@ mod tests {
         ];
         let err = sole_ledger(&one_device_two_interfaces)
             .expect_err("this platform's paths carry no proof of a shared device");
-        assert!(err
-            .detail_string()
-            .contains("multiple Ledger devices connected"));
+        assert!(err.detail_string().contains("2 Ledger devices connected"));
 
         // The single candidate that actually reaches it on this hardware.
         let as_filtered = [candidate("DevSrvsID:4294981014", Some("0001"))];
@@ -731,14 +731,17 @@ mod tests {
         let err = sole_ledger(&c).expect_err("two devices must not resolve to one of them");
         let msg = err.detail_string();
         assert!(
-            msg.contains("multiple Ledger devices connected"),
+            msg.contains("2 Ledger devices connected"),
             "the error must say why, got: {msg}"
         );
         assert!(
             msg.contains("host_device_path"),
             "and must name the remedy, got: {msg}"
         );
-        assert!(msg.contains("/dev/hidraw2") && msg.contains("/dev/hidraw3"));
+        assert!(
+            !msg.contains("/dev/hidraw"),
+            "host paths stay out of returned errors, got: {msg}"
+        );
     }
 
     #[test]
@@ -794,14 +797,9 @@ mod tests {
         ];
         let err = sole_ledger(&c).expect_err("still two devices");
         let msg = err.detail_string();
-        assert!(msg.contains("ledger@01100000") && msg.contains("ledger@01200000"));
-        // One line per device, not per interface.
-        assert_eq!(
-            msg.lines()
-                .filter(|l| l.trim_start().starts_with("IOService:"))
-                .count(),
-            2,
-            "the list must name devices, not interfaces: {msg}"
+        assert!(
+            msg.contains("2 Ledger devices connected"),
+            "the count must be devices, not interfaces: {msg}"
         );
     }
 

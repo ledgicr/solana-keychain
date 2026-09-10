@@ -290,8 +290,8 @@ impl LedgerSigner {
     /// `host_device_path` selects a specific device by its OS HID path when more
     /// than one Ledger is connected. Pass `None` to use the sole connected
     /// device; if several are attached and `None` is given, this returns
-    /// [`SignerError::NotAvailable`] listing each device's path so the caller can
-    /// retry with a specific one.
+    /// [`SignerError::NotAvailable`] with the device count. Host paths are not
+    /// placed in the error; `just rust-ledger-diagnose` lists them.
     ///
     /// Naming a path does **not** make two devices usable concurrently. The
     /// device thread caches one session, so alternating between signers bound to
@@ -852,24 +852,20 @@ fn establish_session(
             0 => return Err(no_ledger_enumerated_error()),
             1 => ledgers.into_iter().next().expect("len == 1"),
             _ => {
-                // `pretty_path` is the canonical Solana device locator
-                // (`usb://ledger/<base pubkey>`) — stable across re-plugs,
-                // unlike the OS HID path, so it is the useful half of the
-                // disambiguation hint even though the path is what selects.
-                let list = ledgers
-                    .iter()
-                    .map(|w| {
-                        format!(
-                            "  {} ({})",
+                #[cfg(feature = "unsafe-debug")]
+                log::error!(
+                    "multiple Ledger devices attached: {}",
+                    ledgers
+                        .iter()
+                        .map(|w| format!(
+                            "{} ({})",
                             hid_path(w).unwrap_or_else(|| "<unknown path>".to_string()),
                             w.pretty_path
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return Err(SignerError::NotAvailable(format!(
-                    "multiple Ledger devices connected; pass host_device_path to select one:\n{list}"
-                )));
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return Err(multiple_devices_error(ledgers.len()));
             }
         },
     };
@@ -878,6 +874,15 @@ fn establish_session(
         .get_pubkey(path, confirm_pubkey_on_device)
         .map_err(map_rw_err)?;
     Ok((ledger, pubkey.to_bytes()))
+}
+
+/// Host paths identify devices to a caller but are host-local detail, so they
+/// go to the `unsafe-debug` log and the error carries only the count.
+fn multiple_devices_error(count: usize) -> SignerError {
+    SignerError::NotAvailable(format!(
+        "{count} Ledger devices connected; pass host_device_path to select one. Run \
+         `just rust-ledger-diagnose` to list them."
+    ))
 }
 
 /// Ledger USB vendor id. Single definition to prevent copy rot.
@@ -2214,9 +2219,12 @@ mod tests {
         // If this ever reads `unknown` in this repo, the lockfile walk in
         // build.rs has broken and every message above silently stops naming a
         // version.
+        assert_ne!(RESOLVED_REMOTE_WALLET, "unknown");
+        assert_ne!(RESOLVED_REMOTE_WALLET, "not-in-graph");
         assert_eq!(
-            RESOLVED_REMOTE_WALLET, "4.2.2",
-            "build.rs should have read this out of rust/Cargo.lock"
+            gen5_support(RESOLVED_REMOTE_WALLET),
+            Gen5Support::Present,
+            "build.rs should have read a 4.1+ version out of rust/Cargo.lock, got {RESOLVED_REMOTE_WALLET}"
         );
     }
 

@@ -181,7 +181,7 @@ After installing, unplug and replug the device.
 | `NotAvailable` naming a product id and a `solana-remote-wallet` version | Device model newer than the resolved `solana-remote-wallet` | See the table below |
 | `NotAvailable`: "either locked, or another application is holding the device" | Device auto-locked, **or** Ledger Live has the handle | Unlock and open the Solana app; quit Ledger Live |
 | `NotAvailable`: "busy with another operation or awaiting on-device confirmation" | Another caller holds the device, or a prompt is unanswered | Answer or dismiss it on the device, or wait |
-| `NotAvailable` listing several devices | More than one Ledger attached | Pass `host_device_path` |
+| `NotAvailable` counting several devices | More than one Ledger attached | Pass `host_device_path`; `just rust-ledger-diagnose` lists the paths |
 | `UserRejected` | Declined on the device screen | Retry and approve |
 
 ## Device support by resolved `solana-remote-wallet`
